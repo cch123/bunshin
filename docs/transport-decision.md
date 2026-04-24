@@ -28,6 +28,7 @@ For an Aeron-like goal, the evaluation must also consider:
 - Reliability, retransmission, flow control, congestion control, and TLS are owned by `quic-go`.
 - Bunshin's ACK frame now confirms application-level handling over a reliable QUIC stream rather than packet-level delivery.
 - Bunshin frame checksums may become optional because QUIC already provides transport integrity.
+- Packet-loss recovery is benchmarked by injecting drops below `quic-go`, because QUIC owns retransmission for the default backend.
 - Benchmarks should still compare QUIC with any future Aeron-backed option under the same message workload.
 - The built-in self-signed TLS configuration is for development and tests. Production users should provide explicit TLS configuration.
 

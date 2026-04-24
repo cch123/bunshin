@@ -14,7 +14,7 @@ This checklist tracks the work needed to evolve Bunshin from the current UDP pro
 
 - [x] Use `quic-go` as the default reliable transport instead of custom UDP ACK/retransmit.
 - [x] Add transport benchmarks for latency percentiles, throughput, and allocations.
-- [ ] Add packet-loss recovery benchmark harness for QUIC.
+- [x] Add packet-loss recovery benchmark harness for QUIC.
 - [x] Add production TLS configuration examples.
 - [ ] Add qlog and metrics hooks for QUIC observability.
 - [ ] Evaluate whether Bunshin's payload CRC32 should remain on top of QUIC transport integrity.

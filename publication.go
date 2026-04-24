@@ -34,6 +34,9 @@ type PublicationConfig struct {
 	TLSConfig       *tls.Config
 	QUICConfig      *quic.Config
 
+	// PacketConn is an advanced hook for tests and custom transports. When set, the caller owns closing it.
+	PacketConn net.PacketConn
+
 	// Kept for API compatibility. QUIC owns retransmission and socket buffers.
 	LocalAddr        string
 	RetransmitEvery  time.Duration
@@ -43,6 +46,7 @@ type PublicationConfig struct {
 
 type Publication struct {
 	conn       *quic.Conn
+	transport  *quic.Transport
 	streamID   uint32
 	sessionID  uint32
 	maxPayload int
@@ -78,13 +82,14 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 		}
 	}
 
-	conn, err := quic.DialAddr(context.Background(), cfg.RemoteAddr, tlsConf, cfg.QUICConfig)
+	conn, transport, err := dialQUIC(context.Background(), cfg.RemoteAddr, tlsConf, cfg.QUICConfig, cfg.PacketConn)
 	if err != nil {
 		return nil, fmt.Errorf("dial quic publication: %w", err)
 	}
 
 	p := &Publication{
 		conn:       conn,
+		transport:  transport,
 		streamID:   cfg.StreamID,
 		sessionID:  cfg.SessionID,
 		maxPayload: cfg.MaxPayloadBytes,
@@ -92,6 +97,9 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 	}
 	if err := p.negotiate(context.Background()); err != nil {
 		_ = conn.CloseWithError(0, "negotiation failed")
+		if transport != nil {
+			_ = transport.Close()
+		}
 		return nil, err
 	}
 	return p, nil
@@ -146,6 +154,11 @@ func (p *Publication) Close() error {
 	p.closeOnce.Do(func() {
 		close(p.closed)
 		err = p.conn.CloseWithError(0, "closed")
+		if p.transport != nil {
+			if transportErr := p.transport.Close(); err == nil {
+				err = transportErr
+			}
+		}
 	})
 	return err
 }
@@ -212,4 +225,23 @@ func decodeProtocolError(payload []byte) error {
 		Code:    uint16(protocolErr.code),
 		Message: protocolErr.message,
 	}
+}
+
+func dialQUIC(ctx context.Context, remoteAddr string, tlsConf *tls.Config, quicConf *quic.Config, packetConn net.PacketConn) (*quic.Conn, *quic.Transport, error) {
+	if packetConn == nil {
+		conn, err := quic.DialAddr(ctx, remoteAddr, tlsConf, quicConf)
+		return conn, nil, err
+	}
+
+	remote, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		return nil, nil, err
+	}
+	transport := &quic.Transport{Conn: packetConn}
+	conn, err := transport.Dial(ctx, remote, tlsConf, quicConf)
+	if err != nil {
+		_ = transport.Close()
+		return nil, nil, err
+	}
+	return conn, transport, nil
 }

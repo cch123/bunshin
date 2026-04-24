@@ -37,6 +37,9 @@ type SubscriptionConfig struct {
 	TLSConfig  *tls.Config
 	QUICConfig *quic.Config
 
+	// PacketConn is an advanced hook for tests and custom transports. When set, LocalAddr is ignored and the caller owns closing it.
+	PacketConn net.PacketConn
+
 	// Kept for API compatibility. QUIC owns socket buffers.
 	ReadBufferBytes  int
 	WriteBufferBytes int
@@ -44,13 +47,14 @@ type SubscriptionConfig struct {
 
 type Subscription struct {
 	listener  *quic.Listener
+	transport *quic.Transport
 	streamID  uint32
 	closed    chan struct{}
 	closeOnce sync.Once
 }
 
 func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
-	if cfg.LocalAddr == "" {
+	if cfg.LocalAddr == "" && cfg.PacketConn == nil {
 		return nil, errors.New("local address is required")
 	}
 	if cfg.StreamID == 0 {
@@ -71,15 +75,16 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 		}
 	}
 
-	listener, err := quic.ListenAddr(cfg.LocalAddr, tlsConf, cfg.QUICConfig)
+	listener, transport, err := listenQUIC(cfg.LocalAddr, tlsConf, cfg.QUICConfig, cfg.PacketConn)
 	if err != nil {
 		return nil, fmt.Errorf("listen quic subscription: %w", err)
 	}
 
 	return &Subscription{
-		listener: listener,
-		streamID: cfg.StreamID,
-		closed:   make(chan struct{}),
+		listener:  listener,
+		transport: transport,
+		streamID:  cfg.StreamID,
+		closed:    make(chan struct{}),
 	}, nil
 }
 
@@ -135,6 +140,11 @@ func (s *Subscription) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		err = s.listener.Close()
+		if s.transport != nil {
+			if transportErr := s.transport.Close(); err == nil {
+				err = transportErr
+			}
+		}
 	})
 	return err
 }
@@ -302,4 +312,19 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		return tls.Certificate{}, fmt.Errorf("load tls key pair: %w", err)
 	}
 	return cert, nil
+}
+
+func listenQUIC(localAddr string, tlsConf *tls.Config, quicConf *quic.Config, packetConn net.PacketConn) (*quic.Listener, *quic.Transport, error) {
+	if packetConn == nil {
+		listener, err := quic.ListenAddr(localAddr, tlsConf, quicConf)
+		return listener, nil, err
+	}
+
+	transport := &quic.Transport{Conn: packetConn}
+	listener, err := transport.Listen(tlsConf, quicConf)
+	if err != nil {
+		_ = transport.Close()
+		return nil, nil, err
+	}
+	return listener, transport, nil
 }
