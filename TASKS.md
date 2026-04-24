@@ -16,7 +16,7 @@ This checklist tracks the work needed to evolve Bunshin from the current UDP pro
 - [x] Add transport benchmarks for latency percentiles, throughput, and allocations.
 - [x] Add packet-loss recovery benchmark harness for QUIC.
 - [x] Add production TLS configuration examples.
-- [ ] Add qlog and metrics hooks for QUIC observability.
+- [x] Add qlog and metrics hooks for QUIC observability.
 - [ ] Evaluate whether Bunshin's payload CRC32 should remain on top of QUIC transport integrity.
 - [ ] Benchmark future Aeron-backed options against the QUIC default before adding another backend.
 - [ ] Implement term buffers with append positions, term IDs, and rotation.

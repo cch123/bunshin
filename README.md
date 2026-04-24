@@ -19,6 +19,8 @@ Benchmark commands are documented in [docs/benchmarks.md](docs/benchmarks.md).
 
 Production TLS setup is documented in [docs/tls.md](docs/tls.md).
 
+Observability hooks are documented in [docs/observability.md](docs/observability.md).
+
 ## Example
 
 ```go

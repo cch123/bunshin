@@ -7,9 +7,12 @@ import (
 )
 
 func TestPublicationSubscription(t *testing.T) {
+	pubMetrics := &Metrics{}
+	subMetrics := &Metrics{}
 	sub, err := ListenSubscription(SubscriptionConfig{
 		StreamID:  99,
 		LocalAddr: "127.0.0.1:0",
+		Metrics:   subMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -32,6 +35,7 @@ func TestPublicationSubscription(t *testing.T) {
 		SessionID:       1234,
 		RemoteAddr:      sub.LocalAddr().String(),
 		RetransmitEvery: time.Millisecond,
+		Metrics:         pubMetrics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -49,5 +53,14 @@ func TestPublicationSubscription(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
+	}
+
+	pubSnapshot := pubMetrics.Snapshot()
+	if pubSnapshot.ConnectionsOpened != 1 || pubSnapshot.MessagesSent != 1 || pubSnapshot.BytesSent != uint64(len("payload")) || pubSnapshot.AcksReceived != 1 {
+		t.Fatalf("unexpected publication metrics: %#v", pubSnapshot)
+	}
+	subSnapshot := subMetrics.Snapshot()
+	if subSnapshot.ConnectionsAccepted != 1 || subSnapshot.MessagesReceived != 1 || subSnapshot.BytesReceived != uint64(len("payload")) || subSnapshot.AcksSent != 1 {
+		t.Fatalf("unexpected subscription metrics: %#v", subSnapshot)
 	}
 }

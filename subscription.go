@@ -36,6 +36,7 @@ type SubscriptionConfig struct {
 	LocalAddr  string
 	TLSConfig  *tls.Config
 	QUICConfig *quic.Config
+	Metrics    *Metrics
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, LocalAddr is ignored and the caller owns closing it.
 	PacketConn net.PacketConn
@@ -48,6 +49,7 @@ type SubscriptionConfig struct {
 type Subscription struct {
 	listener  *quic.Listener
 	transport *quic.Transport
+	metrics   *Metrics
 	streamID  uint32
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -83,6 +85,7 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 	return &Subscription{
 		listener:  listener,
 		transport: transport,
+		metrics:   cfg.Metrics,
 		streamID:  cfg.StreamID,
 		closed:    make(chan struct{}),
 	}, nil
@@ -111,6 +114,7 @@ func (s *Subscription) Serve(ctx context.Context, handler Handler) error {
 				}
 				return
 			}
+			s.metrics.incConnectionsAccepted()
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -168,6 +172,8 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 
 	f, err := decodeFrame(buf)
 	if err != nil {
+		s.metrics.incReceiveErrors()
+		s.metrics.incProtocolErrors()
 		_ = s.writeError(stream, 0, 0, 0, protocolErrorMalformedFrame, err.Error())
 		return
 	}
@@ -177,6 +183,8 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 		_ = s.hello(stream, f)
 	case frameData:
 		if f.streamID != s.streamID {
+			s.metrics.incReceiveErrors()
+			s.metrics.incProtocolErrors()
 			_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorUnsupportedType, "unsupported stream id")
 			return
 		}
@@ -188,11 +196,17 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 			Remote:    remote,
 		}
 		if err := handler(ctx, msg); err != nil {
+			s.metrics.incReceiveErrors()
 			_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorMalformedFrame, err.Error())
 			return
 		}
-		_ = s.ack(stream, f)
+		s.metrics.incMessagesReceived(len(f.payload))
+		if err := s.ack(stream, f); err != nil {
+			s.metrics.incReceiveErrors()
+		}
 	default:
+		s.metrics.incReceiveErrors()
+		s.metrics.incProtocolErrors()
 		_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorUnsupportedType, "unsupported frame type")
 	}
 }
@@ -200,9 +214,11 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 func (s *Subscription) hello(stream *quic.Stream, f frame) error {
 	hello, err := decodeHelloPayload(f.payload)
 	if err != nil {
+		s.metrics.incProtocolErrors()
 		return s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorMalformedFrame, err.Error())
 	}
 	if hello.minVersion > frameVersion || hello.maxVersion < frameVersion {
+		s.metrics.incProtocolErrors()
 		return s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorUnsupportedVersion, "unsupported protocol version")
 	}
 
@@ -235,7 +251,11 @@ func (s *Subscription) ack(stream *quic.Stream, f frame) error {
 	if _, err := stream.Write(packet); err != nil {
 		return err
 	}
-	return stream.Close()
+	if err := stream.Close(); err != nil {
+		return err
+	}
+	s.metrics.incAcksSent()
+	return nil
 }
 
 func (s *Subscription) writeError(stream *quic.Stream, streamID, sessionID uint32, seq uint64, code protocolErrorCode, message string) error {

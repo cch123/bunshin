@@ -33,6 +33,7 @@ type PublicationConfig struct {
 	MaxPayloadBytes int
 	TLSConfig       *tls.Config
 	QUICConfig      *quic.Config
+	Metrics         *Metrics
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, the caller owns closing it.
 	PacketConn net.PacketConn
@@ -47,6 +48,7 @@ type PublicationConfig struct {
 type Publication struct {
 	conn       *quic.Conn
 	transport  *quic.Transport
+	metrics    *Metrics
 	streamID   uint32
 	sessionID  uint32
 	maxPayload int
@@ -86,10 +88,12 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial quic publication: %w", err)
 	}
+	cfg.Metrics.incConnectionsOpened()
 
 	p := &Publication{
 		conn:       conn,
 		transport:  transport,
+		metrics:    cfg.Metrics,
 		streamID:   cfg.StreamID,
 		sessionID:  cfg.SessionID,
 		maxPayload: cfg.MaxPayloadBytes,
@@ -107,11 +111,13 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 
 func (p *Publication) Send(ctx context.Context, payload []byte) error {
 	if len(payload) > p.maxPayload {
+		p.metrics.incSendErrors()
 		return fmt.Errorf("payload too large: %d bytes", len(payload))
 	}
 
 	select {
 	case <-p.closed:
+		p.metrics.incSendErrors()
 		return ErrClosed
 	default:
 	}
@@ -125,22 +131,32 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 		payload:   payload,
 	})
 	if err != nil {
+		p.metrics.incSendErrors()
 		return err
 	}
 
 	resp, err := p.roundTrip(ctx, packet)
 	if err != nil {
+		p.metrics.incSendErrors()
 		return err
 	}
 	switch resp.typ {
 	case frameAck:
 		if resp.streamID != p.streamID || resp.sessionID != p.sessionID || resp.seq != seq {
+			p.metrics.incProtocolErrors()
+			p.metrics.incSendErrors()
 			return &ProtocolError{Code: uint16(protocolErrorMalformedFrame), Message: "ack does not match data frame"}
 		}
+		p.metrics.incMessagesSent(len(payload))
+		p.metrics.incAcksReceived()
 		return nil
 	case frameError:
+		p.metrics.incProtocolErrors()
+		p.metrics.incSendErrors()
 		return decodeProtocolError(resp.payload)
 	default:
+		p.metrics.incProtocolErrors()
+		p.metrics.incSendErrors()
 		return &ProtocolError{Code: uint16(protocolErrorUnsupportedType), Message: "unexpected response frame"}
 	}
 }
