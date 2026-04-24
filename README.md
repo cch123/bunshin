@@ -17,6 +17,8 @@ Transport direction is documented in [docs/transport-decision.md](docs/transport
 
 Benchmark commands are documented in [docs/benchmarks.md](docs/benchmarks.md).
 
+Production TLS setup is documented in [docs/tls.md](docs/tls.md).
+
 ## Example
 
 ```go
