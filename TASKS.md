@@ -4,15 +4,21 @@ This checklist tracks the work needed to evolve Bunshin from the current UDP pro
 
 ## Protocol And Compatibility
 
-- [ ] Document the current frame format, wire assumptions, byte order, and versioning policy.
-- [ ] Decide whether Bunshin targets Aeron wire compatibility or a Go-native Aeron-inspired protocol.
-- [ ] Add protocol negotiation and explicit error frames.
-- [ ] Add checksums or integrity validation for data frames.
-- [ ] Add fuzz tests for frame decoding and malformed packets.
+- [x] Document the current frame format, wire assumptions, byte order, and versioning policy.
+- [x] Decide whether Bunshin targets Aeron wire compatibility or a Go-native Aeron-inspired protocol.
+- [x] Add protocol negotiation and explicit error frames.
+- [x] Add checksums or integrity validation for data frames.
+- [x] Add fuzz tests for frame decoding and malformed packets.
 
 ## Transport Core
 
-- [ ] Replace simple ACK-per-message reliability with status messages and NAK-based loss repair.
+- [x] Use `quic-go` as the default reliable transport instead of custom UDP ACK/retransmit.
+- [x] Add transport benchmarks for latency percentiles, throughput, and allocations.
+- [ ] Add packet-loss recovery benchmark harness for QUIC.
+- [ ] Add production TLS configuration examples.
+- [ ] Add qlog and metrics hooks for QUIC observability.
+- [ ] Evaluate whether Bunshin's payload CRC32 should remain on top of QUIC transport integrity.
+- [ ] Benchmark future Aeron-backed options against the QUIC default before adding another backend.
 - [ ] Implement term buffers with append positions, term IDs, and rotation.
 - [ ] Add publication back pressure instead of blocking only on ACK timeout.
 - [ ] Add receiver gap detection and loss reporting.
