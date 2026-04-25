@@ -41,14 +41,16 @@ const (
 type ClusterControlAuthorizer func(context.Context, ClusterControlAction) error
 
 type ClusterDescription struct {
-	NodeID           ClusterNodeID        `json:"node_id"`
-	Mode             ClusterMode          `json:"mode"`
-	Role             ClusterRole          `json:"role"`
-	LastPosition     int64                `json:"last_position"`
-	SnapshotPosition int64                `json:"snapshot_position"`
-	Closed           bool                 `json:"closed"`
-	Suspended        bool                 `json:"suspended"`
-	Learner          ClusterLearnerStatus `json:"learner"`
+	NodeID           ClusterNodeID            `json:"node_id"`
+	Mode             ClusterMode              `json:"mode"`
+	Role             ClusterRole              `json:"role"`
+	LastPosition     int64                    `json:"last_position"`
+	SnapshotPosition int64                    `json:"snapshot_position"`
+	Closed           bool                     `json:"closed"`
+	Suspended        bool                     `json:"suspended"`
+	Learner          ClusterLearnerStatus     `json:"learner"`
+	Replication      ClusterReplicationStatus `json:"replication"`
+	Election         ClusterElectionStatus    `json:"election"`
 }
 
 type ClusterValidationReport struct {
@@ -215,6 +217,8 @@ func (n *ClusterNode) Describe(ctx context.Context) (ClusterDescription, error) 
 		Closed:           snapshot.Closed,
 		Suspended:        snapshot.Suspended,
 		Learner:          snapshot.Learner,
+		Replication:      snapshot.Replication,
+		Election:         snapshot.Election,
 	}, nil
 }
 
@@ -235,6 +239,18 @@ func (n *ClusterNode) Validate(ctx context.Context) (ClusterValidationReport, er
 	}
 	if description.Learner.Enabled && description.Learner.SyncedPosition > description.Learner.MasterPosition {
 		report.Errors = append(report.Errors, "bunshin cluster learner: synced position is ahead of master")
+	}
+	if description.Replication.Enabled && description.Replication.SourcePosition > 0 &&
+		description.Replication.SyncedPosition > description.Replication.SourcePosition {
+		report.Errors = append(report.Errors, "bunshin cluster replication: synced position is ahead of source")
+	}
+	if description.Election.Enabled {
+		if description.Election.LeaderID == 0 {
+			report.Errors = append(report.Errors, "bunshin cluster election: leader is unavailable")
+		}
+		if description.Election.Role != description.Role {
+			report.Errors = append(report.Errors, "bunshin cluster election: role does not match node role")
+		}
 	}
 	report.Healthy = len(report.Errors) == 0
 	return report, nil

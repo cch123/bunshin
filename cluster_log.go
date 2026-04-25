@@ -3,12 +3,17 @@ package bunshin
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 type ClusterLogEntryType string
 
 const (
-	ClusterLogEntryIngress ClusterLogEntryType = "ingress"
+	ClusterLogEntryIngress        ClusterLogEntryType = "ingress"
+	ClusterLogEntryTimerSchedule  ClusterLogEntryType = "timer_schedule"
+	ClusterLogEntryTimerCancel    ClusterLogEntryType = "timer_cancel"
+	ClusterLogEntryTimerFire      ClusterLogEntryType = "timer_fire"
+	ClusterLogEntryServiceMessage ClusterLogEntryType = "service_message"
 )
 
 type ClusterLogEntry struct {
@@ -16,6 +21,10 @@ type ClusterLogEntry struct {
 	Type          ClusterLogEntryType  `json:"type"`
 	SessionID     ClusterSessionID     `json:"session_id"`
 	CorrelationID ClusterCorrelationID `json:"correlation_id"`
+	TimerID       ClusterTimerID       `json:"timer_id,omitempty"`
+	Deadline      time.Time            `json:"deadline,omitempty"`
+	SourceService string               `json:"source_service,omitempty"`
+	TargetService string               `json:"target_service,omitempty"`
 	Payload       []byte               `json:"payload"`
 }
 

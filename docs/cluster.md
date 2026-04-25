@@ -8,7 +8,7 @@ The first supported modes are:
 - `appointed-leader`: a configured node ID is leader; non-leader nodes reject local ingress.
 - `learner`: the node does not participate in consensus or accept ingress; it follows a configured master log and snapshots local service state.
 
-Leader election, network log replication, backup catch-up, and rolling upgrades are future layers above this core.
+Network transport for member replication, backup catch-up, and rolling upgrades are future layers above this core.
 
 ## Node
 
@@ -52,6 +52,89 @@ type ClusterLog interface {
 
 The log assigns monotonically increasing positions. On node start, existing entries are replayed into the service with `ClusterMessage.Replay = true`, so service state can be rebuilt deterministically from the log.
 
+## Heartbeats And Election
+
+Appointed-leader nodes can optionally enable heartbeat tracking and local leader election. This is a Bunshin-native state machine, not an Aeron or Raft wire protocol.
+
+```go
+node, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    NodeID:            2,
+    Mode:              bunshin.ClusterModeAppointedLeader,
+    AppointedLeaderID: 1,
+    Service:           service,
+    Election: &bunshin.ClusterElectionConfig{
+        Members:          []bunshin.ClusterNodeID{1, 2, 3},
+        HeartbeatTimeout: time.Second,
+    },
+})
+```
+
+`RecordHeartbeat` records member liveness and accepts leader heartbeats with term metadata. `TickElection` evaluates heartbeat timeouts and deterministically selects the first live member when the current leader expires. Role changes immediately affect ingress and timer ownership: only the current local leader can append ingress, fire timers, or send service messages.
+
+```go
+status, err := node.RecordHeartbeat(ctx, bunshin.ClusterHeartbeat{
+    NodeID:   1,
+    LeaderID: 1,
+    Term:     4,
+    At:       time.Now(),
+})
+
+status, err = node.TickElection(ctx, time.Now())
+```
+
+By default Bunshin starts a local election tick loop using `ClusterElectionConfig.TickInterval`. Set `DisableAutoRun` when an application or future member transport wants to drive election ticks explicitly.
+
+## Timers And Service Messages
+
+Cluster timers are log-backed. Scheduling, cancellation, and firing are represented as cluster log entries so recovery, follower replication, and learner catch-up observe the same deterministic sequence.
+
+```go
+timer, err := node.ScheduleTimer(ctx, bunshin.ClusterTimer{
+    Deadline: time.Now().Add(time.Second),
+    Payload:  []byte("settle"),
+})
+
+err = node.CancelTimer(ctx, timer.TimerID)
+```
+
+Leaders own timer firing. `ClusterNode.FireDueTimers` can be called directly by applications that want explicit scheduling control. Unless `ClusterConfig.DisableTimerLoop` is set, Bunshin also starts a leader-only timer loop using `ClusterConfig.TimerCheckInterval`.
+
+Timer fire entries are delivered to the service as `ClusterMessage.Type = ClusterLogEntryTimerFire` with `TimerID`, `Deadline`, and `Payload` set. Pending timers are included in `ClusterStateSnapshot`, so a timer scheduled before a snapshot and due after restart is restored without replaying the old schedule entry.
+
+Inter-service messages use the same replicated log boundary:
+
+```go
+egress, err := node.SendServiceMessage(ctx, bunshin.ClusterServiceMessage{
+    SourceService: "orders",
+    TargetService: "risk",
+    Payload:       []byte("rebalance"),
+})
+```
+
+Service messages are delivered as `ClusterLogEntryServiceMessage` and replay like ingress. Bunshin currently runs a single service callback per node; `SourceService` and `TargetService` are metadata for applications that multiplex deterministic services behind that callback.
+
+## Follower Replication
+
+Appointed-leader followers can optionally replicate and catch up from a leader/source log. This keeps follower service state warm without accepting local ingress.
+
+```go
+follower, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    NodeID:            2,
+    Mode:              bunshin.ClusterModeAppointedLeader,
+    AppointedLeaderID: 1,
+    Log:               followerLog,
+    Service:           followerService,
+    Replication: &bunshin.ClusterReplicationConfig{
+        SourceLog:    leaderLog,
+        SyncInterval: 100 * time.Millisecond,
+    },
+})
+```
+
+`ClusterReplicationConfig.SourceLog` is the source of committed log entries. The follower copies entries after its local position, appends them at the same positions, and invokes its service callback with `ClusterRoleFollower`. `ClusterNode.SyncReplication` can be called manually; by default Bunshin also starts a periodic sync loop. `DisableAutoRun` leaves scheduling to the application or tests.
+
+This is a Bunshin-native replication boundary over `ClusterLog`, not a network wire protocol. A future transport can expose a remote member log behind the same source-log shape.
+
 ## Snapshots
 
 Services that support snapshots implement `ClusterSnapshotService`:
@@ -63,7 +146,7 @@ type ClusterSnapshotService interface {
 }
 ```
 
-`ClusterNode.TakeSnapshot` asks the service to serialize deterministic state at the current log position and stores it in `ClusterConfig.SnapshotStore`.
+`ClusterNode.TakeSnapshot` asks the service to serialize deterministic state at the current log position and stores it in `ClusterConfig.SnapshotStore`. Bunshin also records pending cluster timers in the snapshot metadata.
 
 ```go
 store := bunshin.NewInMemoryClusterSnapshotStore()
@@ -134,4 +217,4 @@ type ClusterService interface {
 
 ## Scope
 
-The current cluster layer provides the local service container, in-process ingress/egress protocol, appointed-leader gating, replayable replicated-log abstraction, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide leader election, remote member communication, quorum replication, or full backup promotion.
+The current cluster layer provides the local service container, in-process ingress/egress protocol, appointed-leader gating, heartbeat-based local election, replayable replicated-log abstraction, log-backed timers and service messages, follower log catch-up, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide remote member communication, quorum replication, or full backup promotion.

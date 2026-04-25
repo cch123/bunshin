@@ -25,11 +25,12 @@ type ClusterSnapshotService interface {
 }
 
 type ClusterStateSnapshot struct {
-	NodeID   ClusterNodeID `json:"node_id"`
-	Role     ClusterRole   `json:"role"`
-	Position int64         `json:"position"`
-	TakenAt  time.Time     `json:"taken_at"`
-	Payload  []byte        `json:"payload"`
+	NodeID   ClusterNodeID  `json:"node_id"`
+	Role     ClusterRole    `json:"role"`
+	Position int64          `json:"position"`
+	TakenAt  time.Time      `json:"taken_at"`
+	Payload  []byte         `json:"payload"`
+	Timers   []ClusterTimer `json:"timers,omitempty"`
 }
 
 type InMemoryClusterSnapshotStore struct {
@@ -107,5 +108,6 @@ func (s *InMemoryClusterSnapshotStore) Close() error {
 
 func cloneClusterStateSnapshot(snapshot ClusterStateSnapshot) ClusterStateSnapshot {
 	snapshot.Payload = cloneBytes(snapshot.Payload)
+	snapshot.Timers = cloneClusterTimers(snapshot.Timers)
 	return snapshot
 }
