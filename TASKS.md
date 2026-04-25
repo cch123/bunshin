@@ -105,18 +105,18 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 
 ## Cluster
 
-- [ ] Define Bunshin cluster scope and consensus semantics.
-- [ ] Add cluster client ingress and egress protocol.
-- [ ] Add replicated log abstraction.
-- [ ] Add a consensus module that sequences ingress into a single replicated log.
+- [x] Define Bunshin cluster scope and consensus semantics.
+- [x] Add cluster client ingress and egress protocol.
+- [x] Add replicated log abstraction.
+- [x] Add a consensus module that sequences ingress into a single replicated log.
 - [ ] Add leader election and heartbeat handling.
 - [ ] Add log replication and catch-up between cluster members.
 - [ ] Add snapshot and recovery support.
-- [ ] Add service container and deterministic service callback APIs.
+- [x] Add service container and deterministic service callback APIs.
 - [ ] Add reliable cluster timers and inter-service messaging.
-- [ ] Add appointed-leader and single-node development modes.
+- [x] Add appointed-leader and single-node development modes.
 - [ ] Add backup and standby replication support.
-- [ ] Add deterministic service execution examples.
+- [x] Add deterministic service execution examples.
 - [ ] Add rolling upgrade and membership-change strategy.
 - [ ] Add cluster control tool for describe, snapshot, suspend, resume, shutdown, and validation.
 - [ ] Add cluster authentication and authorization hooks.
