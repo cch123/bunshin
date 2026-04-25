@@ -74,5 +74,5 @@ clientTLS, err := bunshin.ClientTLSConfigFromFiles(bunshin.ClientTLSFiles{
 
 - Certificates must be rotated outside Bunshin for now.
 - The configured certificate `ServerName` must match the QUIC endpoint.
-- `NextProtos` is set to `bunshin/3` by the helper functions.
+- `NextProtos` is set to `bunshin/4` by the helper functions.
 - TLS minimum version is TLS 1.3.

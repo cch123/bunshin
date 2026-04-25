@@ -11,13 +11,14 @@ Wire compatibility may be revisited later, but doing so would require an explici
 ## Transport Assumptions
 
 - Frames are sent over QUIC streams.
-- Each QUIC stream currently carries exactly one Bunshin request frame and one Bunshin response frame.
+- Each QUIC stream carries one Bunshin request message and one Bunshin response frame. A fragmented request message is encoded as multiple DATA frames on the same stream.
 - The maximum encoded frame size is 64 KiB.
-- The current maximum payload size is 65,492 bytes, calculated as 64 KiB minus the 44-byte frame header.
-- Fragmentation and reassembly are not implemented yet.
+- The default MTU is 64 KiB, so the default maximum DATA payload per frame is 65,488 bytes, calculated as 64 KiB minus the 48-byte frame header.
+- Publications can lower `MTUBytes` to force smaller DATA frames. `MaxPayloadBytes` controls the maximum application payload, which can span multiple DATA frames.
 - Delivery reliability, retransmission, flow control, congestion control, and TLS are provided by QUIC through `quic-go`.
 - Bunshin ACK frames confirm application-level handling, not packet-level delivery.
 - Publications apply a bounded send window before appending frames to the term log. The default window is one term buffer.
+- Subscriptions detect sequence gaps per stream/session/source and expose process-local loss reports.
 - Ordering is not guaranteed beyond the sequence number carried in each frame.
 - Multicast, shared-memory IPC, NAK repair, and receiver-side stream rebuilding are not implemented yet.
 
@@ -27,14 +28,14 @@ All multi-byte integer fields use little-endian byte order. This follows Aeron's
 
 ## Frame Header
 
-Every frame starts with a fixed 44-byte header.
+Every frame starts with a fixed 48-byte header.
 
 | Offset | Size | Type | Field | Description |
 | --- | ---: | --- | --- | --- |
 | 0 | 4 | bytes | Magic | Constant ASCII bytes `BSHN`. |
-| 4 | 1 | uint8 | Version | Current protocol version, `3`. |
+| 4 | 1 | uint8 | Version | Current protocol version, `4`. |
 | 5 | 1 | uint8 | Type | Frame type. |
-| 6 | 2 | uint16 | Reserved | Must be encoded as `0`; currently ignored while decoding. |
+| 6 | 2 | uint16 | Flags | Frame flags. |
 | 8 | 4 | uint32 | Stream ID | Logical stream identifier. |
 | 12 | 4 | uint32 | Session ID | Publisher session identifier. |
 | 16 | 4 | int32 | Term ID | Active term identifier for the publication log. |
@@ -42,14 +43,22 @@ Every frame starts with a fixed 44-byte header.
 | 24 | 8 | uint64 | Sequence | Monotonic publisher sequence number for the session. |
 | 32 | 4 | uint32 | Payload length | Number of payload bytes following the header. |
 | 36 | 8 | uint64 | Reserved value | Application-defined metadata, default `0`. |
+| 44 | 2 | uint16 | Fragment index | Zero-based fragment index for DATA frames. |
+| 46 | 2 | uint16 | Fragment count | Total number of fragments for the application message. |
 
-The payload starts at offset 44 and is copied exactly as provided by the caller.
+The payload starts at offset 48 and is copied exactly as provided by the caller.
 
 The reserved value follows Aeron's data-header pattern: the transport does not interpret or validate it, but applications can use it for checksums, timestamps, or other out-of-band metadata.
 
 Reference: Aeron's checksum cookbook states that Aeron does not perform an additional UDP checksum validation and recommends `ReservedValueSupplier` when applications need checksums or signatures: https://aeron.io/docs/cookbook-content/aeron-app-checksum/
 
 Reference: Aeron's publications documentation lists `ReservedValueSupplier` offer variants for injecting a header value such as a checksum or timestamp: https://aeron.io/docs/aeron/publications-subscriptions/
+
+## Frame Flags
+
+| Value | Name | Description |
+| ---: | --- | --- |
+| 1 | Fragment | DATA frame belongs to a fragmented application message. |
 
 ## Frame Types
 
@@ -64,17 +73,29 @@ Unknown frame types are decoded successfully by the low-level decoder but ignore
 
 ## Versioning
 
-The only accepted protocol version is `3`. Decoding fails if the version byte differs.
+The only accepted protocol version is `4`. Decoding fails if the version byte differs.
 
 Future incompatible changes should increment the version byte. Backward-compatible changes should use currently reserved fields only after the behavior is documented and tested.
 
-Version `3` adds term ID and term offset fields populated from the publication's active term buffer. Version `2` introduced the 36-byte little-endian header with an application-defined reserved value. Version `1` used a 32-byte big-endian header with a mandatory payload CRC32.
+Version `4` adds frame flags and DATA fragment index/count fields. Version `3` added term ID and term offset fields populated from the publication's active term buffer. Version `2` introduced the 36-byte little-endian header with an application-defined reserved value. Version `1` used a 32-byte big-endian header with a mandatory payload CRC32.
 
 ## Term Buffers
 
 Each publication owns an in-memory log with three fixed-length term buffers. A term starts `clean`, becomes `active` while frames are appended, and becomes `dirty` after rotation. When the active term cannot fit the next aligned frame, the publication rotates to the next partition, increments the term ID, clears that partition, and appends at offset `0`.
 
 Term lengths must be powers of two between 64 KiB and 1 GiB. Appended frames are aligned to 32-byte boundaries. The append position is computed as `(termID - initialTermID) * termLength + termOffset + alignedFrameLength`, matching Aeron's position model while Bunshin remains a Go-native protocol.
+
+## Fragmentation
+
+A publication splits an application payload into DATA frames whose encoded size is at most `MTUBytes`. All fragments for one application message use the same stream ID, session ID, sequence, reserved value, and fragment count. Each fragment has its own term ID and term offset because every encoded fragment is appended separately to the publication term log.
+
+All fragments for a message are sent on one QUIC stream. The subscription reassembles them by fragment index, invokes the application handler once with the full payload, and sends one ACK matching the final fragment metadata. Missing, duplicate, mismatched, or incomplete fragments are protocol errors.
+
+## Gap Detection
+
+Each subscription tracks the next expected publisher sequence per stream, session, and remote source. If a later sequence arrives first, Bunshin records the missing sequence range as a loss observation and aggregates it in `LossReports`.
+
+This is an application-level sequence report. It does not imply QUIC packet loss and does not trigger NAK repair yet. Late arrivals can fill an earlier sequence hole, but the original observation remains in the loss report for diagnostics.
 
 ## Negotiation
 
@@ -87,13 +108,13 @@ A publication sends a `HELLO` frame before its first `DATA` frame. The HELLO pay
 
 The subscription responds with `HELLO` when the version ranges overlap. If no overlap exists, it responds with `ERROR`.
 
-The current implementation supports only version `3`, so successful negotiation requires the peer range to include `3`.
+The current implementation supports only version `4`, so successful negotiation requires the peer range to include `4`.
 
 ## Error Handling
 
 The decoder rejects:
 
-- Frames shorter than 44 bytes.
+- Frames shorter than 48 bytes.
 - Frames with an invalid magic value.
 - Frames with an unsupported version.
 - Frames whose payload length extends beyond the received frame bytes.

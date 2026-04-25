@@ -4,14 +4,17 @@ import "testing"
 
 func TestFrameRoundTrip(t *testing.T) {
 	in := frame{
-		typ:        frameData,
-		streamID:   7,
-		sessionID:  11,
-		termID:     13,
-		termOffset: 17,
-		seq:        42,
-		reserved:   99,
-		payload:    []byte("hello"),
+		typ:           frameData,
+		flags:         frameFlagFragment,
+		streamID:      7,
+		sessionID:     11,
+		termID:        13,
+		termOffset:    17,
+		seq:           42,
+		reserved:      99,
+		fragmentIndex: 2,
+		fragmentCount: 3,
+		payload:       []byte("hello"),
 	}
 	buf, err := encodeFrame(in)
 	if err != nil {
@@ -22,7 +25,8 @@ func TestFrameRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out.typ != in.typ || out.streamID != in.streamID || out.sessionID != in.sessionID ||
-		out.termID != in.termID || out.termOffset != in.termOffset || out.seq != in.seq || out.reserved != in.reserved {
+		out.flags != in.flags || out.termID != in.termID || out.termOffset != in.termOffset || out.seq != in.seq ||
+		out.reserved != in.reserved || out.fragmentIndex != in.fragmentIndex || out.fragmentCount != in.fragmentCount {
 		t.Fatalf("decoded header mismatch: %#v", out)
 	}
 	if string(out.payload) != string(in.payload) {
@@ -32,14 +36,17 @@ func TestFrameRoundTrip(t *testing.T) {
 
 func TestFrameWireEncoding(t *testing.T) {
 	buf, err := encodeFrame(frame{
-		typ:        frameData,
-		streamID:   0x01020304,
-		sessionID:  0x05060708,
-		termID:     0x090a0b0c,
-		termOffset: 0x0d0e0f10,
-		seq:        0x1112131415161718,
-		reserved:   0x191a1b1c1d1e1f20,
-		payload:    []byte("x"),
+		typ:           frameData,
+		flags:         frameFlagFragment,
+		streamID:      0x01020304,
+		sessionID:     0x05060708,
+		termID:        0x090a0b0c,
+		termOffset:    0x0d0e0f10,
+		seq:           0x1112131415161718,
+		reserved:      0x191a1b1c1d1e1f20,
+		fragmentIndex: 0x2122,
+		fragmentCount: 0x2324,
+		payload:       []byte("x"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -50,6 +57,9 @@ func TestFrameWireEncoding(t *testing.T) {
 	}
 	if buf[4] != frameVersion {
 		t.Fatalf("version byte = %d, want %d", buf[4], frameVersion)
+	}
+	if got, want := buf[6:8], []byte{0x01, 0x00}; string(got) != string(want) {
+		t.Fatalf("flags bytes = %x, want %x", got, want)
 	}
 	if got, want := buf[8:12], []byte{0x04, 0x03, 0x02, 0x01}; string(got) != string(want) {
 		t.Fatalf("stream id bytes = %x, want %x", got, want)
@@ -62,6 +72,39 @@ func TestFrameWireEncoding(t *testing.T) {
 	}
 	if got, want := buf[36:44], []byte{0x20, 0x1f, 0x1e, 0x1d, 0x1c, 0x1b, 0x1a, 0x19}; string(got) != string(want) {
 		t.Fatalf("reserved value bytes = %x, want %x", got, want)
+	}
+	if got, want := buf[44:46], []byte{0x22, 0x21}; string(got) != string(want) {
+		t.Fatalf("fragment index bytes = %x, want %x", got, want)
+	}
+	if got, want := buf[46:48], []byte{0x24, 0x23}; string(got) != string(want) {
+		t.Fatalf("fragment count bytes = %x, want %x", got, want)
+	}
+}
+
+func TestDecodeFrames(t *testing.T) {
+	first, err := encodeFrame(frame{
+		typ:     frameData,
+		seq:     1,
+		payload: []byte("hello"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := encodeFrame(frame{
+		typ:     frameData,
+		seq:     2,
+		payload: []byte("world"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := decodeFrames(append(first, second...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 2 || frames[0].seq != 1 || string(frames[0].payload) != "hello" ||
+		frames[1].seq != 2 || string(frames[1].payload) != "world" {
+		t.Fatalf("decoded frames = %#v", frames)
 	}
 }
 

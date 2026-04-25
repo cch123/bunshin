@@ -38,7 +38,17 @@ snapshot := metrics.Snapshot()
 fmt.Println(snapshot.MessagesSent, snapshot.MessagesReceived)
 ```
 
-Counters currently include connections opened/accepted, messages and bytes sent/received, application-level ACKs, publication back-pressure events, send/receive errors, and protocol errors.
+Counters currently include connections opened/accepted, messages and bytes sent/received, application-level ACKs, publication back-pressure events, sequence-gap observations, missing sequence counts, send/receive errors, and protocol errors.
+
+Subscriptions also keep process-local loss reports:
+
+```go
+for _, report := range sub.LossReports() {
+    fmt.Println(report.StreamID, report.SessionID, report.ObservationCount, report.MissingMessages)
+}
+```
+
+These reports mirror the diagnostic intent of Aeron's LossStat (https://aeron.io/docs/aeron/aeron-tooling/#loss-stat), but they are based on Bunshin publisher sequence gaps rather than media-driver packet loss.
 
 ## qlog
 

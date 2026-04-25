@@ -19,7 +19,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const quicALPN = "bunshin/3"
+const quicALPN = "bunshin/4"
 
 type Message struct {
 	StreamID      uint32
@@ -35,11 +35,12 @@ type Message struct {
 type Handler func(context.Context, Message) error
 
 type SubscriptionConfig struct {
-	StreamID   uint32
-	LocalAddr  string
-	TLSConfig  *tls.Config
-	QUICConfig *quic.Config
-	Metrics    *Metrics
+	StreamID    uint32
+	LocalAddr   string
+	TLSConfig   *tls.Config
+	QUICConfig  *quic.Config
+	Metrics     *Metrics
+	LossHandler LossHandler
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, LocalAddr is ignored and the caller owns closing it.
 	PacketConn net.PacketConn
@@ -53,6 +54,7 @@ type Subscription struct {
 	listener  *quic.Listener
 	transport *quic.Transport
 	metrics   *Metrics
+	loss      *lossDetector
 	streamID  uint32
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -89,6 +91,7 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 		listener:  listener,
 		transport: transport,
 		metrics:   cfg.Metrics,
+		loss:      newLossDetector(cfg.Metrics, cfg.LossHandler),
 		streamID:  cfg.StreamID,
 		closed:    make(chan struct{}),
 	}, nil
@@ -142,6 +145,10 @@ func (s *Subscription) LocalAddr() net.Addr {
 	return s.listener.Addr()
 }
 
+func (s *Subscription) LossReports() []LossReport {
+	return s.loss.snapshot()
+}
+
 func (s *Subscription) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
@@ -173,48 +180,134 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 		return
 	}
 
-	f, err := decodeFrame(buf)
+	frames, err := decodeFrames(buf)
 	if err != nil {
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
 		_ = s.writeError(stream, 0, 0, 0, protocolErrorMalformedFrame, err.Error())
 		return
 	}
+	if len(frames) == 0 {
+		s.metrics.incReceiveErrors()
+		s.metrics.incProtocolErrors()
+		_ = s.writeError(stream, 0, 0, 0, protocolErrorMalformedFrame, "empty frame stream")
+		return
+	}
 
+	f := frames[0]
 	switch f.typ {
 	case frameHello:
-		_ = s.hello(stream, f)
-	case frameData:
-		if f.streamID != s.streamID {
+		if len(frames) != 1 {
 			s.metrics.incReceiveErrors()
 			s.metrics.incProtocolErrors()
-			_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorUnsupportedType, "unsupported stream id")
+			_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorMalformedFrame, "control stream contains multiple frames")
 			return
 		}
-		msg := Message{
-			StreamID:      f.streamID,
-			SessionID:     f.sessionID,
-			TermID:        f.termID,
-			TermOffset:    f.termOffset,
-			Sequence:      f.seq,
-			ReservedValue: f.reserved,
-			Payload:       f.payload,
-			Remote:        remote,
-		}
-		if err := handler(ctx, msg); err != nil {
-			s.metrics.incReceiveErrors()
-			_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorMalformedFrame, err.Error())
-			return
-		}
-		s.metrics.incMessagesReceived(len(f.payload))
-		if err := s.ack(stream, f); err != nil {
-			s.metrics.incReceiveErrors()
-		}
+		_ = s.hello(stream, f)
+	case frameData:
+		s.data(ctx, remote, stream, frames, handler)
 	default:
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
 		_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorUnsupportedType, "unsupported frame type")
 	}
+}
+
+func (s *Subscription) data(ctx context.Context, remote net.Addr, stream *quic.Stream, frames []frame, handler Handler) {
+	payload, ackFrame, err := reassembleDataFrames(frames)
+	if err != nil {
+		s.metrics.incReceiveErrors()
+		s.metrics.incProtocolErrors()
+		first := frames[0]
+		_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorMalformedFrame, err.Error())
+		return
+	}
+	first := frames[0]
+	if first.streamID != s.streamID {
+		s.metrics.incReceiveErrors()
+		s.metrics.incProtocolErrors()
+		_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorUnsupportedType, "unsupported stream id")
+		return
+	}
+
+	s.loss.observe(first, remote)
+	msg := Message{
+		StreamID:      first.streamID,
+		SessionID:     first.sessionID,
+		TermID:        first.termID,
+		TermOffset:    first.termOffset,
+		Sequence:      first.seq,
+		ReservedValue: first.reserved,
+		Payload:       payload,
+		Remote:        remote,
+	}
+	if err := handler(ctx, msg); err != nil {
+		s.metrics.incReceiveErrors()
+		_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorMalformedFrame, err.Error())
+		return
+	}
+	s.metrics.incMessagesReceived(len(payload))
+	if err := s.ack(stream, ackFrame); err != nil {
+		s.metrics.incReceiveErrors()
+	}
+}
+
+func reassembleDataFrames(frames []frame) ([]byte, frame, error) {
+	if len(frames) == 0 {
+		return nil, frame{}, errors.New("empty data frame stream")
+	}
+	first := frames[0]
+	if len(frames) == 1 {
+		if first.typ != frameData {
+			return nil, frame{}, errors.New("non-data frame in data stream")
+		}
+		if first.fragmentCount > 1 {
+			return nil, frame{}, errors.New("incomplete fragmented data stream")
+		}
+		return first.payload, first, nil
+	}
+
+	fragmentCount := int(first.fragmentCount)
+	if fragmentCount != len(frames) || fragmentCount < 2 {
+		return nil, frame{}, fmt.Errorf("invalid fragment count: got %d frames, header count %d", len(frames), first.fragmentCount)
+	}
+	parts := make([][]byte, fragmentCount)
+	seen := make([]bool, fragmentCount)
+	total := 0
+	ackFrame := first
+
+	for _, f := range frames {
+		if f.typ != frameData {
+			return nil, frame{}, errors.New("non-data frame in fragmented data stream")
+		}
+		if f.streamID != first.streamID || f.sessionID != first.sessionID || f.seq != first.seq || f.reserved != first.reserved {
+			return nil, frame{}, errors.New("fragment metadata mismatch")
+		}
+		if f.flags&frameFlagFragment == 0 {
+			return nil, frame{}, errors.New("fragment flag missing")
+		}
+		if int(f.fragmentCount) != fragmentCount || int(f.fragmentIndex) >= fragmentCount {
+			return nil, frame{}, errors.New("invalid fragment metadata")
+		}
+		if seen[f.fragmentIndex] {
+			return nil, frame{}, errors.New("duplicate fragment")
+		}
+		seen[f.fragmentIndex] = true
+		parts[f.fragmentIndex] = f.payload
+		total += len(f.payload)
+		if int(f.fragmentIndex) == fragmentCount-1 {
+			ackFrame = f
+		}
+	}
+
+	payload := make([]byte, 0, total)
+	for i, part := range parts {
+		if !seen[i] {
+			return nil, frame{}, errors.New("missing fragment")
+		}
+		payload = append(payload, part...)
+	}
+	return payload, ackFrame, nil
 }
 
 func (s *Subscription) hello(stream *quic.Stream, f frame) error {

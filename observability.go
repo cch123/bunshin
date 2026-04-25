@@ -17,6 +17,8 @@ type Metrics struct {
 	acksSent            atomic.Uint64
 	acksReceived        atomic.Uint64
 	backPressureEvents  atomic.Uint64
+	lossGapEvents       atomic.Uint64
+	lossGapMessages     atomic.Uint64
 	sendErrors          atomic.Uint64
 	receiveErrors       atomic.Uint64
 	protocolErrors      atomic.Uint64
@@ -32,6 +34,8 @@ type MetricsSnapshot struct {
 	AcksSent            uint64
 	AcksReceived        uint64
 	BackPressureEvents  uint64
+	LossGapEvents       uint64
+	LossGapMessages     uint64
 	SendErrors          uint64
 	ReceiveErrors       uint64
 	ProtocolErrors      uint64
@@ -51,6 +55,8 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		AcksSent:            m.acksSent.Load(),
 		AcksReceived:        m.acksReceived.Load(),
 		BackPressureEvents:  m.backPressureEvents.Load(),
+		LossGapEvents:       m.lossGapEvents.Load(),
+		LossGapMessages:     m.lossGapMessages.Load(),
 		SendErrors:          m.sendErrors.Load(),
 		ReceiveErrors:       m.receiveErrors.Load(),
 		ProtocolErrors:      m.protocolErrors.Load(),
@@ -112,6 +118,13 @@ func (m *Metrics) incAcksReceived() {
 func (m *Metrics) incBackPressureEvents() {
 	if m != nil {
 		m.backPressureEvents.Add(1)
+	}
+}
+
+func (m *Metrics) incLossGap(missingMessages uint64) {
+	if m != nil {
+		m.lossGapEvents.Add(1)
+		m.lossGapMessages.Add(missingMessages)
 	}
 }
 

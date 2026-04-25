@@ -33,6 +33,7 @@ type PublicationConfig struct {
 	SessionID              uint32
 	RemoteAddr             string
 	MaxPayloadBytes        int
+	MTUBytes               int
 	TermBufferLength       int
 	InitialTermID          int32
 	PublicationWindowBytes int
@@ -58,6 +59,7 @@ type Publication struct {
 	streamID   uint32
 	sessionID  uint32
 	maxPayload int
+	mtuPayload int
 	reserved   ReservedValueSupplier
 	terms      *termLog
 	window     *publicationWindow
@@ -76,10 +78,17 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 	if cfg.SessionID == 0 {
 		cfg.SessionID = rand.Uint32()
 	}
-	if cfg.MaxPayloadBytes == 0 {
-		cfg.MaxPayloadBytes = maxFrameSize - headerLen
+	if cfg.MTUBytes == 0 {
+		cfg.MTUBytes = maxFrameSize
 	}
-	if cfg.MaxPayloadBytes < 0 || cfg.MaxPayloadBytes > maxFrameSize-headerLen {
+	if cfg.MTUBytes <= headerLen || cfg.MTUBytes > maxFrameSize {
+		return nil, fmt.Errorf("invalid MTU bytes: %d", cfg.MTUBytes)
+	}
+	mtuPayload := cfg.MTUBytes - headerLen
+	if cfg.MaxPayloadBytes == 0 {
+		cfg.MaxPayloadBytes = mtuPayload
+	}
+	if cfg.MaxPayloadBytes < 0 || cfg.MaxPayloadBytes > mtuPayload*maxFrameFragments {
 		return nil, fmt.Errorf("invalid max payload bytes: %d", cfg.MaxPayloadBytes)
 	}
 	if cfg.TermBufferLength == 0 {
@@ -90,7 +99,7 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 		return nil, err
 	}
 	if cfg.PublicationWindowBytes == 0 {
-		cfg.PublicationWindowBytes = cfg.TermBufferLength
+		cfg.PublicationWindowBytes = max(cfg.TermBufferLength, fragmentedWindowBytes(cfg.MaxPayloadBytes, mtuPayload))
 	}
 	window, err := newPublicationWindow(cfg.PublicationWindowBytes)
 	if err != nil {
@@ -120,6 +129,7 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 		streamID:   cfg.StreamID,
 		sessionID:  cfg.SessionID,
 		maxPayload: cfg.MaxPayloadBytes,
+		mtuPayload: mtuPayload,
 		reserved:   cfg.ReservedValue,
 		terms:      terms,
 		window:     window,
@@ -148,8 +158,8 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 	default:
 	}
 
-	frameLength := headerLen + len(payload)
-	windowBytes := align(frameLength, termFrameAlignment)
+	fragmentCount := countFragments(len(payload), p.mtuPayload)
+	windowBytes := fragmentedWindowBytes(len(payload), p.mtuPayload)
 	backPressured, err := p.window.reserve(ctx, windowBytes, p.closed)
 	if backPressured {
 		p.metrics.incBackPressureEvents()
@@ -165,25 +175,7 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 	if p.reserved != nil {
 		reserved = p.reserved(payload)
 	}
-	var packet []byte
-	appendResult, err := p.terms.append(frameLength, func(appendResult termAppend) error {
-		var encodeErr error
-		packet, encodeErr = encodeFrame(frame{
-			typ:        frameData,
-			streamID:   p.streamID,
-			sessionID:  p.sessionID,
-			termID:     appendResult.TermID,
-			termOffset: appendResult.TermOffset,
-			seq:        seq,
-			reserved:   reserved,
-			payload:    payload,
-		})
-		if encodeErr != nil {
-			return encodeErr
-		}
-		copy(appendResult.Bytes(), packet)
-		return nil
-	})
+	packet, appendResult, err := p.encodeDataPacket(seq, reserved, payload, fragmentCount)
 	if err != nil {
 		p.metrics.incSendErrors()
 		return err
@@ -214,6 +206,81 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 		p.metrics.incSendErrors()
 		return &ProtocolError{Code: uint16(protocolErrorUnsupportedType), Message: "unexpected response frame"}
 	}
+}
+
+func (p *Publication) encodeDataPacket(seq, reserved uint64, payload []byte, fragmentCount int) ([]byte, termAppend, error) {
+	packet := make([]byte, 0, fragmentedPacketBytes(len(payload), p.mtuPayload))
+	var lastAppend termAppend
+
+	for fragmentIndex := 0; fragmentIndex < fragmentCount; fragmentIndex++ {
+		start := fragmentIndex * p.mtuPayload
+		if start > len(payload) {
+			start = len(payload)
+		}
+		end := min(start+p.mtuPayload, len(payload))
+		fragmentPayload := payload[start:end]
+		flags := frameFlag(0)
+		if fragmentCount > 1 {
+			flags = frameFlagFragment
+		}
+		frameLength := headerLen + len(fragmentPayload)
+
+		appendResult, err := p.terms.append(frameLength, func(appendResult termAppend) error {
+			encoded, encodeErr := encodeFrame(frame{
+				typ:           frameData,
+				flags:         flags,
+				streamID:      p.streamID,
+				sessionID:     p.sessionID,
+				termID:        appendResult.TermID,
+				termOffset:    appendResult.TermOffset,
+				seq:           seq,
+				reserved:      reserved,
+				fragmentIndex: uint16(fragmentIndex),
+				fragmentCount: uint16(fragmentCount),
+				payload:       fragmentPayload,
+			})
+			if encodeErr != nil {
+				return encodeErr
+			}
+			copy(appendResult.Bytes(), encoded)
+			packet = append(packet, encoded...)
+			return nil
+		})
+		if err != nil {
+			return nil, termAppend{}, err
+		}
+		lastAppend = appendResult
+	}
+
+	return packet, lastAppend, nil
+}
+
+func countFragments(payloadLen, fragmentPayloadMax int) int {
+	if payloadLen == 0 {
+		return 1
+	}
+	return (payloadLen + fragmentPayloadMax - 1) / fragmentPayloadMax
+}
+
+func fragmentedWindowBytes(payloadLen, fragmentPayloadMax int) int {
+	count := countFragments(payloadLen, fragmentPayloadMax)
+	total := 0
+	for i := 0; i < count; i++ {
+		fragmentPayloadLen := fragmentPayloadMax
+		if i == count-1 {
+			remaining := payloadLen - i*fragmentPayloadMax
+			if remaining < fragmentPayloadLen {
+				fragmentPayloadLen = remaining
+			}
+		}
+		total += align(headerLen+fragmentPayloadLen, termFrameAlignment)
+	}
+	return total
+}
+
+func fragmentedPacketBytes(payloadLen, fragmentPayloadMax int) int {
+	count := countFragments(payloadLen, fragmentPayloadMax)
+	return payloadLen + count*headerLen
 }
 
 func (p *Publication) LocalAddr() net.Addr {

@@ -21,8 +21,8 @@ This checklist tracks the work needed to evolve Bunshin from the current UDP pro
 - [ ] Benchmark future Aeron-backed options against the QUIC default before adding another backend.
 - [x] Implement term buffers with append positions, term IDs, and rotation.
 - [x] Add publication back pressure instead of blocking only on ACK timeout.
-- [ ] Add receiver gap detection and loss reporting.
-- [ ] Add configurable MTU and fragmentation/reassembly for payloads larger than a single datagram.
+- [x] Add receiver gap detection and loss reporting.
+- [x] Add configurable MTU and fragmentation/reassembly for payloads larger than a single datagram.
 - [ ] Add flow control strategies for unicast and multicast.
 - [ ] Add ordered delivery guarantees per stream/session.
 - [ ] Add idle strategies for low-latency polling loops.
@@ -45,9 +45,9 @@ This checklist tracks the work needed to evolve Bunshin from the current UDP pro
 
 ## Observability
 
-- [ ] Add counters for sent frames, received frames, retransmits, drops, and gaps.
+- [ ] Add counters for sent frames, received frames, retransmits, and drops.
 - [ ] Add structured logging hooks without forcing a logging dependency.
-- [ ] Add loss reports and subscription lag reporting.
+- [ ] Add subscription lag reporting.
 - [ ] Add optional pprof/expvar integration examples.
 - [ ] Add benchmark output for latency and throughput.
 

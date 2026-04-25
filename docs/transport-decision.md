@@ -30,6 +30,8 @@ For an Aeron-like goal, the evaluation must also consider:
 - Bunshin does not perform a mandatory payload CRC32 on top of QUIC. Like Aeron, it exposes an application-defined reserved value that can carry a checksum or timestamp when needed.
 - Bunshin frame fields use little-endian byte order to align with Aeron's data-header convention.
 - Publications apply a bounded send window before appending to the term log. If the window is exhausted, `Send` waits for ACK capacity until its context is done and records a back-pressure event.
+- Subscriptions report sequence gaps per stream/session/source for diagnostics. QUIC still owns transport-level retransmission.
+- Publications can split a large application payload into MTU-sized DATA frames on one QUIC stream. Subscriptions reassemble those fragments before invoking the application handler.
 - Packet-loss recovery is benchmarked by injecting drops below `quic-go`, because QUIC owns retransmission for the default backend.
 - Benchmarks should still compare QUIC with any future Aeron-backed option under the same message workload.
 - The built-in self-signed TLS configuration is for development and tests. Production users should provide explicit TLS configuration.
@@ -37,5 +39,5 @@ For an Aeron-like goal, the evaluation must also consider:
 ## Next Implementation Steps
 
 1. Benchmark future Aeron-backed options against the QUIC default before adding another backend.
-2. Add receiver gap detection and loss reporting.
-3. Add configurable MTU and fragmentation/reassembly for payloads larger than a single datagram.
+2. Add flow control strategies for unicast and multicast.
+3. Add ordered delivery guarantees per stream/session.

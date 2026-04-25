@@ -10,6 +10,8 @@ The first cut focuses on a narrow, testable slice:
 - Binary frame header with stream, session, term, sequence, and payload fields.
 - Reliable send over `quic-go` streams with application-level ACK frames.
 - Publication back pressure through a bounded in-flight send window.
+- Receiver sequence-gap detection with process-local loss reports.
+- Configurable MTU with fragmentation and reassembly for larger payloads.
 - Subscriber-side duplicate suppression.
 
 Protocol details are documented in [docs/protocol.md](docs/protocol.md).
@@ -43,4 +45,4 @@ _ = pub.Send(context.Background(), []byte("hello"))
 
 ## Scope
 
-A full Aeron-compatible Go implementation would still need loss reports, media-driver separation, archive, cluster, counters, tooling, and protocol compatibility work. This repository currently establishes the Go API and a QUIC-backed reliable transport baseline to extend from.
+A full Aeron-compatible Go implementation would still need NAK repair, media-driver separation, archive, cluster, counters, tooling, and protocol compatibility work. This repository currently establishes the Go API and a QUIC-backed reliable transport baseline to extend from.
