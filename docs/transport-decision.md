@@ -30,14 +30,18 @@ For an Aeron-like goal, the evaluation must also consider:
 - Bunshin does not perform a mandatory payload CRC32 on top of QUIC. Like Aeron, it exposes an application-defined reserved value that can carry a checksum or timestamp when needed.
 - Bunshin frame fields use little-endian byte order to align with Aeron's data-header convention.
 - Publications apply a bounded send window before appending to the term log. If the window is exhausted, `Send` waits for ACK capacity until its context is done and records a back-pressure event.
+- Flow control is strategy-driven. The default unicast strategy uses the maximum receiver right edge; multicast-oriented max and min strategies are available for future multi-receiver transports.
+- Idle strategies are available as reusable primitives for low-latency polling loops: no-op, busy-spin, yield, fixed sleep, and capped backoff.
 - Subscriptions report sequence gaps per stream/session/source for diagnostics. QUIC still owns transport-level retransmission.
+- Subscriptions buffer out-of-order messages and invoke handlers in sequence order per stream/session/source. Application-level ACKs are withheld until delivery.
 - Publications can split a large application payload into MTU-sized DATA frames on one QUIC stream. Subscriptions reassemble those fragments before invoking the application handler.
 - Packet-loss recovery is benchmarked by injecting drops below `quic-go`, because QUIC owns retransmission for the default backend.
 - Benchmarks should still compare QUIC with any future Aeron-backed option under the same message workload.
 - The built-in self-signed TLS configuration is for development and tests. Production users should provide explicit TLS configuration.
+- The embeddable media driver owns client/resource lifecycle through in-process command/control channels while QUIC remains the default transport implementation.
 
 ## Next Implementation Steps
 
 1. Benchmark future Aeron-backed options against the QUIC default before adding another backend.
-2. Add flow control strategies for unicast and multicast.
-3. Add ordered delivery guarantees per stream/session.
+2. Add shared-memory or memory-mapped IPC for local media-driver transports.
+3. Add non-blocking offer/poll APIs that use the idle strategy primitives.

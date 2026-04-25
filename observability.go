@@ -12,6 +12,10 @@ type Metrics struct {
 	connectionsAccepted atomic.Uint64
 	messagesSent        atomic.Uint64
 	messagesReceived    atomic.Uint64
+	framesSent          atomic.Uint64
+	framesReceived      atomic.Uint64
+	framesDropped       atomic.Uint64
+	retransmits         atomic.Uint64
 	bytesSent           atomic.Uint64
 	bytesReceived       atomic.Uint64
 	acksSent            atomic.Uint64
@@ -29,6 +33,10 @@ type MetricsSnapshot struct {
 	ConnectionsAccepted uint64
 	MessagesSent        uint64
 	MessagesReceived    uint64
+	FramesSent          uint64
+	FramesReceived      uint64
+	FramesDropped       uint64
+	Retransmits         uint64
 	BytesSent           uint64
 	BytesReceived       uint64
 	AcksSent            uint64
@@ -50,6 +58,10 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		ConnectionsAccepted: m.connectionsAccepted.Load(),
 		MessagesSent:        m.messagesSent.Load(),
 		MessagesReceived:    m.messagesReceived.Load(),
+		FramesSent:          m.framesSent.Load(),
+		FramesReceived:      m.framesReceived.Load(),
+		FramesDropped:       m.framesDropped.Load(),
+		Retransmits:         m.retransmits.Load(),
 		BytesSent:           m.bytesSent.Load(),
 		BytesReceived:       m.bytesReceived.Load(),
 		AcksSent:            m.acksSent.Load(),
@@ -100,6 +112,30 @@ func (m *Metrics) incMessagesReceived(bytes int) {
 	if m != nil {
 		m.messagesReceived.Add(1)
 		m.bytesReceived.Add(uint64(bytes))
+	}
+}
+
+func (m *Metrics) incFramesSent(frames int) {
+	if m != nil && frames > 0 {
+		m.framesSent.Add(uint64(frames))
+	}
+}
+
+func (m *Metrics) incFramesReceived(frames int) {
+	if m != nil && frames > 0 {
+		m.framesReceived.Add(uint64(frames))
+	}
+}
+
+func (m *Metrics) incFramesDropped(frames int) {
+	if m != nil && frames > 0 {
+		m.framesDropped.Add(uint64(frames))
+	}
+}
+
+func (m *Metrics) incRetransmits(frames int) {
+	if m != nil && frames > 0 {
+		m.retransmits.Add(uint64(frames))
 	}
 }
 

@@ -7,7 +7,7 @@ Bunshin exposes observability at two layers:
 
 ## Aeron Reference Note
 
-Aeron exposes counters through its media driver and tooling. Bunshin does not have a media driver yet, so the current `Metrics` type is a process-local counter set that mirrors the same intent: keep operational counters stable and separate from transport internals.
+Aeron exposes counters through its media driver and tooling. Bunshin's embeddable media driver exposes lifecycle counters through `MediaDriver.Snapshot`; the `Metrics` type remains a process-local counter set for stable application-level publication/subscription behavior.
 
 QUIC-specific details are exposed through qlog rather than being normalized into Bunshin counters. This keeps Bunshin counters stable while still allowing transport-level debugging.
 
@@ -38,7 +38,9 @@ snapshot := metrics.Snapshot()
 fmt.Println(snapshot.MessagesSent, snapshot.MessagesReceived)
 ```
 
-Counters currently include connections opened/accepted, messages and bytes sent/received, application-level ACKs, publication back-pressure events, sequence-gap observations, missing sequence counts, send/receive errors, and protocol errors.
+Counters currently include connections opened/accepted, messages and bytes sent/received, application-level frames sent/received/dropped, application-level retransmits, ACKs, publication back-pressure events, sequence-gap observations, missing sequence counts, send/receive errors, and protocol errors.
+
+`FramesSent` and `FramesReceived` count Bunshin protocol frames such as HELLO, DATA, ACK, and ERROR. `FramesDropped` counts valid or attempted Bunshin frames that are suppressed locally, such as duplicates or malformed/unsupported input. QUIC packet drops and QUIC retransmissions remain transport-level details exposed through qlog; Bunshin's `Retransmits` counter is reserved for future Bunshin-managed retransmission paths.
 
 Subscriptions also keep process-local loss reports:
 
@@ -49,6 +51,24 @@ for _, report := range sub.LossReports() {
 ```
 
 These reports mirror the diagnostic intent of Aeron's LossStat (https://aeron.io/docs/aeron/aeron-tooling/#loss-stat), but they are based on Bunshin publisher sequence gaps rather than media-driver packet loss.
+
+## Structured Logging
+
+`PublicationConfig.Logger` and `SubscriptionConfig.Logger` accept a dependency-free structured logging hook:
+
+```go
+logger := bunshin.LoggerFunc(func(ctx context.Context, event bunshin.LogEvent) {
+    slog.InfoContext(ctx, event.Message,
+        "level", event.Level,
+        "component", event.Component,
+        "operation", event.Operation,
+        "fields", event.Fields,
+        "error", event.Err,
+    )
+})
+```
+
+Log events cover connection/listen lifecycle, send/delivery success, back pressure, close, handler failures, and protocol errors. Bunshin does not depend on `log/slog`; the example only shows one adapter shape.
 
 ## qlog
 

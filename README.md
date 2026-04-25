@@ -10,9 +10,15 @@ The first cut focuses on a narrow, testable slice:
 - Binary frame header with stream, session, term, sequence, and payload fields.
 - Reliable send over `quic-go` streams with application-level ACK frames.
 - Publication back pressure through a bounded in-flight send window.
+- Configurable unicast/max-multicast/min-multicast flow control strategies.
+- Idle strategy primitives for low-latency polling loops.
 - Receiver sequence-gap detection with process-local loss reports.
 - Configurable MTU with fragmentation and reassembly for larger payloads.
+- Ordered delivery per stream/session/source.
 - Subscriber-side duplicate suppression.
+- Typed publication/subscription configuration with validation and defaulting.
+- Metrics, qlog, and dependency-free structured logging hooks.
+- Embeddable media driver with lifecycle counters plus memory-mapped local IPC `Offer`/`Poll` primitives.
 
 Protocol details are documented in [docs/protocol.md](docs/protocol.md).
 
@@ -23,6 +29,12 @@ Benchmark commands are documented in [docs/benchmarks.md](docs/benchmarks.md).
 Production TLS setup is documented in [docs/tls.md](docs/tls.md).
 
 Observability hooks are documented in [docs/observability.md](docs/observability.md).
+
+Archive recording and replay are documented in [docs/archive.md](docs/archive.md).
+
+The embeddable media driver is documented in [docs/media-driver.md](docs/media-driver.md).
+
+Runnable examples are available under [examples](examples).
 
 ## Example
 
@@ -45,4 +57,4 @@ _ = pub.Send(context.Background(), []byte("hello"))
 
 ## Scope
 
-A full Aeron-compatible Go implementation would still need NAK repair, media-driver separation, archive, cluster, counters, tooling, and protocol compatibility work. This repository currently establishes the Go API and a QUIC-backed reliable transport baseline to extend from.
+A full Aeron-compatible Go implementation would still need NAK repair, an external media-driver process, archive replication, cluster, tooling, and protocol compatibility work. This repository currently establishes the Go API, a QUIC-backed reliable transport baseline, and local IPC primitives to extend from.

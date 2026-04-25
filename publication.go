@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -40,7 +39,9 @@ type PublicationConfig struct {
 	TLSConfig              *tls.Config
 	QUICConfig             *quic.Config
 	Metrics                *Metrics
+	Logger                 Logger
 	ReservedValue          ReservedValueSupplier
+	FlowControl            FlowControlStrategy
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, the caller owns closing it.
 	PacketConn net.PacketConn
@@ -56,6 +57,7 @@ type Publication struct {
 	conn       *quic.Conn
 	transport  *quic.Transport
 	metrics    *Metrics
+	logger     Logger
 	streamID   uint32
 	sessionID  uint32
 	maxPayload int
@@ -63,61 +65,45 @@ type Publication struct {
 	reserved   ReservedValueSupplier
 	terms      *termLog
 	window     *publicationWindow
+	flow       FlowControlStrategy
+	flowWindow int
+	flowLimit  int64
+	flowMu     sync.Mutex
 	nextSeq    atomic.Uint64
 	closed     chan struct{}
 	closeOnce  sync.Once
 }
 
 func DialPublication(cfg PublicationConfig) (*Publication, error) {
-	if cfg.RemoteAddr == "" {
-		return nil, errors.New("remote address is required")
-	}
-	if cfg.StreamID == 0 {
-		cfg.StreamID = 1
-	}
-	if cfg.SessionID == 0 {
-		cfg.SessionID = rand.Uint32()
-	}
-	if cfg.MTUBytes == 0 {
-		cfg.MTUBytes = maxFrameSize
-	}
-	if cfg.MTUBytes <= headerLen || cfg.MTUBytes > maxFrameSize {
-		return nil, fmt.Errorf("invalid MTU bytes: %d", cfg.MTUBytes)
-	}
-	mtuPayload := cfg.MTUBytes - headerLen
-	if cfg.MaxPayloadBytes == 0 {
-		cfg.MaxPayloadBytes = mtuPayload
-	}
-	if cfg.MaxPayloadBytes < 0 || cfg.MaxPayloadBytes > mtuPayload*maxFrameFragments {
-		return nil, fmt.Errorf("invalid max payload bytes: %d", cfg.MaxPayloadBytes)
-	}
-	if cfg.TermBufferLength == 0 {
-		cfg.TermBufferLength = minTermLength
-	}
-	terms, err := newTermLog(cfg.TermBufferLength, cfg.InitialTermID)
+	normalized, err := normalizePublicationConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
-	if cfg.PublicationWindowBytes == 0 {
-		cfg.PublicationWindowBytes = max(cfg.TermBufferLength, fragmentedWindowBytes(cfg.MaxPayloadBytes, mtuPayload))
+	cfg = normalized.PublicationConfig
+
+	terms, err := newTermLog(cfg.TermBufferLength, cfg.InitialTermID)
+	if err != nil {
+		return nil, err
 	}
 	window, err := newPublicationWindow(cfg.PublicationWindowBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	tlsConf := cfg.TLSConfig
-	if tlsConf == nil {
-		tlsConf = defaultClientTLSConfig()
-	} else {
-		tlsConf = tlsConf.Clone()
-		if len(tlsConf.NextProtos) == 0 {
-			tlsConf.NextProtos = []string{quicALPN}
-		}
-	}
-
-	conn, transport, err := dialQUIC(context.Background(), cfg.RemoteAddr, tlsConf, cfg.QUICConfig, cfg.PacketConn)
+	conn, transport, err := dialQUIC(context.Background(), cfg.RemoteAddr, cfg.TLSConfig, cfg.QUICConfig, cfg.PacketConn)
 	if err != nil {
+		logEvent(context.Background(), cfg.Logger, LogEvent{
+			Level:     LogLevelError,
+			Component: "publication",
+			Operation: "dial",
+			Message:   "dial failed",
+			Fields: map[string]any{
+				"remote_addr": cfg.RemoteAddr,
+				"stream_id":   cfg.StreamID,
+				"session_id":  cfg.SessionID,
+			},
+			Err: err,
+		})
 		return nil, fmt.Errorf("dial quic publication: %w", err)
 	}
 	cfg.Metrics.incConnectionsOpened()
@@ -126,34 +112,54 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 		conn:       conn,
 		transport:  transport,
 		metrics:    cfg.Metrics,
+		logger:     cfg.Logger,
 		streamID:   cfg.StreamID,
 		sessionID:  cfg.SessionID,
 		maxPayload: cfg.MaxPayloadBytes,
-		mtuPayload: mtuPayload,
+		mtuPayload: normalized.mtuPayload,
 		reserved:   cfg.ReservedValue,
 		terms:      terms,
 		window:     window,
+		flow:       cfg.FlowControl,
+		flowWindow: cfg.PublicationWindowBytes,
+		flowLimit:  normalized.flowLimit,
 		closed:     make(chan struct{}),
 	}
 	if err := p.negotiate(context.Background()); err != nil {
+		p.log(context.Background(), LogLevelError, "negotiate", "negotiation failed", map[string]any{
+			"remote_addr": cfg.RemoteAddr,
+			"stream_id":   cfg.StreamID,
+			"session_id":  cfg.SessionID,
+		}, err)
 		_ = conn.CloseWithError(0, "negotiation failed")
 		if transport != nil {
 			_ = transport.Close()
 		}
 		return nil, err
 	}
+	p.log(context.Background(), LogLevelInfo, "dial", "publication connected", map[string]any{
+		"remote_addr": cfg.RemoteAddr,
+		"stream_id":   cfg.StreamID,
+		"session_id":  cfg.SessionID,
+	}, nil)
 	return p, nil
 }
 
 func (p *Publication) Send(ctx context.Context, payload []byte) error {
 	if len(payload) > p.maxPayload {
+		err := fmt.Errorf("payload too large: %d bytes", len(payload))
 		p.metrics.incSendErrors()
-		return fmt.Errorf("payload too large: %d bytes", len(payload))
+		p.log(ctx, LogLevelWarn, "send", "send rejected", map[string]any{
+			"bytes":     len(payload),
+			"max_bytes": p.maxPayload,
+		}, err)
+		return err
 	}
 
 	select {
 	case <-p.closed:
 		p.metrics.incSendErrors()
+		p.log(ctx, LogLevelWarn, "send", "send on closed publication", nil, ErrClosed)
 		return ErrClosed
 	default:
 	}
@@ -163,9 +169,15 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 	backPressured, err := p.window.reserve(ctx, windowBytes, p.closed)
 	if backPressured {
 		p.metrics.incBackPressureEvents()
+		p.log(ctx, LogLevelWarn, "send", "publication back pressured", map[string]any{
+			"bytes": windowBytes,
+		}, nil)
 	}
 	if err != nil {
 		p.metrics.incSendErrors()
+		p.log(ctx, LogLevelWarn, "send", "window reservation failed", map[string]any{
+			"bytes": windowBytes,
+		}, err)
 		return err
 	}
 	defer p.window.release(windowBytes)
@@ -178,34 +190,91 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 	packet, appendResult, err := p.encodeDataPacket(seq, reserved, payload, fragmentCount)
 	if err != nil {
 		p.metrics.incSendErrors()
+		p.log(ctx, LogLevelError, "send", "encode failed", map[string]any{
+			"sequence": seq,
+			"bytes":    len(payload),
+		}, err)
 		return err
 	}
 
-	resp, err := p.roundTrip(ctx, packet)
+	resp, err := p.roundTrip(ctx, packet, fragmentCount)
 	if err != nil {
 		p.metrics.incSendErrors()
+		p.log(ctx, LogLevelWarn, "send", "round trip failed", map[string]any{
+			"sequence":  seq,
+			"bytes":     len(payload),
+			"fragments": fragmentCount,
+		}, err)
 		return err
 	}
 	switch resp.typ {
 	case frameAck:
 		if resp.streamID != p.streamID || resp.sessionID != p.sessionID ||
 			resp.termID != appendResult.TermID || resp.termOffset != appendResult.TermOffset || resp.seq != seq {
+			p.metrics.incFramesDropped(1)
 			p.metrics.incProtocolErrors()
 			p.metrics.incSendErrors()
-			return &ProtocolError{Code: uint16(protocolErrorMalformedFrame), Message: "ack does not match data frame"}
+			err := &ProtocolError{Code: uint16(protocolErrorMalformedFrame), Message: "ack does not match data frame"}
+			p.log(ctx, LogLevelError, "send", "ack mismatch", map[string]any{
+				"sequence": seq,
+			}, err)
+			return err
+		}
+		if err := p.updateFlowControl(appendResult.Position); err != nil {
+			p.metrics.incSendErrors()
+			p.log(ctx, LogLevelError, "send", "flow control update failed", map[string]any{
+				"sequence": seq,
+				"position": appendResult.Position,
+			}, err)
+			return err
 		}
 		p.metrics.incMessagesSent(len(payload))
 		p.metrics.incAcksReceived()
+		p.log(ctx, LogLevelDebug, "send", "message sent", map[string]any{
+			"sequence":  seq,
+			"bytes":     len(payload),
+			"fragments": fragmentCount,
+			"position":  appendResult.Position,
+		}, nil)
 		return nil
 	case frameError:
 		p.metrics.incProtocolErrors()
 		p.metrics.incSendErrors()
-		return decodeProtocolError(resp.payload)
+		err := decodeProtocolError(resp.payload)
+		p.log(ctx, LogLevelError, "send", "peer returned protocol error", map[string]any{
+			"sequence": seq,
+		}, err)
+		return err
 	default:
+		p.metrics.incFramesDropped(1)
 		p.metrics.incProtocolErrors()
 		p.metrics.incSendErrors()
-		return &ProtocolError{Code: uint16(protocolErrorUnsupportedType), Message: "unexpected response frame"}
+		err := &ProtocolError{Code: uint16(protocolErrorUnsupportedType), Message: "unexpected response frame"}
+		p.log(ctx, LogLevelError, "send", "unexpected response frame", map[string]any{
+			"sequence": seq,
+			"type":     resp.typ,
+		}, err)
+		return err
 	}
+}
+
+func (p *Publication) updateFlowControl(receiverPosition int64) error {
+	p.flowMu.Lock()
+	defer p.flowMu.Unlock()
+
+	status := FlowControlStatus{
+		ReceiverID:   remoteAddrString(p.conn.RemoteAddr()),
+		Position:     receiverPosition,
+		WindowLength: p.flowWindow,
+		ObservedAt:   time.Now(),
+	}
+	p.flowLimit = p.flow.OnStatus(status, p.flowLimit)
+
+	limit := int(p.flowLimit - receiverPosition)
+	if limit <= 0 {
+		limit = 1
+	}
+	return p.window.setLimit(limit)
 }
 
 func (p *Publication) encodeDataPacket(seq, reserved uint64, payload []byte, fragmentCount int) ([]byte, termAppend, error) {
@@ -297,8 +366,23 @@ func (p *Publication) Close() error {
 				err = transportErr
 			}
 		}
+		p.log(context.Background(), LogLevelInfo, "close", "publication closed", map[string]any{
+			"stream_id":  p.streamID,
+			"session_id": p.sessionID,
+		}, err)
 	})
 	return err
+}
+
+func (p *Publication) log(ctx context.Context, level LogLevel, operation, message string, fields map[string]any, err error) {
+	logEvent(ctx, p.logger, LogEvent{
+		Level:     level,
+		Component: "publication",
+		Operation: operation,
+		Message:   message,
+		Fields:    fields,
+		Err:       err,
+	})
 }
 
 func (p *Publication) negotiate(ctx context.Context) error {
@@ -313,7 +397,7 @@ func (p *Publication) negotiate(ctx context.Context) error {
 		return err
 	}
 
-	resp, err := p.roundTrip(ctx, packet)
+	resp, err := p.roundTrip(ctx, packet, 1)
 	if err != nil {
 		return err
 	}
@@ -321,37 +405,59 @@ func (p *Publication) negotiate(ctx context.Context) error {
 	case frameHello:
 		hello, err := decodeHelloPayload(resp.payload)
 		if err != nil {
+			p.metrics.incFramesDropped(1)
 			return err
 		}
 		if hello.minVersion > frameVersion || hello.maxVersion < frameVersion {
+			p.metrics.incFramesDropped(1)
 			return &ProtocolError{Code: uint16(protocolErrorUnsupportedVersion), Message: "peer does not support protocol version"}
 		}
 		return nil
 	case frameError:
 		return decodeProtocolError(resp.payload)
 	default:
+		p.metrics.incFramesDropped(1)
 		return &ProtocolError{Code: uint16(protocolErrorUnsupportedType), Message: "unexpected negotiation response"}
 	}
 }
 
-func (p *Publication) roundTrip(ctx context.Context, packet []byte) (frame, error) {
+func (p *Publication) roundTrip(ctx context.Context, packet []byte, sentFrames int) (frame, error) {
 	stream, err := p.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return frame{}, err
 	}
+	stop := context.AfterFunc(ctx, func() {
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+	})
+	defer stop()
 	if _, err := stream.Write(packet); err != nil {
 		_ = stream.Close()
-		return frame{}, err
+		return frame{}, contextErrorOr(ctx, err)
 	}
+	p.metrics.incFramesSent(sentFrames)
 	if err := stream.Close(); err != nil {
-		return frame{}, err
+		return frame{}, contextErrorOr(ctx, err)
 	}
 
 	resp, err := io.ReadAll(stream)
 	if err != nil {
+		return frame{}, contextErrorOr(ctx, err)
+	}
+	f, err := decodeFrame(resp)
+	if err != nil {
+		p.metrics.incFramesDropped(1)
 		return frame{}, err
 	}
-	return decodeFrame(resp)
+	p.metrics.incFramesReceived(1)
+	return f, nil
+}
+
+func contextErrorOr(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 func decodeProtocolError(payload []byte) error {

@@ -4,9 +4,9 @@ This document describes the current Bunshin wire format. The protocol is intenti
 
 ## Compatibility Policy
 
-Bunshin does not currently target Aeron wire compatibility. The current protocol is a Bunshin-specific baseline for iterating on transport behavior in Go.
+Bunshin does not target Aeron wire compatibility. The current protocol is a Bunshin-specific baseline for iterating on transport behavior in Go.
 
-Wire compatibility may be revisited later, but doing so would require an explicit compatibility design and migration plan.
+Aeron concepts such as stream IDs, session IDs, term IDs, term offsets, and reserved values are used as design reference points only. Peers should treat Bunshin frames as a Go-native protocol, not as Aeron-compatible frames.
 
 ## Transport Assumptions
 
@@ -18,9 +18,10 @@ Wire compatibility may be revisited later, but doing so would require an explici
 - Delivery reliability, retransmission, flow control, congestion control, and TLS are provided by QUIC through `quic-go`.
 - Bunshin ACK frames confirm application-level handling, not packet-level delivery.
 - Publications apply a bounded send window before appending frames to the term log. The default window is one term buffer.
+- Publication flow control is strategy-driven. The default strategy is unicast max-right-edge flow control.
 - Subscriptions detect sequence gaps per stream/session/source and expose process-local loss reports.
-- Ordering is not guaranteed beyond the sequence number carried in each frame.
-- Multicast, shared-memory IPC, NAK repair, and receiver-side stream rebuilding are not implemented yet.
+- Subscriptions deliver messages to the application in sequence order per stream/session/source.
+- Multicast, an external media-driver process, NAK repair, and receiver-side stream rebuilding are not implemented yet.
 
 ## Byte Order
 
@@ -91,11 +92,23 @@ A publication splits an application payload into DATA frames whose encoded size 
 
 All fragments for a message are sent on one QUIC stream. The subscription reassembles them by fragment index, invokes the application handler once with the full payload, and sends one ACK matching the final fragment metadata. Missing, duplicate, mismatched, or incomplete fragments are protocol errors.
 
+## Flow Control
+
+`PublicationConfig.FlowControl` can provide a sender flow-control strategy. If unset, Bunshin uses `UnicastFlowControl`, which follows Aeron's default unicast behavior of advancing the sender limit to the maximum receiver right edge.
+
+`MaxMulticastFlowControl` applies the same max-right-edge rule for multicast-style receiver sets. `MinMulticastFlowControl` tracks receiver right edges and uses the slowest active receiver until that receiver times out. Bunshin's current QUIC transport has one remote endpoint per publication, so the multicast strategies are available as API and testable policy hooks before multicast channels are added.
+
 ## Gap Detection
 
 Each subscription tracks the next expected publisher sequence per stream, session, and remote source. If a later sequence arrives first, Bunshin records the missing sequence range as a loss observation and aggregates it in `LossReports`.
 
 This is an application-level sequence report. It does not imply QUIC packet loss and does not trigger NAK repair yet. Late arrivals can fill an earlier sequence hole, but the original observation remains in the loss report for diagnostics.
+
+## Ordered Delivery
+
+Subscriptions gate handler invocation by stream, session, and remote source. A message with a later sequence can be read from QUIC and recorded as a gap, but it is buffered until earlier sequences for the same stream/session/source have been handled. ACK frames are sent only after the corresponding message has been delivered to the handler.
+
+Duplicate or late sequences that have already been delivered are ACKed without invoking the handler again.
 
 ## Negotiation
 

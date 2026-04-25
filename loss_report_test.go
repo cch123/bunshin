@@ -71,13 +71,13 @@ func TestLossDetectorReportsLargeGapAsSingleObservation(t *testing.T) {
 
 func TestSubscriptionReportsSequenceGap(t *testing.T) {
 	subMetrics := &Metrics{}
-	var observations []LossObservation
+	observations := make(chan LossObservation, 1)
 	sub, err := ListenSubscription(SubscriptionConfig{
 		StreamID:  101,
 		LocalAddr: "127.0.0.1:0",
 		Metrics:   subMetrics,
 		LossHandler: func(observation LossObservation) {
-			observations = append(observations, observation)
+			observations <- observation
 		},
 	})
 	if err != nil {
@@ -87,7 +87,7 @@ func TestSubscriptionReportsSequenceGap(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	received := make(chan Message, 2)
+	received := make(chan Message, 3)
 	go func() {
 		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
 			received <- msg
@@ -105,25 +105,44 @@ func TestSubscriptionReportsSequenceGap(t *testing.T) {
 	}
 	defer pub.Close()
 
-	for _, seq := range []uint64{1, 3} {
-		packet, err := encodeFrame(frame{
-			typ:       frameData,
-			streamID:  101,
-			sessionID: 202,
-			seq:       seq,
-			payload:   []byte("payload"),
-		})
+	if err := sendDataFrame(ctx, pub, 101, 202, 1, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+
+	thirdErr := make(chan error, 1)
+	go func() {
+		thirdErr <- sendDataFrame(ctx, pub, 101, 202, 3, []byte("payload"))
+	}()
+
+	var observation LossObservation
+	select {
+	case observation = <-observations:
+		if observation.FromSequence != 2 || observation.ToSequence != 2 {
+			t.Fatalf("unexpected observation: %#v", observation)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	if err := sendDataFrame(ctx, pub, 101, 202, 2, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-thirdErr:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pub.roundTrip(ctx, packet); err != nil {
-			t.Fatal(err)
-		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 
-	for range 2 {
+	for _, want := range []uint64{1, 2, 3} {
 		select {
-		case <-received:
+		case msg := <-received:
+			if msg.Sequence != want {
+				t.Fatalf("received sequence = %d, want %d", msg.Sequence, want)
+			}
 		case <-ctx.Done():
 			t.Fatal(ctx.Err())
 		}
@@ -136,9 +155,6 @@ func TestSubscriptionReportsSequenceGap(t *testing.T) {
 	report := reports[0]
 	if report.StreamID != 101 || report.SessionID != 202 || report.ObservationCount != 1 || report.MissingMessages != 1 {
 		t.Fatalf("unexpected loss report: %#v", report)
-	}
-	if len(observations) != 1 || observations[0].FromSequence != 2 || observations[0].ToSequence != 2 {
-		t.Fatalf("unexpected observations: %#v", observations)
 	}
 	snapshot := subMetrics.Snapshot()
 	if snapshot.LossGapEvents != 1 || snapshot.LossGapMessages != 1 {

@@ -26,6 +26,18 @@ func newPublicationWindow(limit int) (*publicationWindow, error) {
 	}, nil
 }
 
+func (w *publicationWindow) setLimit(limit int) error {
+	if limit <= 0 {
+		return fmt.Errorf("invalid publication window bytes: %d", limit)
+	}
+	w.mu.Lock()
+	w.limit = limit
+	close(w.notify)
+	w.notify = make(chan struct{})
+	w.mu.Unlock()
+	return nil
+}
+
 func (w *publicationWindow) reserve(ctx context.Context, bytes int, closed <-chan struct{}) (bool, error) {
 	if bytes <= 0 {
 		return false, fmt.Errorf("invalid publication window reservation bytes: %d", bytes)

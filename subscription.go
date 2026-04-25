@@ -40,7 +40,9 @@ type SubscriptionConfig struct {
 	TLSConfig   *tls.Config
 	QUICConfig  *quic.Config
 	Metrics     *Metrics
+	Logger      Logger
 	LossHandler LossHandler
+	Archive     *Archive
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, LocalAddr is ignored and the caller owns closing it.
 	PacketConn net.PacketConn
@@ -54,52 +56,60 @@ type Subscription struct {
 	listener  *quic.Listener
 	transport *quic.Transport
 	metrics   *Metrics
+	logger    Logger
 	loss      *lossDetector
+	archive   *Archive
+	ordered   *orderedDelivery
 	streamID  uint32
 	closed    chan struct{}
 	closeOnce sync.Once
 }
 
 func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
-	if cfg.LocalAddr == "" && cfg.PacketConn == nil {
-		return nil, errors.New("local address is required")
-	}
-	if cfg.StreamID == 0 {
-		cfg.StreamID = 1
-	}
-
-	tlsConf := cfg.TLSConfig
-	var err error
-	if tlsConf == nil {
-		tlsConf, err = defaultServerTLSConfig()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		tlsConf = tlsConf.Clone()
-		if len(tlsConf.NextProtos) == 0 {
-			tlsConf.NextProtos = []string{quicALPN}
-		}
-	}
-
-	listener, transport, err := listenQUIC(cfg.LocalAddr, tlsConf, cfg.QUICConfig, cfg.PacketConn)
+	cfg, err := normalizeSubscriptionConfig(cfg)
 	if err != nil {
+		return nil, err
+	}
+
+	listener, transport, err := listenQUIC(cfg.LocalAddr, cfg.TLSConfig, cfg.QUICConfig, cfg.PacketConn)
+	if err != nil {
+		logEvent(context.Background(), cfg.Logger, LogEvent{
+			Level:     LogLevelError,
+			Component: "subscription",
+			Operation: "listen",
+			Message:   "listen failed",
+			Fields: map[string]any{
+				"local_addr": cfg.LocalAddr,
+				"stream_id":  cfg.StreamID,
+			},
+			Err: err,
+		})
 		return nil, fmt.Errorf("listen quic subscription: %w", err)
 	}
 
-	return &Subscription{
+	sub := &Subscription{
 		listener:  listener,
 		transport: transport,
 		metrics:   cfg.Metrics,
+		logger:    cfg.Logger,
 		loss:      newLossDetector(cfg.Metrics, cfg.LossHandler),
+		archive:   cfg.Archive,
 		streamID:  cfg.StreamID,
 		closed:    make(chan struct{}),
-	}, nil
+	}
+	sub.ordered = newOrderedDelivery(sub)
+	sub.log(context.Background(), LogLevelInfo, "listen", "subscription listening", map[string]any{
+		"local_addr": sub.LocalAddr().String(),
+		"stream_id":  sub.streamID,
+	}, nil)
+	return sub, nil
 }
 
 func (s *Subscription) Serve(ctx context.Context, handler Handler) error {
 	if handler == nil {
-		return errors.New("handler is required")
+		err := errors.New("handler is required")
+		s.log(ctx, LogLevelWarn, "serve", "serve rejected", nil, err)
+		return err
 	}
 
 	errCh := make(chan error, 1)
@@ -116,11 +126,15 @@ func (s *Subscription) Serve(ctx context.Context, handler Handler) error {
 				case <-ctx.Done():
 					errCh <- ctx.Err()
 				default:
+					s.log(ctx, LogLevelError, "accept", "accept failed", nil, err)
 					errCh <- err
 				}
 				return
 			}
 			s.metrics.incConnectionsAccepted()
+			s.log(ctx, LogLevelDebug, "accept", "connection accepted", map[string]any{
+				"remote_addr": conn.RemoteAddr().String(),
+			}, nil)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -132,10 +146,15 @@ func (s *Subscription) Serve(ctx context.Context, handler Handler) error {
 	select {
 	case <-ctx.Done():
 		_ = s.Close()
+		s.log(ctx, LogLevelInfo, "serve", "serve context done", nil, ctx.Err())
 		return ctx.Err()
 	case err := <-errCh:
 		if errors.Is(err, ErrClosed) && ctx.Err() != nil {
+			s.log(ctx, LogLevelInfo, "serve", "serve context done", nil, ctx.Err())
 			return ctx.Err()
+		}
+		if !errors.Is(err, ErrClosed) {
+			s.log(ctx, LogLevelError, "serve", "serve stopped", nil, err)
 		}
 		return err
 	}
@@ -159,6 +178,9 @@ func (s *Subscription) Close() error {
 				err = transportErr
 			}
 		}
+		s.log(context.Background(), LogLevelInfo, "close", "subscription closed", map[string]any{
+			"stream_id": s.streamID,
+		}, err)
 	})
 	return err
 }
@@ -177,6 +199,9 @@ func (s *Subscription) serveConn(ctx context.Context, conn *quic.Conn, handler H
 func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream *quic.Stream, handler Handler) {
 	buf, err := io.ReadAll(stream)
 	if err != nil {
+		s.log(ctx, LogLevelWarn, "stream", "stream read failed", map[string]any{
+			"remote_addr": remoteAddrString(remote),
+		}, err)
 		return
 	}
 
@@ -184,15 +209,18 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 	if err != nil {
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
+		s.metrics.incFramesDropped(1)
 		_ = s.writeError(stream, 0, 0, 0, protocolErrorMalformedFrame, err.Error())
 		return
 	}
 	if len(frames) == 0 {
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
+		s.metrics.incFramesDropped(1)
 		_ = s.writeError(stream, 0, 0, 0, protocolErrorMalformedFrame, "empty frame stream")
 		return
 	}
+	s.metrics.incFramesReceived(len(frames))
 
 	f := frames[0]
 	switch f.typ {
@@ -200,6 +228,7 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 		if len(frames) != 1 {
 			s.metrics.incReceiveErrors()
 			s.metrics.incProtocolErrors()
+			s.metrics.incFramesDropped(len(frames))
 			_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorMalformedFrame, "control stream contains multiple frames")
 			return
 		}
@@ -209,6 +238,7 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 	default:
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
+		s.metrics.incFramesDropped(len(frames))
 		_ = s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorUnsupportedType, "unsupported frame type")
 	}
 }
@@ -218,6 +248,7 @@ func (s *Subscription) data(ctx context.Context, remote net.Addr, stream *quic.S
 	if err != nil {
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
+		s.metrics.incFramesDropped(len(frames))
 		first := frames[0]
 		_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorMalformedFrame, err.Error())
 		return
@@ -226,6 +257,7 @@ func (s *Subscription) data(ctx context.Context, remote net.Addr, stream *quic.S
 	if first.streamID != s.streamID {
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
+		s.metrics.incFramesDropped(len(frames))
 		_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorUnsupportedType, "unsupported stream id")
 		return
 	}
@@ -241,15 +273,67 @@ func (s *Subscription) data(ctx context.Context, remote net.Addr, stream *quic.S
 		Payload:       payload,
 		Remote:        remote,
 	}
-	if err := handler(ctx, msg); err != nil {
+	if err := s.ordered.deliver(ctx, orderedMessage{
+		ctx:      ctx,
+		stream:   stream,
+		msg:      msg,
+		ackFrame: ackFrame,
+	}, handler); err != nil {
 		s.metrics.incReceiveErrors()
-		_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorMalformedFrame, err.Error())
 		return
 	}
-	s.metrics.incMessagesReceived(len(payload))
+}
+
+func (s *Subscription) handleMessage(ctx context.Context, stream *quic.Stream, msg Message, ackFrame frame, handler Handler) error {
+	if s.archive != nil {
+		record, err := s.archive.Record(msg)
+		if err != nil {
+			s.metrics.incReceiveErrors()
+			s.log(ctx, LogLevelError, "archive", "archive record failed", map[string]any{
+				"stream_id":  msg.StreamID,
+				"session_id": msg.SessionID,
+				"sequence":   msg.Sequence,
+			}, err)
+			_ = s.writeError(stream, msg.StreamID, msg.SessionID, msg.Sequence, protocolErrorMalformedFrame, err.Error())
+			return err
+		}
+		s.log(ctx, LogLevelDebug, "archive", "message recorded", map[string]any{
+			"stream_id":        msg.StreamID,
+			"session_id":       msg.SessionID,
+			"sequence":         msg.Sequence,
+			"archive_position": record.Position,
+		}, nil)
+	}
+	if err := handler(ctx, msg); err != nil {
+		s.metrics.incReceiveErrors()
+		s.log(ctx, LogLevelWarn, "handler", "handler failed", map[string]any{
+			"stream_id":   msg.StreamID,
+			"session_id":  msg.SessionID,
+			"sequence":    msg.Sequence,
+			"bytes":       len(msg.Payload),
+			"remote_addr": remoteAddrString(msg.Remote),
+		}, err)
+		_ = s.writeError(stream, msg.StreamID, msg.SessionID, msg.Sequence, protocolErrorMalformedFrame, err.Error())
+		return err
+	}
+	s.metrics.incMessagesReceived(len(msg.Payload))
 	if err := s.ack(stream, ackFrame); err != nil {
 		s.metrics.incReceiveErrors()
+		s.log(ctx, LogLevelWarn, "ack", "ack failed", map[string]any{
+			"stream_id":  msg.StreamID,
+			"session_id": msg.SessionID,
+			"sequence":   msg.Sequence,
+		}, err)
+		return err
 	}
+	s.log(ctx, LogLevelDebug, "deliver", "message delivered", map[string]any{
+		"stream_id":   msg.StreamID,
+		"session_id":  msg.SessionID,
+		"sequence":    msg.Sequence,
+		"bytes":       len(msg.Payload),
+		"remote_addr": remoteAddrString(msg.Remote),
+	}, nil)
+	return nil
 }
 
 func reassembleDataFrames(frames []frame) ([]byte, frame, error) {
@@ -314,10 +398,12 @@ func (s *Subscription) hello(stream *quic.Stream, f frame) error {
 	hello, err := decodeHelloPayload(f.payload)
 	if err != nil {
 		s.metrics.incProtocolErrors()
+		s.metrics.incFramesDropped(1)
 		return s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorMalformedFrame, err.Error())
 	}
 	if hello.minVersion > frameVersion || hello.maxVersion < frameVersion {
 		s.metrics.incProtocolErrors()
+		s.metrics.incFramesDropped(1)
 		return s.writeError(stream, f.streamID, f.sessionID, f.seq, protocolErrorUnsupportedVersion, "unsupported protocol version")
 	}
 
@@ -334,6 +420,7 @@ func (s *Subscription) hello(stream *quic.Stream, f frame) error {
 	if _, err := stream.Write(packet); err != nil {
 		return err
 	}
+	s.metrics.incFramesSent(1)
 	return stream.Close()
 }
 
@@ -352,6 +439,7 @@ func (s *Subscription) ack(stream *quic.Stream, f frame) error {
 	if _, err := stream.Write(packet); err != nil {
 		return err
 	}
+	s.metrics.incFramesSent(1)
 	if err := stream.Close(); err != nil {
 		return err
 	}
@@ -360,6 +448,13 @@ func (s *Subscription) ack(stream *quic.Stream, f frame) error {
 }
 
 func (s *Subscription) writeError(stream *quic.Stream, streamID, sessionID uint32, seq uint64, code protocolErrorCode, message string) error {
+	s.log(context.Background(), LogLevelWarn, "protocol", "protocol error sent", map[string]any{
+		"stream_id":  streamID,
+		"session_id": sessionID,
+		"sequence":   seq,
+		"code":       code,
+		"message":    message,
+	}, nil)
 	packet, err := encodeFrame(frame{
 		typ:       frameError,
 		streamID:  streamID,
@@ -376,7 +471,19 @@ func (s *Subscription) writeError(stream *quic.Stream, streamID, sessionID uint3
 	if _, err := stream.Write(packet); err != nil {
 		return err
 	}
+	s.metrics.incFramesSent(1)
 	return stream.Close()
+}
+
+func (s *Subscription) log(ctx context.Context, level LogLevel, operation, message string, fields map[string]any, err error) {
+	logEvent(ctx, s.logger, LogEvent{
+		Level:     level,
+		Component: "subscription",
+		Operation: operation,
+		Message:   message,
+		Fields:    fields,
+		Err:       err,
+	})
 }
 
 func defaultClientTLSConfig() *tls.Config {
