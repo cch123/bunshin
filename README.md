@@ -7,8 +7,9 @@ Implementation decisions should follow the Aeron-first principle documented in [
 The first cut focuses on a narrow, testable slice:
 
 - QUIC-backed publication/subscription.
-- Binary frame header with stream, session, sequence, and payload fields.
+- Binary frame header with stream, session, term, sequence, and payload fields.
 - Reliable send over `quic-go` streams with application-level ACK frames.
+- Publication back pressure through a bounded in-flight send window.
 - Subscriber-side duplicate suppression.
 
 Protocol details are documented in [docs/protocol.md](docs/protocol.md).
@@ -42,4 +43,4 @@ _ = pub.Send(context.Background(), []byte("hello"))
 
 ## Scope
 
-A full Aeron-compatible Go implementation would still need term buffers, loss reports, media-driver separation, archive, cluster, counters, tooling, and protocol compatibility work. This repository currently establishes the Go API and a QUIC-backed reliable transport baseline to extend from.
+A full Aeron-compatible Go implementation would still need loss reports, media-driver separation, archive, cluster, counters, tooling, and protocol compatibility work. This repository currently establishes the Go API and a QUIC-backed reliable transport baseline to extend from.

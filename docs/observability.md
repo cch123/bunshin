@@ -38,7 +38,7 @@ snapshot := metrics.Snapshot()
 fmt.Println(snapshot.MessagesSent, snapshot.MessagesReceived)
 ```
 
-Counters currently include connections opened/accepted, messages and bytes sent/received, application-level ACKs, send/receive errors, and protocol errors.
+Counters currently include connections opened/accepted, messages and bytes sent/received, application-level ACKs, publication back-pressure events, send/receive errors, and protocol errors.
 
 ## qlog
 

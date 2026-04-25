@@ -19,14 +19,17 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const quicALPN = "bunshin/1"
+const quicALPN = "bunshin/3"
 
 type Message struct {
-	StreamID  uint32
-	SessionID uint32
-	Sequence  uint64
-	Payload   []byte
-	Remote    net.Addr
+	StreamID      uint32
+	SessionID     uint32
+	TermID        int32
+	TermOffset    int32
+	Sequence      uint64
+	ReservedValue uint64
+	Payload       []byte
+	Remote        net.Addr
 }
 
 type Handler func(context.Context, Message) error
@@ -189,11 +192,14 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 			return
 		}
 		msg := Message{
-			StreamID:  f.streamID,
-			SessionID: f.sessionID,
-			Sequence:  f.seq,
-			Payload:   f.payload,
-			Remote:    remote,
+			StreamID:      f.streamID,
+			SessionID:     f.sessionID,
+			TermID:        f.termID,
+			TermOffset:    f.termOffset,
+			Sequence:      f.seq,
+			ReservedValue: f.reserved,
+			Payload:       f.payload,
+			Remote:        remote,
 		}
 		if err := handler(ctx, msg); err != nil {
 			s.metrics.incReceiveErrors()
@@ -240,10 +246,12 @@ func (s *Subscription) hello(stream *quic.Stream, f frame) error {
 
 func (s *Subscription) ack(stream *quic.Stream, f frame) error {
 	packet, err := encodeFrame(frame{
-		typ:       frameAck,
-		streamID:  f.streamID,
-		sessionID: f.sessionID,
-		seq:       f.seq,
+		typ:        frameAck,
+		streamID:   f.streamID,
+		sessionID:  f.sessionID,
+		termID:     f.termID,
+		termOffset: f.termOffset,
+		seq:        f.seq,
 	})
 	if err != nil {
 		return err

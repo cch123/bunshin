@@ -26,14 +26,20 @@ func (e *ProtocolError) Error() string {
 	return fmt.Sprintf("bunshin protocol error %d: %s", e.Code, e.Message)
 }
 
+type ReservedValueSupplier func(payload []byte) uint64
+
 type PublicationConfig struct {
-	StreamID        uint32
-	SessionID       uint32
-	RemoteAddr      string
-	MaxPayloadBytes int
-	TLSConfig       *tls.Config
-	QUICConfig      *quic.Config
-	Metrics         *Metrics
+	StreamID               uint32
+	SessionID              uint32
+	RemoteAddr             string
+	MaxPayloadBytes        int
+	TermBufferLength       int
+	InitialTermID          int32
+	PublicationWindowBytes int
+	TLSConfig              *tls.Config
+	QUICConfig             *quic.Config
+	Metrics                *Metrics
+	ReservedValue          ReservedValueSupplier
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, the caller owns closing it.
 	PacketConn net.PacketConn
@@ -52,6 +58,9 @@ type Publication struct {
 	streamID   uint32
 	sessionID  uint32
 	maxPayload int
+	reserved   ReservedValueSupplier
+	terms      *termLog
+	window     *publicationWindow
 	nextSeq    atomic.Uint64
 	closed     chan struct{}
 	closeOnce  sync.Once
@@ -72,6 +81,20 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 	}
 	if cfg.MaxPayloadBytes < 0 || cfg.MaxPayloadBytes > maxFrameSize-headerLen {
 		return nil, fmt.Errorf("invalid max payload bytes: %d", cfg.MaxPayloadBytes)
+	}
+	if cfg.TermBufferLength == 0 {
+		cfg.TermBufferLength = minTermLength
+	}
+	terms, err := newTermLog(cfg.TermBufferLength, cfg.InitialTermID)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.PublicationWindowBytes == 0 {
+		cfg.PublicationWindowBytes = cfg.TermBufferLength
+	}
+	window, err := newPublicationWindow(cfg.PublicationWindowBytes)
+	if err != nil {
+		return nil, err
 	}
 
 	tlsConf := cfg.TLSConfig
@@ -97,6 +120,9 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 		streamID:   cfg.StreamID,
 		sessionID:  cfg.SessionID,
 		maxPayload: cfg.MaxPayloadBytes,
+		reserved:   cfg.ReservedValue,
+		terms:      terms,
+		window:     window,
 		closed:     make(chan struct{}),
 	}
 	if err := p.negotiate(context.Background()); err != nil {
@@ -122,13 +148,41 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 	default:
 	}
 
+	frameLength := headerLen + len(payload)
+	windowBytes := align(frameLength, termFrameAlignment)
+	backPressured, err := p.window.reserve(ctx, windowBytes, p.closed)
+	if backPressured {
+		p.metrics.incBackPressureEvents()
+	}
+	if err != nil {
+		p.metrics.incSendErrors()
+		return err
+	}
+	defer p.window.release(windowBytes)
+
 	seq := p.nextSeq.Add(1)
-	packet, err := encodeFrame(frame{
-		typ:       frameData,
-		streamID:  p.streamID,
-		sessionID: p.sessionID,
-		seq:       seq,
-		payload:   payload,
+	var reserved uint64
+	if p.reserved != nil {
+		reserved = p.reserved(payload)
+	}
+	var packet []byte
+	appendResult, err := p.terms.append(frameLength, func(appendResult termAppend) error {
+		var encodeErr error
+		packet, encodeErr = encodeFrame(frame{
+			typ:        frameData,
+			streamID:   p.streamID,
+			sessionID:  p.sessionID,
+			termID:     appendResult.TermID,
+			termOffset: appendResult.TermOffset,
+			seq:        seq,
+			reserved:   reserved,
+			payload:    payload,
+		})
+		if encodeErr != nil {
+			return encodeErr
+		}
+		copy(appendResult.Bytes(), packet)
+		return nil
 	})
 	if err != nil {
 		p.metrics.incSendErrors()
@@ -142,7 +196,8 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 	}
 	switch resp.typ {
 	case frameAck:
-		if resp.streamID != p.streamID || resp.sessionID != p.sessionID || resp.seq != seq {
+		if resp.streamID != p.streamID || resp.sessionID != p.sessionID ||
+			resp.termID != appendResult.TermID || resp.termOffset != appendResult.TermOffset || resp.seq != seq {
 			p.metrics.incProtocolErrors()
 			p.metrics.incSendErrors()
 			return &ProtocolError{Code: uint16(protocolErrorMalformedFrame), Message: "ack does not match data frame"}

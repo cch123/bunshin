@@ -7,7 +7,7 @@ This checklist tracks the work needed to evolve Bunshin from the current UDP pro
 - [x] Document the current frame format, wire assumptions, byte order, and versioning policy.
 - [x] Decide whether Bunshin targets Aeron wire compatibility or a Go-native Aeron-inspired protocol.
 - [x] Add protocol negotiation and explicit error frames.
-- [x] Add checksums or integrity validation for data frames.
+- [x] Add optional reserved value support for application-level integrity metadata.
 - [x] Add fuzz tests for frame decoding and malformed packets.
 
 ## Transport Core
@@ -17,10 +17,10 @@ This checklist tracks the work needed to evolve Bunshin from the current UDP pro
 - [x] Add packet-loss recovery benchmark harness for QUIC.
 - [x] Add production TLS configuration examples.
 - [x] Add qlog and metrics hooks for QUIC observability.
-- [ ] Evaluate whether Bunshin's payload CRC32 should remain on top of QUIC transport integrity.
+- [x] Evaluate whether Bunshin's payload CRC32 should remain on top of QUIC transport integrity.
 - [ ] Benchmark future Aeron-backed options against the QUIC default before adding another backend.
-- [ ] Implement term buffers with append positions, term IDs, and rotation.
-- [ ] Add publication back pressure instead of blocking only on ACK timeout.
+- [x] Implement term buffers with append positions, term IDs, and rotation.
+- [x] Add publication back pressure instead of blocking only on ACK timeout.
 - [ ] Add receiver gap detection and loss reporting.
 - [ ] Add configurable MTU and fragmentation/reassembly for payloads larger than a single datagram.
 - [ ] Add flow control strategies for unicast and multicast.
@@ -45,7 +45,7 @@ This checklist tracks the work needed to evolve Bunshin from the current UDP pro
 
 ## Observability
 
-- [ ] Add counters for sent frames, received frames, retransmits, drops, gaps, and back pressure.
+- [ ] Add counters for sent frames, received frames, retransmits, drops, and gaps.
 - [ ] Add structured logging hooks without forcing a logging dependency.
 - [ ] Add loss reports and subscription lag reporting.
 - [ ] Add optional pprof/expvar integration examples.
