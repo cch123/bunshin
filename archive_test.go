@@ -40,6 +40,22 @@ func TestArchiveRecordReplayAndFilter(t *testing.T) {
 	if first.Position != 0 || first.NextPosition <= first.Position || second.Position != first.NextPosition {
 		t.Fatalf("unexpected positions: first=%#v second=%#v", first, second)
 	}
+	if first.RecordingID == 0 || second.RecordingID != first.RecordingID {
+		t.Fatalf("unexpected recording ids: first=%#v second=%#v", first, second)
+	}
+	descriptors, err := archive.ListRecordings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(descriptors) != 1 || descriptors[0].RecordingID != first.RecordingID || descriptors[0].StopPosition != second.NextPosition {
+		t.Fatalf("unexpected catalog descriptors: %#v", descriptors)
+	}
+	if _, err := os.Stat(filepath.Join(archive.dir, archiveCatalogFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(archive.segmentPath(first.RecordingID, first.SegmentBase)); err != nil {
+		t.Fatal(err)
+	}
 
 	var replayed []Message
 	err = archive.Replay(context.Background(), ArchiveReplayConfig{FromPosition: 0}, func(_ context.Context, msg Message) error {
@@ -216,10 +232,17 @@ func TestArchiveTruncatePurgeAndIntegrityScan(t *testing.T) {
 	if report.Records != 0 || report.Bytes != 0 {
 		t.Fatalf("unexpected scan after purge: %#v", report)
 	}
+	descriptors, err := archive.ListRecordings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(descriptors) != 0 {
+		t.Fatalf("recordings were not purged: %#v", descriptors)
+	}
 }
 
 func TestArchiveIntegrityScanDetectsCorruption(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "archive.bsar")
+	path := filepath.Join(t.TempDir(), "archive")
 	archive, err := OpenArchive(ArchiveConfig{Path: path})
 	if err != nil {
 		t.Fatal(err)
@@ -231,11 +254,11 @@ func TestArchiveIntegrityScanDetectsCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	file, err := os.OpenFile(archive.segmentPath(record.RecordingID, record.SegmentBase), os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.WriteAt([]byte{'x'}, record.Position+archiveHeaderLen); err != nil {
+	if _, err := file.WriteAt([]byte{'x'}, record.Position-record.SegmentBase+archiveHeaderLen); err != nil {
 		_ = file.Close()
 		t.Fatal(err)
 	}
@@ -249,6 +272,279 @@ func TestArchiveIntegrityScanDetectsCorruption(t *testing.T) {
 	}
 	if report.CorruptPosition != record.Position || report.Records != 0 {
 		t.Fatalf("unexpected corrupt report: %#v", report)
+	}
+}
+
+func TestArchiveRecordsAcrossSegmentFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "archive")
+	archive, err := OpenArchive(ArchiveConfig{
+		Path:          dir,
+		SegmentLength: 192,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+
+	first, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 1, Payload: []byte("0123456789012345678901234567890123456789")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 2, Payload: []byte("abcdefghijklmnopqrstuvwxyzabcdefghijklmn")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SegmentBase != 0 || second.SegmentBase != 192 || second.Position != 192 {
+		t.Fatalf("unexpected segment rollover: first=%#v second=%#v", first, second)
+	}
+	if _, err := os.Stat(archive.segmentPath(first.RecordingID, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(archive.segmentPath(second.RecordingID, 192)); err != nil {
+		t.Fatal(err)
+	}
+
+	var replayed []Message
+	if err := archive.Replay(context.Background(), ArchiveReplayConfig{RecordingID: first.RecordingID}, func(_ context.Context, msg Message) error {
+		replayed = append(replayed, msg)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 2 || replayed[0].Sequence != 1 || replayed[1].Sequence != 2 {
+		t.Fatalf("unexpected replay across segments: %#v", replayed)
+	}
+
+	report, err := archive.IntegrityScan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Recordings != 1 || report.Records != 2 || report.Bytes != second.NextPosition {
+		t.Fatalf("unexpected segment scan report: %#v", report)
+	}
+}
+
+func TestArchiveReopensCatalogAndExtendsRecording(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "archive")
+	archive, err := OpenArchive(ArchiveConfig{Path: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := archive.Record(Message{StreamID: 7, SessionID: 8, Sequence: 1, Payload: []byte("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenArchive(ArchiveConfig{Path: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	descriptor, err := reopened.RecordingDescriptor(first.RecordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.StopPosition != first.NextPosition {
+		t.Fatalf("reopened descriptor stop = %d, want %d", descriptor.StopPosition, first.NextPosition)
+	}
+
+	second, err := reopened.Record(Message{StreamID: 7, SessionID: 8, Sequence: 2, Payload: []byte("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.RecordingID != first.RecordingID || second.Position != first.NextPosition {
+		t.Fatalf("recording was not extended: first=%#v second=%#v", first, second)
+	}
+
+	var replayed []Message
+	if err := reopened.Replay(context.Background(), ArchiveReplayConfig{RecordingID: first.RecordingID}, func(_ context.Context, msg Message) error {
+		replayed = append(replayed, msg)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 2 || string(replayed[0].Payload) != "first" || string(replayed[1].Payload) != "second" {
+		t.Fatalf("unexpected replay after reopen: %#v", replayed)
+	}
+}
+
+func TestArchiveRecordingEvents(t *testing.T) {
+	var events []ArchiveRecordingEvent
+	collect := func(event ArchiveRecordingEvent) {
+		events = append(events, event)
+	}
+	archive, err := OpenArchive(ArchiveConfig{
+		Path:                     filepath.Join(t.TempDir(), "archive"),
+		RecordingProgressHandler: collect,
+		RecordingSignalHandler:   collect,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+
+	first, err := archive.Record(Message{StreamID: 1, SessionID: 2, Sequence: 10, Payload: []byte("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := archive.Record(Message{StreamID: 1, SessionID: 2, Sequence: 11, Payload: []byte("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Truncate(second.Position); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Purge(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantSignals := []ArchiveRecordingSignal{
+		ArchiveRecordingSignalStart,
+		ArchiveRecordingSignalProgress,
+		ArchiveRecordingSignalProgress,
+		ArchiveRecordingSignalTruncate,
+		ArchiveRecordingSignalPurge,
+	}
+	if len(events) != len(wantSignals) {
+		t.Fatalf("events = %#v, want %d events", events, len(wantSignals))
+	}
+	for i, signal := range wantSignals {
+		if events[i].Signal != signal {
+			t.Fatalf("event %d signal = %q, want %q; events=%#v", i, events[i].Signal, signal, events)
+		}
+		if events[i].RecordingID != first.RecordingID {
+			t.Fatalf("event %d recording id = %d, want %d", i, events[i].RecordingID, first.RecordingID)
+		}
+	}
+	if events[1].Position != first.Position || events[1].NextPosition != first.NextPosition ||
+		events[1].StreamID != 1 || events[1].SessionID != 2 || events[1].Sequence != 10 ||
+		events[1].PayloadLength != len("first") {
+		t.Fatalf("unexpected first progress event: %#v", events[1])
+	}
+	if events[2].Position != second.Position || events[2].NextPosition != second.NextPosition ||
+		events[2].Descriptor.StopPosition != second.NextPosition {
+		t.Fatalf("unexpected second progress event: %#v", events[2])
+	}
+	if events[3].Position != second.Position || events[3].Descriptor.StopPosition != second.Position {
+		t.Fatalf("unexpected truncate event: %#v", events[3])
+	}
+	if events[4].Descriptor.StopPosition != second.Position {
+		t.Fatalf("unexpected purge event: %#v", events[4])
+	}
+}
+
+func TestArchiveRecordingExtendSignal(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "archive")
+	archive, err := OpenArchive(ArchiveConfig{Path: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := archive.Record(Message{StreamID: 7, SessionID: 8, Sequence: 1, Payload: []byte("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []ArchiveRecordingEvent
+	collect := func(event ArchiveRecordingEvent) {
+		events = append(events, event)
+	}
+	reopened, err := OpenArchive(ArchiveConfig{
+		Path:                     dir,
+		RecordingProgressHandler: collect,
+		RecordingSignalHandler:   collect,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	second, err := reopened.Record(Message{StreamID: 7, SessionID: 8, Sequence: 2, Payload: []byte("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSignals := []ArchiveRecordingSignal{
+		ArchiveRecordingSignalExtend,
+		ArchiveRecordingSignalProgress,
+	}
+	if len(events) != len(wantSignals) {
+		t.Fatalf("events = %#v, want %d events", events, len(wantSignals))
+	}
+	for i, signal := range wantSignals {
+		if events[i].Signal != signal {
+			t.Fatalf("event %d signal = %q, want %q", i, events[i].Signal, signal)
+		}
+	}
+	if events[0].RecordingID != first.RecordingID || events[0].Position != first.NextPosition ||
+		events[0].NextPosition != second.NextPosition || events[0].Descriptor.StopPosition != second.NextPosition {
+		t.Fatalf("unexpected extend event: %#v", events[0])
+	}
+}
+
+func TestArchiveStartStopCreatesRecordingBoundaries(t *testing.T) {
+	var events []ArchiveRecordingEvent
+	collect := func(event ArchiveRecordingEvent) {
+		events = append(events, event)
+	}
+	archive, err := OpenArchive(ArchiveConfig{
+		Path:                     filepath.Join(t.TempDir(), "archive"),
+		RecordingProgressHandler: collect,
+		RecordingSignalHandler:   collect,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+
+	firstDesc, err := archive.StartRecording(10, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := archive.Record(Message{StreamID: 10, SessionID: 20, Sequence: 1, Payload: []byte("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := archive.StopRecording(firstDesc.RecordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := archive.Record(Message{StreamID: 10, SessionID: 20, Sequence: 2, Payload: []byte("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.RecordingID != firstDesc.RecordingID || stopped.StopPosition != first.NextPosition {
+		t.Fatalf("unexpected first recording boundary: desc=%#v first=%#v stopped=%#v", firstDesc, first, stopped)
+	}
+	if second.RecordingID == first.RecordingID || second.Position != 0 {
+		t.Fatalf("second record did not start a new recording: first=%#v second=%#v", first, second)
+	}
+	descriptors, err := archive.ListRecordings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(descriptors) != 2 || descriptors[0].RecordingID != first.RecordingID || descriptors[1].RecordingID != second.RecordingID {
+		t.Fatalf("unexpected descriptors after start/stop: %#v", descriptors)
+	}
+
+	wantSignals := []ArchiveRecordingSignal{
+		ArchiveRecordingSignalStart,
+		ArchiveRecordingSignalProgress,
+		ArchiveRecordingSignalStop,
+		ArchiveRecordingSignalStart,
+		ArchiveRecordingSignalProgress,
+	}
+	if len(events) != len(wantSignals) {
+		t.Fatalf("events = %#v, want %d events", events, len(wantSignals))
+	}
+	for i, signal := range wantSignals {
+		if events[i].Signal != signal {
+			t.Fatalf("event %d signal = %q, want %q", i, events[i].Signal, signal)
+		}
 	}
 }
 
@@ -272,7 +568,7 @@ func openTestArchive(t *testing.T) *Archive {
 	t.Helper()
 
 	archive, err := OpenArchive(ArchiveConfig{
-		Path: filepath.Join(t.TempDir(), "archive.bsar"),
+		Path: filepath.Join(t.TempDir(), "archive"),
 	})
 	if err != nil {
 		t.Fatal(err)

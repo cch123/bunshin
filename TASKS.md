@@ -92,11 +92,11 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 - [x] Implement recording of live streams.
 - [x] Implement replay from a recorded position.
 - [x] Implement truncate, purge, and integrity scan operations.
-- [ ] Add a recording catalog with recording IDs, descriptors, start positions, stop positions, and source metadata.
-- [ ] Add archive control API/server for start, stop, list, query, replay, truncate, and purge requests.
-- [ ] Add recording progress events and recording signal callbacks.
-- [ ] Add recording extension support for appending to existing recordings.
-- [ ] Add segmented recording files with configurable segment length.
+- [x] Add a recording catalog with recording IDs, descriptors, start positions, stop positions, and source metadata.
+- [x] Add archive control API/server for start, stop, list, query, replay, truncate, and purge requests.
+- [x] Add recording progress events and recording signal callbacks.
+- [x] Add recording extension support for appending to existing recordings.
+- [x] Add segmented recording files with configurable segment length.
 - [ ] Add replay merge from recorded history into a live stream.
 - [ ] Add archive replication between nodes.
 - [ ] Add archive segment attach, detach, delete, and migrate operations.
