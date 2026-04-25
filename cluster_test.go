@@ -2,6 +2,7 @@ package bunshin
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"testing"
 )
@@ -166,12 +167,161 @@ func TestInMemoryClusterLogSnapshotsClonePayloads(t *testing.T) {
 	}
 }
 
+func TestClusterSnapshotRecoverySkipsReplayedEntries(t *testing.T) {
+	log := NewInMemoryClusterLog()
+	store := NewInMemoryClusterSnapshotStore()
+	firstService := &snapshotCounterService{}
+	first, err := StartClusterNode(context.Background(), ClusterConfig{
+		Log:           log,
+		SnapshotStore: store,
+		Service:       firstService,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := first.NewClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Send(context.Background(), []byte("increment")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Send(context.Background(), []byte("increment")); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := first.TakeSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Position != 2 || binary.BigEndian.Uint64(snapshot.Payload) != 2 {
+		t.Fatalf("unexpected snapshot: %#v", snapshot)
+	}
+	if _, err := client.Send(context.Background(), []byte("increment")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	secondService := &snapshotCounterService{}
+	second, err := StartClusterNode(context.Background(), ClusterConfig{
+		Log:           log,
+		SnapshotStore: store,
+		Service:       secondService,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close(context.Background())
+
+	if secondService.value != 3 || secondService.loadedSnapshotPosition != 2 || secondService.replayed != 1 ||
+		secondService.startContext.SnapshotPosition != 2 || secondService.startContext.LastPosition != 3 {
+		t.Fatalf("unexpected recovered service: %#v", secondService)
+	}
+	status, err := second.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.SnapshotPosition != 2 || status.LastPosition != 3 {
+		t.Fatalf("unexpected cluster snapshot status: %#v", status)
+	}
+}
+
+func TestClusterSnapshotRequiresStoreAndServiceSupport(t *testing.T) {
+	service := &snapshotCounterService{}
+	node, err := StartClusterNode(context.Background(), ClusterConfig{Service: service})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close(context.Background())
+	if _, err := node.TakeSnapshot(context.Background()); !errors.Is(err, ErrClusterSnapshotStoreUnavailable) {
+		t.Fatalf("TakeSnapshot() err = %v, want %v", err, ErrClusterSnapshotStoreUnavailable)
+	}
+
+	store := NewInMemoryClusterSnapshotStore()
+	if err := store.Save(context.Background(), ClusterStateSnapshot{Position: 1, Payload: []byte("state")}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = StartClusterNode(context.Background(), ClusterConfig{
+		Log:           NewInMemoryClusterLog(),
+		SnapshotStore: store,
+		Service:       ClusterHandler(func(context.Context, ClusterMessage) ([]byte, error) { return nil, nil }),
+	})
+	if !errors.Is(err, ErrClusterSnapshotUnsupported) {
+		t.Fatalf("StartClusterNode() err = %v, want %v", err, ErrClusterSnapshotUnsupported)
+	}
+}
+
+func TestInMemoryClusterSnapshotStoreClonesPayloads(t *testing.T) {
+	store := NewInMemoryClusterSnapshotStore()
+	payload := []byte("state")
+	if err := store.Save(context.Background(), ClusterStateSnapshot{Position: 3, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	payload[0] = 'x'
+	snapshot, ok, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || snapshot.Position != 3 || string(snapshot.Payload) != "state" {
+		t.Fatalf("unexpected loaded snapshot: %#v ok=%v", snapshot, ok)
+	}
+	snapshot.Payload[1] = 'x'
+	again, ok, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || string(again.Payload) != "state" {
+		t.Fatalf("snapshot store did not clone payloads: %#v", again)
+	}
+}
+
 type recordingClusterService struct {
 	starts       int
 	stops        int
 	messages     int
 	startContext ClusterServiceContext
 	stopContext  ClusterServiceContext
+}
+
+type snapshotCounterService struct {
+	value                  uint64
+	replayed               int
+	loadedSnapshotPosition int64
+	startContext           ClusterServiceContext
+}
+
+func (s *snapshotCounterService) OnClusterStart(_ context.Context, ctx ClusterServiceContext) error {
+	s.startContext = ctx
+	return nil
+}
+
+func (s *snapshotCounterService) OnClusterStop(context.Context, ClusterServiceContext) error {
+	return nil
+}
+
+func (s *snapshotCounterService) OnClusterMessage(_ context.Context, msg ClusterMessage) ([]byte, error) {
+	if msg.Replay {
+		s.replayed++
+	}
+	if string(msg.Payload) == "increment" {
+		s.value++
+	}
+	response := make([]byte, 8)
+	binary.BigEndian.PutUint64(response, s.value)
+	return response, nil
+}
+
+func (s *snapshotCounterService) SnapshotClusterState(context.Context, ClusterServiceContext) ([]byte, error) {
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint64(payload, s.value)
+	return payload, nil
+}
+
+func (s *snapshotCounterService) LoadClusterSnapshot(_ context.Context, snapshot ClusterStateSnapshot) error {
+	s.loadedSnapshotPosition = snapshot.Position
+	s.value = binary.BigEndian.Uint64(snapshot.Payload)
+	return nil
 }
 
 func (s *recordingClusterService) OnClusterStart(_ context.Context, ctx ClusterServiceContext) error {

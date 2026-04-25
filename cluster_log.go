@@ -55,7 +55,17 @@ func (l *InMemoryClusterLog) Append(ctx context.Context, entry ClusterLogEntry) 
 	if l.closed {
 		return ClusterLogEntry{}, ErrClusterLogClosed
 	}
-	entry.Position = int64(len(l.entries) + 1)
+	nextPosition := int64(1)
+	if len(l.entries) > 0 {
+		nextPosition = l.entries[len(l.entries)-1].Position + 1
+	}
+	if entry.Position == 0 {
+		entry.Position = nextPosition
+	} else if len(l.entries) > 0 && entry.Position != nextPosition {
+		return ClusterLogEntry{}, ErrClusterLogPosition
+	} else if entry.Position < 1 {
+		return ClusterLogEntry{}, ErrClusterLogPosition
+	}
 	entry.Payload = cloneBytes(entry.Payload)
 	l.entries = append(l.entries, entry)
 	return cloneClusterLogEntry(entry), nil

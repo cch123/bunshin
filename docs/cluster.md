@@ -6,8 +6,9 @@ The first supported modes are:
 
 - `single-node`: the node is always leader and sequences ingress directly into its log.
 - `appointed-leader`: a configured node ID is leader; non-leader nodes reject local ingress.
+- `learner`: the node does not participate in consensus or accept ingress; it follows a configured master log and snapshots local service state.
 
-Leader election, network log replication, backup catch-up, snapshots, and rolling upgrades are future layers above this core.
+Leader election, network log replication, backup catch-up, and rolling upgrades are future layers above this core.
 
 ## Node
 
@@ -22,7 +23,7 @@ node, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
 defer node.Close(ctx)
 ```
 
-`ClusterConfig.Log` can provide a durable implementation. If unset, Bunshin uses `NewInMemoryClusterLog`, which is useful for tests and local development.
+`ClusterConfig.Log` can provide a durable implementation. If unset, Bunshin uses `NewInMemoryClusterLog`, which is useful for tests and local development. `ClusterConfig.SnapshotStore` enables snapshot-based recovery.
 
 ## Ingress And Egress
 
@@ -51,6 +52,74 @@ type ClusterLog interface {
 
 The log assigns monotonically increasing positions. On node start, existing entries are replayed into the service with `ClusterMessage.Replay = true`, so service state can be rebuilt deterministically from the log.
 
+## Snapshots
+
+Services that support snapshots implement `ClusterSnapshotService`:
+
+```go
+type ClusterSnapshotService interface {
+    SnapshotClusterState(context.Context, bunshin.ClusterServiceContext) ([]byte, error)
+    LoadClusterSnapshot(context.Context, bunshin.ClusterStateSnapshot) error
+}
+```
+
+`ClusterNode.TakeSnapshot` asks the service to serialize deterministic state at the current log position and stores it in `ClusterConfig.SnapshotStore`.
+
+```go
+store := bunshin.NewInMemoryClusterSnapshotStore()
+node, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    Log:           log,
+    SnapshotStore: store,
+    Service:       service,
+})
+
+snapshot, err := node.TakeSnapshot(ctx)
+fmt.Println(snapshot.Position)
+```
+
+On restart, the node loads the latest snapshot into the service first, then replays only log entries with positions greater than the snapshot position.
+
+## Learner Nodes
+
+Learner nodes are optional. A normal cluster node does not start learner behavior unless `ClusterConfig.Learner` is set. If `Mode` is omitted while `Learner` is set, Bunshin automatically selects `ClusterModeLearner`; explicitly setting `ClusterModeLearner` still requires a learner config.
+
+```go
+learner, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    NodeID:        2,
+    Mode:          bunshin.ClusterModeLearner,
+    Log:           learnerLog,
+    SnapshotStore: learnerSnapshots,
+    Service:       snapshotService,
+    Learner: &bunshin.ClusterLearnerConfig{
+        MasterLog:    masterLog,
+        SyncInterval: 100 * time.Millisecond,
+    },
+})
+```
+
+A learner has `ClusterRoleLearner`. It does not vote, does not become leader, and local ingress is rejected with `ErrClusterNotLeader`. Its job is to keep reading the configured master log, apply committed entries to its local service, and write snapshots through `SnapshotStore`.
+
+`ClusterLearnerConfig.MasterLog` is the source log. `SnapshotStore` and a `ClusterSnapshotService` are required because learner recovery is snapshot-first. `SnapshotEvery` controls how many applied entries can accumulate before a snapshot is taken; the zero value snapshots after each successful sync batch. `DisableAutoRun` is available for tests and externally scheduled replication loops. Applications can also call `ClusterNode.SyncLearner` to force a sync cycle.
+
+## Control
+
+`StartClusterControlServer` provides an in-process typed control channel for local cluster operations. It is Bunshin-native and can be fronted by an external process or CLI later.
+
+```go
+control, err := bunshin.StartClusterControlServer(node, bunshin.ClusterControlConfig{})
+client := control.Client()
+
+description, err := client.Describe(ctx)
+snapshot, err := client.Snapshot(ctx)
+report, err := client.Validate(ctx)
+
+err = client.Suspend(ctx)
+err = client.Resume(ctx)
+err = client.Shutdown(ctx)
+```
+
+`ClusterControlConfig.Authorizer` can reject control operations before they touch the node. Suspend makes local ingress return `ErrClusterSuspended`; resume re-enables ingress without changing the log. Shutdown closes the node through the same lifecycle path as `ClusterNode.Close`.
+
 ## Service Callbacks
 
 Services implement `ClusterService`:
@@ -65,4 +134,4 @@ type ClusterService interface {
 
 ## Scope
 
-The current cluster layer provides the local service container, in-process ingress/egress protocol, appointed-leader gating, and replayable replicated-log abstraction. It does not yet provide leader election, remote member communication, log catch-up, snapshots, backups, or cluster control tooling.
+The current cluster layer provides the local service container, in-process ingress/egress protocol, appointed-leader gating, replayable replicated-log abstraction, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide leader election, remote member communication, quorum replication, or full backup promotion.

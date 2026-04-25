@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 const (
@@ -12,9 +13,11 @@ const (
 
 var (
 	ErrClusterClosed             = errors.New("bunshin cluster: closed")
+	ErrClusterSuspended          = errors.New("bunshin cluster: suspended")
 	ErrClusterNotLeader          = errors.New("bunshin cluster: not leader")
 	ErrClusterServiceUnavailable = errors.New("bunshin cluster: service unavailable")
 	ErrClusterLogClosed          = errors.New("bunshin cluster log: closed")
+	ErrClusterLogPosition        = errors.New("bunshin cluster log: invalid position")
 )
 
 type ClusterNodeID uint64
@@ -28,6 +31,7 @@ type ClusterMode string
 const (
 	ClusterModeSingleNode      ClusterMode = "single-node"
 	ClusterModeAppointedLeader ClusterMode = "appointed-leader"
+	ClusterModeLearner         ClusterMode = "learner"
 )
 
 type ClusterRole string
@@ -35,6 +39,7 @@ type ClusterRole string
 const (
 	ClusterRoleLeader   ClusterRole = "leader"
 	ClusterRoleFollower ClusterRole = "follower"
+	ClusterRoleLearner  ClusterRole = "learner"
 )
 
 type ClusterConfig struct {
@@ -42,6 +47,8 @@ type ClusterConfig struct {
 	Mode              ClusterMode
 	AppointedLeaderID ClusterNodeID
 	Log               ClusterLog
+	SnapshotStore     ClusterSnapshotStore
+	Learner           *ClusterLearnerConfig
 	Service           ClusterService
 	Logger            Logger
 }
@@ -53,9 +60,12 @@ type ClusterNode struct {
 	mode              ClusterMode
 	role              ClusterRole
 	log               ClusterLog
+	snapshotStore     ClusterSnapshotStore
+	learner           *clusterLearnerState
 	service           ClusterService
 	logger            Logger
 	closed            bool
+	suspended         bool
 	nextSessionID     ClusterSessionID
 	nextCorrelationID ClusterCorrelationID
 }
@@ -76,9 +86,10 @@ type ClusterLifecycleService interface {
 }
 
 type ClusterServiceContext struct {
-	NodeID       ClusterNodeID
-	Role         ClusterRole
-	LastPosition int64
+	NodeID           ClusterNodeID
+	Role             ClusterRole
+	LastPosition     int64
+	SnapshotPosition int64
 }
 
 type ClusterIngress struct {
@@ -105,11 +116,14 @@ type ClusterMessage struct {
 }
 
 type ClusterSnapshot struct {
-	NodeID       ClusterNodeID
-	Mode         ClusterMode
-	Role         ClusterRole
-	LastPosition int64
-	Closed       bool
+	NodeID           ClusterNodeID
+	Mode             ClusterMode
+	Role             ClusterRole
+	LastPosition     int64
+	SnapshotPosition int64
+	Closed           bool
+	Suspended        bool
+	Learner          ClusterLearnerStatus
 }
 
 type ClusterClient struct {
@@ -130,6 +144,8 @@ func StartClusterNode(ctx context.Context, cfg ClusterConfig) (*ClusterNode, err
 		mode:              normalized.Mode,
 		role:              clusterRoleForConfig(normalized),
 		log:               normalized.Log,
+		snapshotStore:     normalized.SnapshotStore,
+		learner:           newClusterLearnerState(normalized.Learner),
 		service:           normalized.Service,
 		logger:            normalized.Logger,
 		nextSessionID:     1,
@@ -138,6 +154,7 @@ func StartClusterNode(ctx context.Context, cfg ClusterConfig) (*ClusterNode, err
 	if err := node.start(ctx); err != nil {
 		return nil, err
 	}
+	node.startLearnerLoop()
 	return node, nil
 }
 
@@ -165,10 +182,12 @@ func (n *ClusterNode) Snapshot(ctx context.Context) (ClusterSnapshot, error) {
 	}
 	n.mu.Lock()
 	snapshot := ClusterSnapshot{
-		NodeID: n.nodeID,
-		Mode:   n.mode,
-		Role:   n.role,
-		Closed: n.closed,
+		NodeID:    n.nodeID,
+		Mode:      n.mode,
+		Role:      n.role,
+		Closed:    n.closed,
+		Suspended: n.suspended,
+		Learner:   n.learnerStatusLocked(),
 	}
 	n.mu.Unlock()
 
@@ -177,12 +196,24 @@ func (n *ClusterNode) Snapshot(ctx context.Context) (ClusterSnapshot, error) {
 		return ClusterSnapshot{}, err
 	}
 	snapshot.LastPosition = position
+	if n.snapshotStore != nil {
+		state, ok, err := n.snapshotStore.Load(ctx)
+		if err != nil {
+			return ClusterSnapshot{}, err
+		}
+		if ok {
+			snapshot.SnapshotPosition = state.Position
+		}
+	}
 	return snapshot, nil
 }
 
 func (n *ClusterNode) NewClient(ctx context.Context) (*ClusterClient, error) {
 	if n == nil {
 		return nil, ErrClusterClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -221,6 +252,10 @@ func (n *ClusterNode) Submit(ctx context.Context, ingress ClusterIngress) (Clust
 		n.mu.Unlock()
 		return ClusterEgress{}, ErrClusterClosed
 	}
+	if n.suspended {
+		n.mu.Unlock()
+		return ClusterEgress{}, ErrClusterSuspended
+	}
 	if n.role != ClusterRoleLeader {
 		n.mu.Unlock()
 		return ClusterEgress{}, ErrClusterNotLeader
@@ -249,10 +284,76 @@ func (n *ClusterNode) Submit(ctx context.Context, ingress ClusterIngress) (Clust
 	return n.applyEntry(ctx, nodeID, role, entry, false)
 }
 
+func (n *ClusterNode) Suspend(ctx context.Context) error {
+	if n == nil {
+		return ErrClusterClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.closed {
+		return ErrClusterClosed
+	}
+	n.suspended = true
+	return nil
+}
+
+func (n *ClusterNode) Resume(ctx context.Context) error {
+	if n == nil {
+		return ErrClusterClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.closed {
+		return ErrClusterClosed
+	}
+	n.suspended = false
+	return nil
+}
+
 func (n *ClusterNode) Close(ctx context.Context) error {
 	if n == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	n.stopLearnerLoop()
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
 	n.mu.Lock()
 	if n.closed {
 		n.mu.Unlock()
@@ -269,12 +370,70 @@ func (n *ClusterNode) Close(ctx context.Context) error {
 			return err
 		}
 		return lifecycle.OnClusterStop(ctx, ClusterServiceContext{
-			NodeID:       nodeID,
-			Role:         role,
-			LastPosition: position,
+			NodeID:           nodeID,
+			Role:             role,
+			LastPosition:     position,
+			SnapshotPosition: n.snapshotPosition(ctx),
 		})
 	}
 	return nil
+}
+
+func (n *ClusterNode) TakeSnapshot(ctx context.Context) (ClusterStateSnapshot, error) {
+	if n == nil {
+		return ClusterStateSnapshot{}, ErrClusterClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	return n.takeSnapshot(ctx)
+}
+
+func (n *ClusterNode) takeSnapshot(ctx context.Context) (ClusterStateSnapshot, error) {
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		return ClusterStateSnapshot{}, ErrClusterClosed
+	}
+	nodeID := n.nodeID
+	role := n.role
+	n.mu.Unlock()
+
+	if n.snapshotStore == nil {
+		return ClusterStateSnapshot{}, ErrClusterSnapshotStoreUnavailable
+	}
+	service, ok := n.service.(ClusterSnapshotService)
+	if !ok {
+		return ClusterStateSnapshot{}, ErrClusterSnapshotUnsupported
+	}
+	position, err := n.log.LastPosition(ctx)
+	if err != nil {
+		return ClusterStateSnapshot{}, err
+	}
+	payload, err := service.SnapshotClusterState(ctx, ClusterServiceContext{
+		NodeID:           nodeID,
+		Role:             role,
+		LastPosition:     position,
+		SnapshotPosition: n.snapshotPosition(ctx),
+	})
+	if err != nil {
+		return ClusterStateSnapshot{}, err
+	}
+	snapshot := ClusterStateSnapshot{
+		NodeID:   nodeID,
+		Role:     role,
+		Position: position,
+		TakenAt:  time.Now().UTC(),
+		Payload:  cloneBytes(payload),
+	}
+	if err := n.snapshotStore.Save(ctx, snapshot); err != nil {
+		return ClusterStateSnapshot{}, err
+	}
+	return cloneClusterStateSnapshot(snapshot), nil
 }
 
 func (c *ClusterClient) SessionID() ClusterSessionID {
@@ -307,15 +466,21 @@ func (n *ClusterNode) start(ctx context.Context) error {
 	n.applyMu.Lock()
 	defer n.applyMu.Unlock()
 
+	snapshotPosition, err := n.loadSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
 	if lifecycle, ok := n.service.(ClusterLifecycleService); ok {
 		position, err := n.log.LastPosition(ctx)
 		if err != nil {
 			return err
 		}
 		if err := lifecycle.OnClusterStart(ctx, ClusterServiceContext{
-			NodeID:       n.nodeID,
-			Role:         n.role,
-			LastPosition: position,
+			NodeID:           n.nodeID,
+			Role:             n.role,
+			LastPosition:     position,
+			SnapshotPosition: snapshotPosition,
 		}); err != nil {
 			return err
 		}
@@ -326,11 +491,45 @@ func (n *ClusterNode) start(ctx context.Context) error {
 		return err
 	}
 	for _, entry := range entries {
+		if entry.Position <= snapshotPosition {
+			continue
+		}
 		if _, err := n.applyEntry(ctx, n.nodeID, n.role, entry, true); err != nil {
 			return err
 		}
 	}
+	if n.learner != nil {
+		position, err := n.log.LastPosition(ctx)
+		if err != nil {
+			return err
+		}
+		if position < snapshotPosition {
+			position = snapshotPosition
+		}
+		n.setLearnerPosition(position)
+	}
 	return nil
+}
+
+func (n *ClusterNode) loadSnapshot(ctx context.Context) (int64, error) {
+	if n.snapshotStore == nil {
+		return 0, nil
+	}
+	snapshot, ok, err := n.snapshotStore.Load(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, nil
+	}
+	service, supported := n.service.(ClusterSnapshotService)
+	if !supported {
+		return 0, ErrClusterSnapshotUnsupported
+	}
+	if err := service.LoadClusterSnapshot(ctx, cloneClusterStateSnapshot(snapshot)); err != nil {
+		return 0, err
+	}
+	return snapshot.Position, nil
 }
 
 func (n *ClusterNode) applyEntry(ctx context.Context, nodeID ClusterNodeID, role ClusterRole, entry ClusterLogEntry, replay bool) (ClusterEgress, error) {
@@ -362,15 +561,31 @@ func normalizeClusterConfig(cfg ClusterConfig) (ClusterConfig, error) {
 		cfg.NodeID = defaultClusterNodeID
 	}
 	if cfg.Mode == "" {
-		cfg.Mode = ClusterModeSingleNode
+		if cfg.Learner != nil {
+			cfg.Mode = ClusterModeLearner
+		} else {
+			cfg.Mode = ClusterModeSingleNode
+		}
 	}
 	switch cfg.Mode {
 	case ClusterModeSingleNode:
+		if cfg.Learner != nil {
+			return ClusterConfig{}, invalidConfigf("learner config requires learner mode")
+		}
 		cfg.AppointedLeaderID = cfg.NodeID
 	case ClusterModeAppointedLeader:
+		if cfg.Learner != nil {
+			return ClusterConfig{}, invalidConfigf("learner config requires learner mode")
+		}
 		if cfg.AppointedLeaderID == 0 {
 			return ClusterConfig{}, invalidConfigf("appointed leader id is required")
 		}
+	case ClusterModeLearner:
+		learnerCfg, err := normalizeClusterLearnerConfig(cfg.Learner)
+		if err != nil {
+			return ClusterConfig{}, err
+		}
+		cfg.Learner = &learnerCfg
 	default:
 		return ClusterConfig{}, invalidConfigf("invalid cluster mode: %s", cfg.Mode)
 	}
@@ -380,10 +595,21 @@ func normalizeClusterConfig(cfg ClusterConfig) (ClusterConfig, error) {
 	if cfg.Service == nil {
 		return ClusterConfig{}, invalidConfigf("cluster service is required")
 	}
+	if cfg.Mode == ClusterModeLearner {
+		if cfg.SnapshotStore == nil {
+			return ClusterConfig{}, invalidConfigf("learner snapshot store is required")
+		}
+		if _, ok := cfg.Service.(ClusterSnapshotService); !ok {
+			return ClusterConfig{}, invalidConfigf("learner service must support snapshots")
+		}
+	}
 	return cfg, nil
 }
 
 func clusterRoleForConfig(cfg ClusterConfig) ClusterRole {
+	if cfg.Mode == ClusterModeLearner {
+		return ClusterRoleLearner
+	}
 	if cfg.NodeID == cfg.AppointedLeaderID {
 		return ClusterRoleLeader
 	}
@@ -392,4 +618,15 @@ func clusterRoleForConfig(cfg ClusterConfig) ClusterRole {
 
 func cloneBytes(value []byte) []byte {
 	return append([]byte(nil), value...)
+}
+
+func (n *ClusterNode) snapshotPosition(ctx context.Context) int64 {
+	if n == nil || n.snapshotStore == nil {
+		return 0
+	}
+	snapshot, ok, err := n.snapshotStore.Load(ctx)
+	if err != nil || !ok {
+		return 0
+	}
+	return snapshot.Position
 }
