@@ -27,6 +27,14 @@ func (cfg SubscriptionConfig) Validate() error {
 }
 
 func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationConfig, error) {
+	if cfg.Transport == "" {
+		cfg.Transport = TransportQUIC
+	}
+	switch cfg.Transport {
+	case TransportQUIC, TransportUDP:
+	default:
+		return normalizedPublicationConfig{}, invalidConfigf("invalid publication transport: %s", cfg.Transport)
+	}
 	if cfg.RemoteAddr == "" {
 		return normalizedPublicationConfig{}, invalidConfigf("remote address is required")
 	}
@@ -39,11 +47,20 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 	if cfg.RetransmitEvery < 0 {
 		return normalizedPublicationConfig{}, invalidConfigf("invalid retransmit interval: %s", cfg.RetransmitEvery)
 	}
+	if cfg.UDPRetransmitBufferBytes < 0 {
+		return normalizedPublicationConfig{}, invalidConfigf("invalid UDP retransmit buffer bytes: %d", cfg.UDPRetransmitBufferBytes)
+	}
 	if cfg.StreamID == 0 {
 		cfg.StreamID = defaultStreamID
 	}
 	if cfg.SessionID == 0 {
 		cfg.SessionID = defaultSessionID()
+	}
+	if cfg.MTUBytes == 0 && cfg.Transport == TransportUDP {
+		cfg.MTUBytes = defaultUDPTransportMTUBytes
+	}
+	if cfg.UDPRetransmitBufferBytes == 0 && cfg.Transport == TransportUDP {
+		cfg.UDPRetransmitBufferBytes = defaultUDPRetransmitBufferBytes
 	}
 	if cfg.MTUBytes == 0 {
 		cfg.MTUBytes = maxFrameSize
@@ -80,12 +97,14 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 		return normalizedPublicationConfig{}, invalidConfigf("invalid publication window bytes: %d", cfg.PublicationWindowBytes)
 	}
 
-	if cfg.TLSConfig == nil {
-		cfg.TLSConfig = defaultClientTLSConfig()
-	} else {
-		cfg.TLSConfig = cfg.TLSConfig.Clone()
-		if len(cfg.TLSConfig.NextProtos) == 0 {
-			cfg.TLSConfig.NextProtos = []string{quicALPN}
+	if cfg.Transport == TransportQUIC {
+		if cfg.TLSConfig == nil {
+			cfg.TLSConfig = defaultClientTLSConfig()
+		} else {
+			cfg.TLSConfig = cfg.TLSConfig.Clone()
+			if len(cfg.TLSConfig.NextProtos) == 0 {
+				cfg.TLSConfig.NextProtos = []string{quicALPN}
+			}
 		}
 	}
 
@@ -97,6 +116,14 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 }
 
 func normalizeSubscriptionConfig(cfg SubscriptionConfig) (SubscriptionConfig, error) {
+	if cfg.Transport == "" {
+		cfg.Transport = TransportQUIC
+	}
+	switch cfg.Transport {
+	case TransportQUIC, TransportUDP:
+	default:
+		return SubscriptionConfig{}, invalidConfigf("invalid subscription transport: %s", cfg.Transport)
+	}
 	if cfg.LocalAddr == "" && cfg.PacketConn == nil {
 		return SubscriptionConfig{}, invalidConfigf("local address is required")
 	}
@@ -106,20 +133,28 @@ func normalizeSubscriptionConfig(cfg SubscriptionConfig) (SubscriptionConfig, er
 	if cfg.WriteBufferBytes < 0 {
 		return SubscriptionConfig{}, invalidConfigf("invalid write buffer bytes: %d", cfg.WriteBufferBytes)
 	}
+	if cfg.ReceiverWindowBytes < 0 {
+		return SubscriptionConfig{}, invalidConfigf("invalid receiver window bytes: %d", cfg.ReceiverWindowBytes)
+	}
 	if cfg.StreamID == 0 {
 		cfg.StreamID = defaultStreamID
 	}
+	if cfg.ReceiverWindowBytes == 0 {
+		cfg.ReceiverWindowBytes = minTermLength
+	}
 
-	if cfg.TLSConfig == nil {
-		tlsConf, err := defaultServerTLSConfig()
-		if err != nil {
-			return SubscriptionConfig{}, err
-		}
-		cfg.TLSConfig = tlsConf
-	} else {
-		cfg.TLSConfig = cfg.TLSConfig.Clone()
-		if len(cfg.TLSConfig.NextProtos) == 0 {
-			cfg.TLSConfig.NextProtos = []string{quicALPN}
+	if cfg.Transport == TransportQUIC {
+		if cfg.TLSConfig == nil {
+			tlsConf, err := defaultServerTLSConfig()
+			if err != nil {
+				return SubscriptionConfig{}, err
+			}
+			cfg.TLSConfig = tlsConf
+		} else {
+			cfg.TLSConfig = cfg.TLSConfig.Clone()
+			if len(cfg.TLSConfig.NextProtos) == 0 {
+				cfg.TLSConfig.NextProtos = []string{quicALPN}
+			}
 		}
 	}
 

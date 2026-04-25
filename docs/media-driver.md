@@ -1,8 +1,8 @@
 # Media Driver
 
-Bunshin now has an embeddable media driver. It runs as an in-process goroutine with a command/control channel, owns client/resource lifecycle, and delegates actual I/O to the existing QUIC publication/subscription primitives.
+Bunshin now has an embeddable media driver and an out-of-process driver binary. The embeddable driver runs in-process with a command/control channel, owns client/resource lifecycle, and delegates actual I/O to the publication/subscription primitives. The external driver uses the same resource model over typed local IPC.
 
-This is not yet an external media-driver process. The API boundary is intentionally shaped so that backend can be added without replacing the client-facing driver API, and Bunshin now includes a memory-mapped local IPC ring as the low-level building block for that path.
+Bunshin's driver boundary is still intentionally small: external publications can send through the driver, external subscriptions are owned by the driver process, and local `Serve` callbacks remain an embeddable-driver capability.
 
 ## Starting A Driver
 
@@ -17,6 +17,16 @@ client, err := driver.NewClient(ctx, "example")
 ```
 
 `DriverConfig.Metrics` and `DriverConfig.Logger` are inherited by driver-managed publications and subscriptions when their own config does not provide values.
+
+Set `DriverConfig.Directory` when the driver should expose Aeron-style local files for tooling:
+
+```go
+driver, err := bunshin.StartMediaDriver(bunshin.DriverConfig{
+    Directory: "/var/run/bunshin/default",
+})
+```
+
+The directory is used by both embeddable and external drivers. It is the filesystem contract shared by tools and external clients.
 
 ## Managed Resources
 
@@ -38,6 +48,23 @@ err = pub.Send(ctx, []byte("hello"))
 
 `DriverPublication` exposes `Send`, `LocalAddr`, `ID`, and `Close`. `DriverSubscription` exposes `Serve`, `LocalAddr`, `LossReports`, `ID`, and `Close`. Closing a `DriverClient` closes all of its managed publications and subscriptions.
 
+In embedded mode, the returned handles wrap in-process resources. Against an external driver, `ConnectMediaDriver` returns the same client-facing handle shape, but publication and subscription ownership stays in the driver process:
+
+```go
+client, err := bunshin.ConnectMediaDriver(ctx, bunshin.DriverConnectionConfig{
+    Directory:  "/var/run/bunshin/default",
+    ClientName: "worker-a",
+})
+
+pub, err := client.AddPublication(ctx, bunshin.PublicationConfig{
+    StreamID:   1,
+    RemoteAddr: "127.0.0.1:40456",
+})
+err = pub.Send(ctx, []byte("hello"))
+```
+
+External publication sends, closes, client heartbeats, snapshots, and resource registration use typed IPC commands and correlated events. External subscription handles expose the driver-owned local address and can be closed through IPC; local `Serve` callbacks remain an embedded-driver capability.
+
 ## Counters And Lifecycle
 
 `MediaDriver.Snapshot` returns process-local driver counters plus client/publication/subscription lifecycle state:
@@ -49,6 +76,26 @@ fmt.Println(snapshot.Counters.ClientsRegistered, len(snapshot.Publications))
 
 Counters include processed/failed commands, registered/closed clients, registered/closed publications, registered/closed subscriptions, cleanup runs, and stale client cleanup count.
 
+## Driver Directory
+
+`ResolveDriverDirectoryLayout` returns the stable local layout:
+
+- `driver.mark`: JSON mark file with PID, status, start time, update time, and timeout configuration.
+- `command.ring` and `events.ring`: typed IPC ring paths for driver commands and async events.
+- `reports/counters.json`: driver counters, inherited transport metrics, and active resource counts.
+- `reports/loss-report.json`: aggregated loss reports from driver-managed subscriptions.
+- `reports/error-report.json`: driver command and lifecycle errors.
+- `clients/`, `publications/`, `subscriptions/`, and `buffers/`: reserved ownership and shared-buffer directories.
+
+`MediaDriver.FlushReports` writes the latest counters, loss reports, and error reports atomically:
+
+```go
+report, err := driver.FlushReports(ctx)
+fmt.Println(report.Layout.MarkFile, report.Counters.Counters.ClientsRegistered)
+```
+
+`MediaDriver.Directory` returns the resolved layout for tools that need to locate these files. On `Close`, the mark file is updated to `closed`.
+
 ## Cleanup
 
 Clients should call `Heartbeat` when they are long-lived but idle:
@@ -59,9 +106,52 @@ err := client.Heartbeat(ctx)
 
 The driver closes clients that have not heartbeat within `DriverConfig.ClientTimeout`, and it also closes their managed publications and subscriptions. `CleanupInterval` controls how often stale clients are checked.
 
-## Current IPC Scope
+## Driver IPC Protocol
 
-The current driver command/control path is a buffered Go channel inside the process. It gives Bunshin a driver ownership model and testable lifecycle semantics before adding an external process command protocol.
+`OpenDriverIPC` opens the command and event rings from a driver directory or explicit ring paths. Commands are JSON records with a protocol version, command type, and correlation ID. Events are written asynchronously to the event ring with the same correlation ID.
+
+```go
+ipc, err := bunshin.OpenDriverIPC(bunshin.DriverIPCConfig{
+    Directory: "/var/run/bunshin/default",
+    Reset:     true,
+})
+
+correlationID, err := ipc.SendCommand(ctx, bunshin.DriverIPCCommand{
+    Type:       bunshin.DriverIPCCommandOpenClient,
+    ClientName: "worker-a",
+}, nil)
+
+_, err = ipc.PollEvents(1, func(event bunshin.DriverIPCEvent) error {
+    fmt.Println(event.CorrelationID == correlationID, event.Type, event.ClientID)
+    return nil
+})
+```
+
+`NewDriverIPCServer` adapts the typed IPC protocol to the embeddable `MediaDriver`. It handles client open/heartbeat/close, publication add/send/close, subscription add/close, snapshot, report flush, and terminate commands. Failed commands emit `DriverIPCEventCommandError` instead of mutating the ring protocol shape.
+
+## Out-Of-Process Driver
+
+`bunshin-driver` runs the media driver as a separate process over the driver directory and IPC rings:
+
+```sh
+bunshin-driver run -dir /var/run/bunshin/default
+```
+
+The process updates `driver.mark` on each heartbeat/report flush. Tooling can inspect the mark file with:
+
+```sh
+bunshin-driver status -dir /var/run/bunshin/default
+```
+
+`CheckDriverProcess` reads the same mark file and reports a driver as stale when it is still marked `active` but its heartbeat age exceeds the configured stale timeout. A normal shutdown updates the mark file to `closed`.
+
+Terminate a running process through the typed IPC command ring:
+
+```sh
+bunshin-driver terminate -dir /var/run/bunshin/default
+```
+
+The terminate command emits a correlated `terminated` event before the process exits.
 
 ## Memory-Mapped Local IPC
 
@@ -90,4 +180,4 @@ _, err = ring.Poll(func(payload []byte) error {
 
 For blocking loops, `OfferContext`, `PollContext`, and `PollNContext` retry the non-blocking operations until work succeeds, the ring closes, or the context expires. The caller can provide an `IdleStrategy`; a default backoff strategy is used when nil is passed.
 
-The ring can be opened by multiple handles that map the same file, which is enough for local command/control transport experiments and driver tests. Cross-process synchronization and a typed external-driver command protocol are intentionally left as the next layer above this primitive.
+The ring can be opened by multiple handles that map the same file, which is enough for the typed driver IPC protocol and local driver tests. Mmap-backed driver term buffers, active-driver detection, and stale mark-file recovery are the next layers above this primitive.

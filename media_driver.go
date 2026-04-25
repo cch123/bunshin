@@ -18,12 +18,14 @@ const (
 )
 
 var (
-	ErrDriverClosed           = errors.New("bunshin driver: closed")
-	ErrDriverClientClosed     = errors.New("bunshin driver: client closed")
-	ErrDriverResourceNotFound = errors.New("bunshin driver: resource not found")
+	ErrDriverClosed              = errors.New("bunshin driver: closed")
+	ErrDriverClientClosed        = errors.New("bunshin driver: client closed")
+	ErrDriverResourceNotFound    = errors.New("bunshin driver: resource not found")
+	ErrDriverExternalUnsupported = errors.New("bunshin driver: external resource unsupported")
 )
 
 type DriverConfig struct {
+	Directory       string
 	CommandBuffer   int
 	ClientTimeout   time.Duration
 	CleanupInterval time.Duration
@@ -37,30 +39,46 @@ type MediaDriver struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	closing   atomic.Bool
+	directory *driverDirectory
 }
 
 type DriverClient struct {
-	driver *MediaDriver
-	id     DriverClientID
-	name   string
-	closed atomic.Bool
+	driver  *MediaDriver
+	ipc     *DriverIPC
+	id      DriverClientID
+	name    string
+	timeout time.Duration
+	mu      sync.Mutex
+	closed  atomic.Bool
 }
 
 type DriverPublication struct {
 	id          DriverResourceID
 	client      *DriverClient
 	publication *Publication
+	localAddr   string
 }
 
 type DriverSubscription struct {
 	id           DriverResourceID
 	client       *DriverClient
 	subscription *Subscription
+	localAddr    string
 }
 
 type DriverClientID uint64
 
 type DriverResourceID uint64
+
+type DriverConnectionConfig struct {
+	Directory           string
+	CommandRingPath     string
+	EventRingPath       string
+	ClientName          string
+	CommandRingCapacity int
+	EventRingCapacity   int
+	Timeout             time.Duration
+}
 
 type DriverCounters struct {
 	CommandsProcessed       uint64
@@ -80,6 +98,7 @@ type DriverSnapshot struct {
 	Clients       []DriverClientSnapshot
 	Publications  []DriverPublicationSnapshot
 	Subscriptions []DriverSubscriptionSnapshot
+	LossReports   []DriverLossReportSnapshot
 }
 
 type DriverClientSnapshot struct {
@@ -108,6 +127,18 @@ type DriverSubscriptionSnapshot struct {
 	CreatedAt time.Time
 }
 
+type DriverLossReportSnapshot struct {
+	ResourceID       DriverResourceID
+	ClientID         DriverClientID
+	StreamID         uint32
+	SessionID        uint32
+	Source           string
+	ObservationCount uint64
+	MissingMessages  uint64
+	FirstObservation time.Time
+	LastObservation  time.Time
+}
+
 type driverCommand struct {
 	apply func(*driverState) (any, error)
 	reply chan driverResult
@@ -123,6 +154,7 @@ type driverState struct {
 	logger          Logger
 	clientTimeout   time.Duration
 	cleanupInterval time.Duration
+	directory       *driverDirectory
 
 	nextClientID   DriverClientID
 	nextResourceID DriverResourceID
@@ -130,6 +162,7 @@ type driverState struct {
 	publications   map[DriverResourceID]*driverPublicationState
 	subscriptions  map[DriverResourceID]*driverSubscriptionState
 	counters       DriverCounters
+	errorReports   []DriverErrorReport
 }
 
 type driverClientState struct {
@@ -179,13 +212,18 @@ func StartMediaDriver(cfg DriverConfig) (*MediaDriver, error) {
 	if cfg.CleanupInterval == 0 {
 		cfg.CleanupInterval = defaultDriverCleanupPeriod
 	}
+	directory, err := openDriverDirectory(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	driver := &MediaDriver{
-		commands: make(chan driverCommand, cfg.CommandBuffer),
-		done:     make(chan struct{}),
-		closed:   make(chan struct{}),
+		commands:  make(chan driverCommand, cfg.CommandBuffer),
+		done:      make(chan struct{}),
+		closed:    make(chan struct{}),
+		directory: directory,
 	}
-	go driver.run(cfg)
+	go driver.run(cfg, directory)
 
 	logEvent(context.Background(), cfg.Logger, LogEvent{
 		Level:     LogLevelInfo,
@@ -196,6 +234,7 @@ func StartMediaDriver(cfg DriverConfig) (*MediaDriver, error) {
 			"command_buffer":   cfg.CommandBuffer,
 			"client_timeout":   cfg.ClientTimeout,
 			"cleanup_interval": cfg.CleanupInterval,
+			"directory":        cfg.Directory,
 		},
 	})
 	return driver, nil
@@ -234,6 +273,38 @@ func (d *MediaDriver) NewClient(ctx context.Context, name string) (*DriverClient
 	return value.(*DriverClient), nil
 }
 
+func ConnectMediaDriver(ctx context.Context, cfg DriverConnectionConfig) (*DriverClient, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ipc, err := OpenDriverIPC(DriverIPCConfig{
+		Directory:           cfg.Directory,
+		CommandRingPath:     cfg.CommandRingPath,
+		EventRingPath:       cfg.EventRingPath,
+		CommandRingCapacity: cfg.CommandRingCapacity,
+		EventRingCapacity:   cfg.EventRingCapacity,
+	})
+	if err != nil {
+		return nil, err
+	}
+	client := &DriverClient{
+		ipc:     ipc,
+		name:    cfg.ClientName,
+		timeout: cfg.Timeout,
+	}
+	event, err := client.sendIPCCommand(ctx, DriverIPCCommand{
+		Type:       DriverIPCCommandOpenClient,
+		ClientName: cfg.ClientName,
+	})
+	if err != nil {
+		_ = ipc.Close()
+		return nil, err
+	}
+	client.id = event.ClientID
+	client.name = event.Message
+	return client, nil
+}
+
 func (d *MediaDriver) Snapshot(ctx context.Context) (DriverSnapshot, error) {
 	value, err := d.dispatch(ctx, func(state *driverState) (any, error) {
 		return state.snapshot(), nil
@@ -242,6 +313,26 @@ func (d *MediaDriver) Snapshot(ctx context.Context) (DriverSnapshot, error) {
 		return DriverSnapshot{}, err
 	}
 	return value.(DriverSnapshot), nil
+}
+
+func (d *MediaDriver) Directory() (DriverDirectoryLayout, bool) {
+	if d == nil || d.directory == nil {
+		return DriverDirectoryLayout{}, false
+	}
+	return d.directory.layout, true
+}
+
+func (d *MediaDriver) FlushReports(ctx context.Context) (DriverDirectoryReport, error) {
+	if d == nil || d.directory == nil {
+		return DriverDirectoryReport{}, ErrDriverDirectoryUnavailable
+	}
+	value, err := d.dispatch(ctx, func(state *driverState) (any, error) {
+		return state.flushDriverDirectory(time.Now(), DriverDirectoryStatusActive)
+	})
+	if err != nil {
+		return DriverDirectoryReport{}, err
+	}
+	return value.(DriverDirectoryReport), nil
 }
 
 func (d *MediaDriver) Close() error {
@@ -284,15 +375,21 @@ func (d *MediaDriver) dispatch(ctx context.Context, apply func(*driverState) (an
 	}
 }
 
-func (d *MediaDriver) run(cfg DriverConfig) {
+func (d *MediaDriver) run(cfg DriverConfig, directory *driverDirectory) {
 	state := &driverState{
 		metrics:         cfg.Metrics,
 		logger:          cfg.Logger,
 		clientTimeout:   cfg.ClientTimeout,
 		cleanupInterval: cfg.CleanupInterval,
+		directory:       directory,
 		clients:         make(map[DriverClientID]*driverClientState),
 		publications:    make(map[DriverResourceID]*driverPublicationState),
 		subscriptions:   make(map[DriverResourceID]*driverSubscriptionState),
+	}
+	if directory != nil {
+		if _, err := state.flushDriverDirectory(time.Now(), DriverDirectoryStatusActive); err != nil {
+			state.recordDriverError(LogLevelError, "directory", "initial driver report flush failed", nil, err)
+		}
 	}
 
 	ticker := time.NewTicker(cfg.CleanupInterval)
@@ -306,6 +403,7 @@ func (d *MediaDriver) run(cfg DriverConfig) {
 			value, err := command.apply(state)
 			if err != nil {
 				state.counters.CommandsFailed++
+				state.recordDriverError(LogLevelError, "command", "driver command failed", nil, err)
 			}
 			command.reply <- driverResult{value: value, err: err}
 		case now := <-ticker.C:
@@ -313,6 +411,11 @@ func (d *MediaDriver) run(cfg DriverConfig) {
 		case <-d.done:
 			state.closeAll()
 			state.log(LogLevelInfo, "close", "media driver closed", nil, nil)
+			if directory != nil {
+				if _, err := state.flushDriverDirectory(time.Now(), DriverDirectoryStatusClosed); err != nil {
+					state.recordDriverError(LogLevelError, "directory", "final driver report flush failed", nil, err)
+				}
+			}
 			return
 		}
 	}
@@ -330,6 +433,13 @@ func (c *DriverClient) Heartbeat(ctx context.Context) error {
 	if c.closed.Load() {
 		return ErrDriverClientClosed
 	}
+	if c.ipc != nil {
+		_, err := c.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:     DriverIPCCommandHeartbeatClient,
+			ClientID: c.id,
+		})
+		return err
+	}
 	_, err := c.driver.dispatch(ctx, func(state *driverState) (any, error) {
 		client := state.clients[c.id]
 		if client == nil {
@@ -344,6 +454,30 @@ func (c *DriverClient) Heartbeat(ctx context.Context) error {
 func (c *DriverClient) AddPublication(ctx context.Context, cfg PublicationConfig) (*DriverPublication, error) {
 	if c.closed.Load() {
 		return nil, ErrDriverClientClosed
+	}
+	if c.ipc != nil {
+		event, err := c.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:     DriverIPCCommandAddPublication,
+			ClientID: c.id,
+			Publication: DriverIPCPublicationConfig{
+				StreamID:               cfg.StreamID,
+				SessionID:              cfg.SessionID,
+				RemoteAddr:             cfg.RemoteAddr,
+				MaxPayloadBytes:        cfg.MaxPayloadBytes,
+				MTUBytes:               cfg.MTUBytes,
+				TermBufferLength:       cfg.TermBufferLength,
+				InitialTermID:          cfg.InitialTermID,
+				PublicationWindowBytes: cfg.PublicationWindowBytes,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &DriverPublication{
+			id:        event.ResourceID,
+			client:    c,
+			localAddr: event.Message,
+		}, nil
 	}
 	value, err := c.driver.dispatch(ctx, func(state *driverState) (any, error) {
 		client := state.clients[c.id]
@@ -387,6 +521,7 @@ func (c *DriverClient) AddPublication(ctx context.Context, cfg PublicationConfig
 			id:          id,
 			client:      c,
 			publication: pub,
+			localAddr:   pub.LocalAddr().String(),
 		}, nil
 	})
 	if err != nil {
@@ -398,6 +533,24 @@ func (c *DriverClient) AddPublication(ctx context.Context, cfg PublicationConfig
 func (c *DriverClient) AddSubscription(ctx context.Context, cfg SubscriptionConfig) (*DriverSubscription, error) {
 	if c.closed.Load() {
 		return nil, ErrDriverClientClosed
+	}
+	if c.ipc != nil {
+		event, err := c.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:     DriverIPCCommandAddSubscription,
+			ClientID: c.id,
+			Subscription: DriverIPCSubscriptionConfig{
+				StreamID:  cfg.StreamID,
+				LocalAddr: cfg.LocalAddr,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &DriverSubscription{
+			id:        event.ResourceID,
+			client:    c,
+			localAddr: event.Message,
+		}, nil
 	}
 	value, err := c.driver.dispatch(ctx, func(state *driverState) (any, error) {
 		client := state.clients[c.id]
@@ -439,6 +592,7 @@ func (c *DriverClient) AddSubscription(ctx context.Context, cfg SubscriptionConf
 			id:           id,
 			client:       c,
 			subscription: sub,
+			localAddr:    sub.LocalAddr().String(),
 		}, nil
 	})
 	if err != nil {
@@ -448,6 +602,17 @@ func (c *DriverClient) AddSubscription(ctx context.Context, cfg SubscriptionConf
 }
 
 func (c *DriverClient) ClosePublication(ctx context.Context, id DriverResourceID) error {
+	if c.closed.Load() {
+		return ErrDriverClientClosed
+	}
+	if c.ipc != nil {
+		_, err := c.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:       DriverIPCCommandClosePublication,
+			ClientID:   c.id,
+			ResourceID: id,
+		})
+		return err
+	}
 	_, err := c.driver.dispatch(ctx, func(state *driverState) (any, error) {
 		if state.clients[c.id] == nil {
 			return nil, ErrDriverClientClosed
@@ -458,6 +623,17 @@ func (c *DriverClient) ClosePublication(ctx context.Context, id DriverResourceID
 }
 
 func (c *DriverClient) CloseSubscription(ctx context.Context, id DriverResourceID) error {
+	if c.closed.Load() {
+		return ErrDriverClientClosed
+	}
+	if c.ipc != nil {
+		_, err := c.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:       DriverIPCCommandCloseSubscription,
+			ClientID:   c.id,
+			ResourceID: id,
+		})
+		return err
+	}
 	_, err := c.driver.dispatch(ctx, func(state *driverState) (any, error) {
 		if state.clients[c.id] == nil {
 			return nil, ErrDriverClientClosed
@@ -468,12 +644,41 @@ func (c *DriverClient) CloseSubscription(ctx context.Context, id DriverResourceI
 }
 
 func (c *DriverClient) Snapshot(ctx context.Context) (DriverSnapshot, error) {
+	if c.closed.Load() {
+		return DriverSnapshot{}, ErrDriverClientClosed
+	}
+	if c.ipc != nil {
+		event, err := c.sendIPCCommand(ctx, DriverIPCCommand{
+			Type: DriverIPCCommandSnapshot,
+		})
+		if err != nil {
+			return DriverSnapshot{}, err
+		}
+		if event.Snapshot == nil {
+			return DriverSnapshot{}, ErrDriverIPCProtocol
+		}
+		return *event.Snapshot, nil
+	}
 	return c.driver.Snapshot(ctx)
 }
 
 func (c *DriverClient) Close(ctx context.Context) error {
 	if c.closed.Load() {
 		return nil
+	}
+	if c.ipc != nil {
+		_, err := c.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:     DriverIPCCommandCloseClient,
+			ClientID: c.id,
+		})
+		if err == nil || errors.Is(err, ErrDriverClientClosed) {
+			c.closed.Store(true)
+			closeErr := c.ipc.Close()
+			if err == nil {
+				return closeErr
+			}
+		}
+		return err
 	}
 	_, err := c.driver.dispatch(ctx, func(state *driverState) (any, error) {
 		return nil, state.closeClient(c.id, false, true)
@@ -489,10 +694,28 @@ func (p *DriverPublication) ID() DriverResourceID {
 }
 
 func (p *DriverPublication) Send(ctx context.Context, payload []byte) error {
+	if p == nil || p.client == nil {
+		return ErrDriverClientClosed
+	}
+	if p.publication == nil {
+		_, err := p.client.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:       DriverIPCCommandSendPublication,
+			ClientID:   p.client.id,
+			ResourceID: p.id,
+			Payload:    cloneBytes(payload),
+		})
+		return err
+	}
 	return p.publication.Send(ctx, payload)
 }
 
 func (p *DriverPublication) LocalAddr() net.Addr {
+	if p == nil {
+		return nil
+	}
+	if p.publication == nil {
+		return driverNetAddr(p.localAddr)
+	}
 	return p.publication.LocalAddr()
 }
 
@@ -505,19 +728,75 @@ func (s *DriverSubscription) ID() DriverResourceID {
 }
 
 func (s *DriverSubscription) Serve(ctx context.Context, handler Handler) error {
+	if s == nil {
+		return ErrDriverClientClosed
+	}
+	if s.subscription == nil {
+		return ErrDriverExternalUnsupported
+	}
 	return s.subscription.Serve(ctx, handler)
 }
 
 func (s *DriverSubscription) LocalAddr() net.Addr {
+	if s == nil {
+		return nil
+	}
+	if s.subscription == nil {
+		return driverNetAddr(s.localAddr)
+	}
 	return s.subscription.LocalAddr()
 }
 
 func (s *DriverSubscription) LossReports() []LossReport {
+	if s == nil || s.subscription == nil {
+		return nil
+	}
 	return s.subscription.LossReports()
 }
 
 func (s *DriverSubscription) Close(ctx context.Context) error {
 	return s.client.CloseSubscription(ctx, s.id)
+}
+
+func (c *DriverClient) sendIPCCommand(ctx context.Context, command DriverIPCCommand) (DriverIPCEvent, error) {
+	if c == nil || c.ipc == nil {
+		return DriverIPCEvent{}, ErrDriverClientClosed
+	}
+	if c.closed.Load() {
+		return DriverIPCEvent{}, ErrDriverClientClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	correlationID, err := c.ipc.SendCommand(ctx, command, nil)
+	if err != nil {
+		return DriverIPCEvent{}, err
+	}
+	event, err := waitDriverIPCEvent(ctx, c.ipc, correlationID)
+	if err != nil {
+		return DriverIPCEvent{}, err
+	}
+	if event.Type == DriverIPCEventCommandError {
+		return DriverIPCEvent{}, errors.New(event.Error)
+	}
+	return event, nil
+}
+
+type driverNetAddr string
+
+func (a driverNetAddr) Network() string {
+	return "driver"
+}
+
+func (a driverNetAddr) String() string {
+	return string(a)
 }
 
 func (state *driverState) closeAll() {
@@ -651,6 +930,21 @@ func (state *driverState) snapshot() DriverSnapshot {
 			LocalAddr: subscription.localAddr,
 			CreatedAt: subscription.createdAt,
 		})
+		if subscription.subscription != nil {
+			for _, report := range subscription.subscription.LossReports() {
+				snapshot.LossReports = append(snapshot.LossReports, DriverLossReportSnapshot{
+					ResourceID:       subscription.id,
+					ClientID:         subscription.clientID,
+					StreamID:         report.StreamID,
+					SessionID:        report.SessionID,
+					Source:           report.Source,
+					ObservationCount: report.ObservationCount,
+					MissingMessages:  report.MissingMessages,
+					FirstObservation: report.FirstObservation,
+					LastObservation:  report.LastObservation,
+				})
+			}
+		}
 	}
 	sort.Slice(snapshot.Clients, func(i, j int) bool {
 		return snapshot.Clients[i].ID < snapshot.Clients[j].ID
@@ -661,10 +955,23 @@ func (state *driverState) snapshot() DriverSnapshot {
 	sort.Slice(snapshot.Subscriptions, func(i, j int) bool {
 		return snapshot.Subscriptions[i].ID < snapshot.Subscriptions[j].ID
 	})
+	sort.Slice(snapshot.LossReports, func(i, j int) bool {
+		if snapshot.LossReports[i].ResourceID != snapshot.LossReports[j].ResourceID {
+			return snapshot.LossReports[i].ResourceID < snapshot.LossReports[j].ResourceID
+		}
+		if snapshot.LossReports[i].StreamID != snapshot.LossReports[j].StreamID {
+			return snapshot.LossReports[i].StreamID < snapshot.LossReports[j].StreamID
+		}
+		if snapshot.LossReports[i].SessionID != snapshot.LossReports[j].SessionID {
+			return snapshot.LossReports[i].SessionID < snapshot.LossReports[j].SessionID
+		}
+		return snapshot.LossReports[i].Source < snapshot.LossReports[j].Source
+	})
 	return snapshot
 }
 
 func (state *driverState) log(level LogLevel, operation, message string, fields map[string]any, err error) {
+	state.recordDriverError(level, operation, message, fields, err)
 	logEvent(context.Background(), state.logger, LogEvent{
 		Level:     level,
 		Component: "media_driver",

@@ -21,6 +21,9 @@ func TestPublicationConfigNormalizeAppliesDefaults(t *testing.T) {
 	if cfg.SessionID == 0 {
 		t.Fatal("session id was not defaulted")
 	}
+	if cfg.Transport != TransportQUIC {
+		t.Fatalf("transport = %s, want %s", cfg.Transport, TransportQUIC)
+	}
 	if cfg.MTUBytes != maxFrameSize || cfg.mtuPayload != maxFrameSize-headerLen {
 		t.Fatalf("mtu defaults = %d/%d", cfg.MTUBytes, cfg.mtuPayload)
 	}
@@ -38,6 +41,29 @@ func TestPublicationConfigNormalizeAppliesDefaults(t *testing.T) {
 	}
 	if cfg.TLSConfig == nil || len(cfg.TLSConfig.NextProtos) != 1 || cfg.TLSConfig.NextProtos[0] != quicALPN {
 		t.Fatalf("tls config was not defaulted: %#v", cfg.TLSConfig)
+	}
+}
+
+func TestPublicationConfigNormalizeUDPDefaults(t *testing.T) {
+	cfg, err := normalizePublicationConfig(PublicationConfig{
+		Transport:  TransportUDP,
+		RemoteAddr: "127.0.0.1:40456",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Transport != TransportUDP {
+		t.Fatalf("transport = %s, want %s", cfg.Transport, TransportUDP)
+	}
+	if cfg.MTUBytes != defaultUDPTransportMTUBytes || cfg.mtuPayload != defaultUDPTransportMTUBytes-headerLen {
+		t.Fatalf("udp mtu defaults = %d/%d", cfg.MTUBytes, cfg.mtuPayload)
+	}
+	if cfg.TLSConfig != nil {
+		t.Fatalf("udp tls config = %#v, want nil", cfg.TLSConfig)
+	}
+	if cfg.UDPRetransmitBufferBytes != defaultUDPRetransmitBufferBytes {
+		t.Fatalf("udp retransmit buffer = %d, want %d", cfg.UDPRetransmitBufferBytes, defaultUDPRetransmitBufferBytes)
 	}
 }
 
@@ -68,9 +94,11 @@ func TestPublicationConfigValidateRejectsInvalidValues(t *testing.T) {
 		cfg  PublicationConfig
 	}{
 		{name: "missing remote", cfg: PublicationConfig{}},
+		{name: "invalid transport", cfg: PublicationConfig{Transport: TransportMode("bogus"), RemoteAddr: "127.0.0.1:1"}},
 		{name: "negative read buffer", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", ReadBufferBytes: -1}},
 		{name: "negative write buffer", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", WriteBufferBytes: -1}},
 		{name: "negative retransmit", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", RetransmitEvery: -time.Nanosecond}},
+		{name: "negative udp retransmit buffer", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", UDPRetransmitBufferBytes: -1}},
 		{name: "small mtu", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MTUBytes: headerLen}},
 		{name: "large mtu", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MTUBytes: maxFrameSize + 1}},
 		{name: "negative max payload", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MaxPayloadBytes: -1}},
@@ -99,8 +127,31 @@ func TestSubscriptionConfigNormalizeAppliesDefaults(t *testing.T) {
 	if cfg.StreamID != defaultStreamID {
 		t.Fatalf("stream id = %d, want %d", cfg.StreamID, defaultStreamID)
 	}
+	if cfg.Transport != TransportQUIC {
+		t.Fatalf("transport = %s, want %s", cfg.Transport, TransportQUIC)
+	}
+	if cfg.ReceiverWindowBytes != minTermLength {
+		t.Fatalf("receiver window = %d, want %d", cfg.ReceiverWindowBytes, minTermLength)
+	}
 	if cfg.TLSConfig == nil || len(cfg.TLSConfig.NextProtos) != 1 || cfg.TLSConfig.NextProtos[0] != quicALPN {
 		t.Fatalf("tls config was not defaulted: %#v", cfg.TLSConfig)
+	}
+}
+
+func TestSubscriptionConfigNormalizeUDPDefaults(t *testing.T) {
+	cfg, err := normalizeSubscriptionConfig(SubscriptionConfig{
+		Transport: TransportUDP,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.Transport != TransportUDP {
+		t.Fatalf("transport = %s, want %s", cfg.Transport, TransportUDP)
+	}
+	if cfg.TLSConfig != nil {
+		t.Fatalf("udp tls config = %#v, want nil", cfg.TLSConfig)
 	}
 }
 
@@ -131,8 +182,10 @@ func TestSubscriptionConfigValidateRejectsInvalidValues(t *testing.T) {
 		cfg  SubscriptionConfig
 	}{
 		{name: "missing local", cfg: SubscriptionConfig{}},
+		{name: "invalid transport", cfg: SubscriptionConfig{Transport: TransportMode("bogus"), LocalAddr: "127.0.0.1:0"}},
 		{name: "negative read buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", ReadBufferBytes: -1}},
 		{name: "negative write buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", WriteBufferBytes: -1}},
+		{name: "negative receiver window", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", ReceiverWindowBytes: -1}},
 	}
 
 	for _, tt := range tests {

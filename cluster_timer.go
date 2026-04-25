@@ -64,6 +64,18 @@ func (n *ClusterNode) ScheduleTimer(ctx context.Context, timer ClusterTimer) (Cl
 	role := n.role
 	n.mu.Unlock()
 
+	if err := n.authorizeClusterAction(ctx, ClusterAuthorizationRequest{
+		NodeID:    nodeID,
+		Role:      role,
+		Action:    ClusterAuthorizationActionScheduleTimer,
+		TimerID:   timer.TimerID,
+		Deadline:  timer.Deadline,
+		Payload:   timer.Payload,
+		Principal: clusterPrincipalFromContext(ctx),
+	}); err != nil {
+		return ClusterTimer{}, err
+	}
+
 	entry, err := n.log.Append(ctx, ClusterLogEntry{
 		Type:     ClusterLogEntryTimerSchedule,
 		TimerID:  timer.TimerID,
@@ -109,7 +121,20 @@ func (n *ClusterNode) CancelTimer(ctx context.Context, timerID ClusterTimerID) e
 	}
 	nodeID := n.nodeID
 	role := n.role
+	timer := cloneClusterTimer(n.timers[timerID])
 	n.mu.Unlock()
+
+	if err := n.authorizeClusterAction(ctx, ClusterAuthorizationRequest{
+		NodeID:    nodeID,
+		Role:      role,
+		Action:    ClusterAuthorizationActionCancelTimer,
+		TimerID:   timerID,
+		Deadline:  timer.Deadline,
+		Payload:   timer.Payload,
+		Principal: clusterPrincipalFromContext(ctx),
+	}); err != nil {
+		return err
+	}
 
 	entry, err := n.log.Append(ctx, ClusterLogEntry{
 		Type:    ClusterLogEntryTimerCancel,
@@ -210,6 +235,19 @@ func (n *ClusterNode) SendServiceMessage(ctx context.Context, msg ClusterService
 	nodeID := n.nodeID
 	role := n.role
 	n.mu.Unlock()
+
+	if err := n.authorizeClusterAction(ctx, ClusterAuthorizationRequest{
+		NodeID:        nodeID,
+		Role:          role,
+		Action:        ClusterAuthorizationActionServiceMessage,
+		CorrelationID: msg.CorrelationID,
+		SourceService: msg.SourceService,
+		TargetService: msg.TargetService,
+		Payload:       msg.Payload,
+		Principal:     clusterPrincipalFromContext(ctx),
+	}); err != nil {
+		return ClusterEgress{}, err
+	}
 
 	entry, err := n.log.Append(ctx, ClusterLogEntry{
 		Type:          ClusterLogEntryServiceMessage,

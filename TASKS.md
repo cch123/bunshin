@@ -1,6 +1,6 @@
 # Bunshin Go Aeron-Inspired Roadmap
 
-This checklist tracks the work needed to evolve Bunshin from the current QUIC-backed prototype into a fuller Go implementation inspired by Aeron's open-source architecture.
+This checklist tracks the work needed to evolve Bunshin from the current transport prototype into a fuller Go implementation inspired by Aeron's open-source architecture.
 
 ## Protocol And Compatibility
 
@@ -29,10 +29,10 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 - [x] Add flow control strategies for unicast and multicast.
 - [x] Add ordered delivery guarantees per stream/session.
 - [x] Add idle strategies for low-latency polling loops.
-- [ ] Add a Bunshin-native UDP transport backend behind the publication/subscription API.
-- [ ] Add receiver status/position feedback frames for non-QUIC transports.
-- [ ] Add NAK-style repair for UDP/backend transports while keeping QUIC reliability as the default path.
-- [ ] Add RTT measurement and congestion-control hooks for non-QUIC transports.
+- [x] Add a Bunshin-native UDP transport backend behind the publication/subscription API.
+- [x] Add receiver status/position feedback frames for non-QUIC transports.
+- [x] Add NAK-style repair for UDP/backend transports while keeping QUIC reliability as the default path.
+- [x] Add RTT measurement and congestion-control hooks for non-QUIC transports.
 - [ ] Add multicast transport support for UDP publications and subscriptions.
 - [ ] Add multi-destination send and receive support with dynamic destination add/remove.
 - [ ] Add response-channel support for request/response without application-encoded reply addresses.
@@ -46,10 +46,10 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 - [x] Add command/control channels between clients and driver.
 - [x] Add shared-memory or memory-mapped transport for local IPC.
 - [x] Add driver cleanup for stale clients and inactive sessions.
-- [ ] Define external driver directory layout, mark file, counters file, and loss/error report files.
-- [ ] Implement a typed driver command protocol over local IPC with correlation IDs and async driver events.
-- [ ] Add an out-of-process media driver binary with heartbeat, termination, and stale-driver detection.
-- [ ] Move publication/subscription resource ownership behind the external driver boundary while preserving embeddable mode.
+- [x] Define external driver directory layout, mark file, counters file, and loss/error report files.
+- [x] Implement a typed driver command protocol over local IPC with correlation IDs and async driver events.
+- [x] Add an out-of-process media driver binary with heartbeat, termination, and stale-driver detection.
+- [x] Move publication/subscription resource ownership behind the external driver boundary while preserving embeddable mode.
 - [ ] Back driver-managed term buffers with mmap files shared between clients and driver.
 - [ ] Add driver conductor/sender/receiver agent loops with configurable threading and idle strategies.
 - [ ] Add active-directory detection and stale mark-file recovery.
@@ -69,7 +69,7 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 - [ ] Add vectored offer APIs for gathering multiple buffers into one message.
 - [ ] Add zero-copy claim/commit APIs for single-message writes.
 - [ ] Add an exclusive publication API for single-writer hot paths.
-- [ ] Add a Bunshin channel URI parser/builder for `bunshin:quic`, `bunshin:udp`, and `bunshin:ipc`.
+- [x] Add a Bunshin channel URI parser/builder for `bunshin:quic`, `bunshin:udp`, and `bunshin:ipc`.
 - [ ] Add channel-level dynamic destination APIs.
 
 ## Observability
@@ -116,11 +116,11 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 - [x] Add optional learner nodes that follow the master log and build snapshots without joining consensus.
 - [x] Add reliable cluster timers and inter-service messaging.
 - [x] Add appointed-leader and single-node development modes.
-- [ ] Add backup and standby replication support.
+- [x] Add backup and standby replication support.
 - [x] Add deterministic service execution examples.
-- [ ] Add rolling upgrade and membership-change strategy.
+- [x] Add rolling upgrade and membership-change strategy.
 - [x] Add cluster control tool for describe, snapshot, suspend, resume, shutdown, and validation.
-- [ ] Add cluster authentication and authorization hooks.
+- [x] Add cluster authentication and authorization hooks.
 
 ## Performance
 
@@ -131,7 +131,7 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 - [ ] Add Linux-specific socket tuning documentation.
 - [ ] Evaluate runtime pinning and busy-spin options for low-latency deployments.
 - [ ] Add mmap IPC and shared term-buffer throughput benchmarks.
-- [ ] Add p99/p999 latency benchmarks for QUIC, IPC, and future UDP transports.
+- [ ] Add p99/p999 latency benchmarks for QUIC, UDP, and IPC transports.
 - [ ] Add fanout, multi-destination, archive replay, and replay-merge benchmarks.
 - [ ] Add memory and GC profile benchmarks for publication, subscription, archive, and driver loops.
 
@@ -145,7 +145,9 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 - [ ] Add cross-platform CI for macOS and Linux.
 - [ ] Add driver restart, stale client, stale driver, and mark-file recovery tests.
 - [ ] Add shared mmap buffer corruption and recovery tests.
-- [ ] Add UDP transport, NAK repair, multicast, and multi-destination integration tests.
+- [x] Add UDP transport integration tests.
+- [x] Add NAK repair integration tests.
+- [ ] Add multicast and multi-destination integration tests.
 - [ ] Add response-channel and dynamic destination system tests.
 - [ ] Add archive catalog, recording extension, replay merge, and replication tests.
 - [ ] Add cluster network partition, leader failover, snapshot recovery, and backup tests.

@@ -35,14 +35,16 @@ type Message struct {
 type Handler func(context.Context, Message) error
 
 type SubscriptionConfig struct {
-	StreamID    uint32
-	LocalAddr   string
-	TLSConfig   *tls.Config
-	QUICConfig  *quic.Config
-	Metrics     *Metrics
-	Logger      Logger
-	LossHandler LossHandler
-	Archive     *Archive
+	Transport           TransportMode
+	StreamID            uint32
+	LocalAddr           string
+	TLSConfig           *tls.Config
+	QUICConfig          *quic.Config
+	Metrics             *Metrics
+	Logger              Logger
+	LossHandler         LossHandler
+	Archive             *Archive
+	ReceiverWindowBytes int
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, LocalAddr is ignored and the caller owns closing it.
 	PacketConn net.PacketConn
@@ -53,22 +55,67 @@ type SubscriptionConfig struct {
 }
 
 type Subscription struct {
-	listener  *quic.Listener
-	transport *quic.Transport
-	metrics   *Metrics
-	logger    Logger
-	loss      *lossDetector
-	archive   *Archive
-	ordered   *orderedDelivery
-	streamID  uint32
-	closed    chan struct{}
-	closeOnce sync.Once
+	transportMode  TransportMode
+	listener       *quic.Listener
+	udpConn        net.PacketConn
+	udpOwnConn     bool
+	udpMu          sync.Mutex
+	udpFragments   map[udpFragmentKey]*udpFragmentSet
+	udpPeers       map[string]struct{}
+	transport      *quic.Transport
+	metrics        *Metrics
+	logger         Logger
+	loss           *lossDetector
+	archive        *Archive
+	ordered        *orderedDelivery
+	streamID       uint32
+	receiverWindow int
+	closed         chan struct{}
+	closeOnce      sync.Once
 }
 
 func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 	cfg, err := normalizeSubscriptionConfig(cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	if cfg.Transport == TransportUDP {
+		conn, err := listenUDPSubscription(cfg.LocalAddr, cfg.PacketConn)
+		if err != nil {
+			logEvent(context.Background(), cfg.Logger, LogEvent{
+				Level:     LogLevelError,
+				Component: "subscription",
+				Operation: "listen",
+				Message:   "udp listen failed",
+				Fields: map[string]any{
+					"local_addr": cfg.LocalAddr,
+					"stream_id":  cfg.StreamID,
+				},
+				Err: err,
+			})
+			return nil, fmt.Errorf("listen udp subscription: %w", err)
+		}
+		sub := &Subscription{
+			transportMode:  cfg.Transport,
+			udpConn:        conn,
+			udpOwnConn:     cfg.PacketConn == nil,
+			udpFragments:   make(map[udpFragmentKey]*udpFragmentSet),
+			udpPeers:       make(map[string]struct{}),
+			metrics:        cfg.Metrics,
+			logger:         cfg.Logger,
+			loss:           newLossDetector(cfg.Metrics, cfg.LossHandler),
+			archive:        cfg.Archive,
+			streamID:       cfg.StreamID,
+			receiverWindow: cfg.ReceiverWindowBytes,
+			closed:         make(chan struct{}),
+		}
+		sub.ordered = newOrderedDelivery(sub)
+		sub.log(context.Background(), LogLevelInfo, "listen", "udp subscription listening", map[string]any{
+			"local_addr": sub.LocalAddr().String(),
+			"stream_id":  sub.streamID,
+		}, nil)
+		return sub, nil
 	}
 
 	listener, transport, err := listenQUIC(cfg.LocalAddr, cfg.TLSConfig, cfg.QUICConfig, cfg.PacketConn)
@@ -88,14 +135,16 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 	}
 
 	sub := &Subscription{
-		listener:  listener,
-		transport: transport,
-		metrics:   cfg.Metrics,
-		logger:    cfg.Logger,
-		loss:      newLossDetector(cfg.Metrics, cfg.LossHandler),
-		archive:   cfg.Archive,
-		streamID:  cfg.StreamID,
-		closed:    make(chan struct{}),
+		transportMode:  cfg.Transport,
+		listener:       listener,
+		transport:      transport,
+		metrics:        cfg.Metrics,
+		logger:         cfg.Logger,
+		loss:           newLossDetector(cfg.Metrics, cfg.LossHandler),
+		archive:        cfg.Archive,
+		streamID:       cfg.StreamID,
+		receiverWindow: cfg.ReceiverWindowBytes,
+		closed:         make(chan struct{}),
 	}
 	sub.ordered = newOrderedDelivery(sub)
 	sub.log(context.Background(), LogLevelInfo, "listen", "subscription listening", map[string]any{
@@ -106,6 +155,9 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 }
 
 func (s *Subscription) Serve(ctx context.Context, handler Handler) error {
+	if s != nil && s.transportMode == TransportUDP {
+		return s.serveUDP(ctx, handler)
+	}
 	if handler == nil {
 		err := errors.New("handler is required")
 		s.log(ctx, LogLevelWarn, "serve", "serve rejected", nil, err)
@@ -161,6 +213,9 @@ func (s *Subscription) Serve(ctx context.Context, handler Handler) error {
 }
 
 func (s *Subscription) LocalAddr() net.Addr {
+	if s.udpConn != nil {
+		return s.udpConn.LocalAddr()
+	}
 	return s.listener.Addr()
 }
 
@@ -172,7 +227,15 @@ func (s *Subscription) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		err = s.listener.Close()
+		if s.udpConn != nil {
+			if s.udpOwnConn {
+				err = s.udpConn.Close()
+			} else {
+				err = s.udpConn.SetReadDeadline(time.Now())
+			}
+		} else {
+			err = s.listener.Close()
+		}
 		if s.transport != nil {
 			if transportErr := s.transport.Close(); err == nil {
 				err = transportErr
@@ -274,17 +337,22 @@ func (s *Subscription) data(ctx context.Context, remote net.Addr, stream *quic.S
 		Remote:        remote,
 	}
 	if err := s.ordered.deliver(ctx, orderedMessage{
-		ctx:      ctx,
-		stream:   stream,
-		msg:      msg,
-		ackFrame: ackFrame,
+		ctx: ctx,
+		msg: msg,
+		ack: func() error {
+			return s.ack(stream, ackFrame)
+		},
+		fail: func(err error) error {
+			return s.writeError(stream, msg.StreamID, msg.SessionID, msg.Sequence, protocolErrorMalformedFrame, err.Error())
+		},
 	}, handler); err != nil {
 		s.metrics.incReceiveErrors()
 		return
 	}
 }
 
-func (s *Subscription) handleMessage(ctx context.Context, stream *quic.Stream, msg Message, ackFrame frame, handler Handler) error {
+func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, handler Handler) error {
+	msg := item.msg
 	if s.archive != nil {
 		record, err := s.archive.Record(msg)
 		if err != nil {
@@ -294,7 +362,9 @@ func (s *Subscription) handleMessage(ctx context.Context, stream *quic.Stream, m
 				"session_id": msg.SessionID,
 				"sequence":   msg.Sequence,
 			}, err)
-			_ = s.writeError(stream, msg.StreamID, msg.SessionID, msg.Sequence, protocolErrorMalformedFrame, err.Error())
+			if item.fail != nil {
+				_ = item.fail(err)
+			}
 			return err
 		}
 		s.log(ctx, LogLevelDebug, "archive", "message recorded", map[string]any{
@@ -313,11 +383,16 @@ func (s *Subscription) handleMessage(ctx context.Context, stream *quic.Stream, m
 			"bytes":       len(msg.Payload),
 			"remote_addr": remoteAddrString(msg.Remote),
 		}, err)
-		_ = s.writeError(stream, msg.StreamID, msg.SessionID, msg.Sequence, protocolErrorMalformedFrame, err.Error())
+		if item.fail != nil {
+			_ = item.fail(err)
+		}
 		return err
 	}
 	s.metrics.incMessagesReceived(len(msg.Payload))
-	if err := s.ack(stream, ackFrame); err != nil {
+	if item.ack == nil {
+		return nil
+	}
+	if err := item.ack(); err != nil {
 		s.metrics.incReceiveErrors()
 		s.log(ctx, LogLevelWarn, "ack", "ack failed", map[string]any{
 			"stream_id":  msg.StreamID,

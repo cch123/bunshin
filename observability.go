@@ -2,6 +2,7 @@ package bunshin
 
 import (
 	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/qlog"
@@ -26,6 +27,10 @@ type Metrics struct {
 	sendErrors          atomic.Uint64
 	receiveErrors       atomic.Uint64
 	protocolErrors      atomic.Uint64
+	rttMeasurements     atomic.Uint64
+	rttLatestNanos      atomic.Uint64
+	rttMinNanos         atomic.Uint64
+	rttMaxNanos         atomic.Uint64
 }
 
 type MetricsSnapshot struct {
@@ -47,6 +52,10 @@ type MetricsSnapshot struct {
 	SendErrors          uint64
 	ReceiveErrors       uint64
 	ProtocolErrors      uint64
+	RTTMeasurements     uint64
+	RTTLatest           time.Duration
+	RTTMin              time.Duration
+	RTTMax              time.Duration
 }
 
 func (m *Metrics) Snapshot() MetricsSnapshot {
@@ -72,6 +81,10 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		SendErrors:          m.sendErrors.Load(),
 		ReceiveErrors:       m.receiveErrors.Load(),
 		ProtocolErrors:      m.protocolErrors.Load(),
+		RTTMeasurements:     m.rttMeasurements.Load(),
+		RTTLatest:           time.Duration(m.rttLatestNanos.Load()),
+		RTTMin:              time.Duration(m.rttMinNanos.Load()),
+		RTTMax:              time.Duration(m.rttMaxNanos.Load()),
 	}
 }
 
@@ -179,5 +192,32 @@ func (m *Metrics) incReceiveErrors() {
 func (m *Metrics) incProtocolErrors() {
 	if m != nil {
 		m.protocolErrors.Add(1)
+	}
+}
+
+func (m *Metrics) observeRTT(duration time.Duration) {
+	if m == nil || duration <= 0 {
+		return
+	}
+	nanos := uint64(duration)
+	m.rttMeasurements.Add(1)
+	m.rttLatestNanos.Store(nanos)
+	for {
+		current := m.rttMinNanos.Load()
+		if current != 0 && current <= nanos {
+			break
+		}
+		if m.rttMinNanos.CompareAndSwap(current, nanos) {
+			break
+		}
+	}
+	for {
+		current := m.rttMaxNanos.Load()
+		if current >= nanos {
+			break
+		}
+		if m.rttMaxNanos.CompareAndSwap(current, nanos) {
+			break
+		}
 	}
 }

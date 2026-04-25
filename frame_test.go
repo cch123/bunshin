@@ -147,6 +147,28 @@ func TestErrorPayloadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStatusPayloadRoundTrip(t *testing.T) {
+	in := statusPayload{windowLength: 4096}
+	out, err := decodeStatusPayload(encodeStatusPayload(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != in {
+		t.Fatalf("decoded status = %#v, want %#v", out, in)
+	}
+}
+
+func TestNakPayloadRoundTrip(t *testing.T) {
+	in := nakPayload{fromSequence: 3, toSequence: 7}
+	out, err := decodeNakPayload(encodeNakPayload(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != in {
+		t.Fatalf("decoded nak = %#v, want %#v", out, in)
+	}
+}
+
 func FuzzDecodeFrame(f *testing.F) {
 	valid, err := encodeFrame(frame{
 		typ:       frameData,

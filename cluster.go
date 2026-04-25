@@ -41,6 +41,8 @@ const (
 	ClusterRoleLeader   ClusterRole = "leader"
 	ClusterRoleFollower ClusterRole = "follower"
 	ClusterRoleLearner  ClusterRole = "learner"
+	ClusterRoleBackup   ClusterRole = "backup"
+	ClusterRoleStandby  ClusterRole = "standby"
 )
 
 type ClusterConfig struct {
@@ -52,6 +54,8 @@ type ClusterConfig struct {
 	Learner            *ClusterLearnerConfig
 	Replication        *ClusterReplicationConfig
 	Election           *ClusterElectionConfig
+	Authenticator      ClusterAuthenticator
+	Authorizer         ClusterAuthorizer
 	TimerCheckInterval time.Duration
 	DisableTimerLoop   bool
 	Service            ClusterService
@@ -69,6 +73,8 @@ type ClusterNode struct {
 	learner            *clusterLearnerState
 	replication        *clusterReplicationState
 	election           *clusterElectionState
+	authenticator      ClusterAuthenticator
+	authorizer         ClusterAuthorizer
 	timers             map[ClusterTimerID]ClusterTimer
 	timerCheckInterval time.Duration
 	disableTimerLoop   bool
@@ -156,6 +162,7 @@ type ClusterClient struct {
 	node              *ClusterNode
 	sessionID         ClusterSessionID
 	nextCorrelationID ClusterCorrelationID
+	principal         ClusterPrincipal
 }
 
 func StartClusterNode(ctx context.Context, cfg ClusterConfig) (*ClusterNode, error) {
@@ -173,6 +180,8 @@ func StartClusterNode(ctx context.Context, cfg ClusterConfig) (*ClusterNode, err
 		learner:            newClusterLearnerState(normalized.Learner),
 		replication:        newClusterReplicationState(normalized.Replication),
 		election:           newClusterElectionState(normalized.Election, normalized.AppointedLeaderID),
+		authenticator:      normalized.Authenticator,
+		authorizer:         normalized.Authorizer,
 		timers:             make(map[ClusterTimerID]ClusterTimer),
 		timerCheckInterval: normalized.TimerCheckInterval,
 		disableTimerLoop:   normalized.DisableTimerLoop,
@@ -252,27 +261,54 @@ func (n *ClusterNode) NewClient(ctx context.Context) (*ClusterClient, error) {
 		ctx = context.Background()
 	}
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	if n.closed {
+		n.mu.Unlock()
 		return nil, ErrClusterClosed
 	}
+	request := ClusterAuthenticationRequest{
+		NodeID: n.nodeID,
+		Role:   n.role,
+	}
+	n.mu.Unlock()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
 
+	principal, err := n.authenticateClusterPrincipal(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.authorizeClusterAction(ctx, ClusterAuthorizationRequest{
+		NodeID:    request.NodeID,
+		Role:      request.Role,
+		Principal: principal,
+		Action:    ClusterAuthorizationActionOpenSession,
+	}); err != nil {
+		return nil, err
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return nil, ErrClusterClosed
+	}
 	sessionID := n.nextSessionID
 	n.nextSessionID++
 	return &ClusterClient{
 		node:              n,
 		sessionID:         sessionID,
 		nextCorrelationID: 1,
+		principal:         cloneClusterPrincipal(principal),
 	}, nil
 }
 
 func (n *ClusterNode) Submit(ctx context.Context, ingress ClusterIngress) (ClusterEgress, error) {
+	return n.submit(ctx, ingress, clusterPrincipalFromContext(ctx))
+}
+
+func (n *ClusterNode) submit(ctx context.Context, ingress ClusterIngress, principal ClusterPrincipal) (ClusterEgress, error) {
 	if n == nil {
 		return ClusterEgress{}, ErrClusterClosed
 	}
@@ -307,6 +343,18 @@ func (n *ClusterNode) Submit(ctx context.Context, ingress ClusterIngress) (Clust
 	nodeID := n.nodeID
 	role := n.role
 	n.mu.Unlock()
+
+	if err := n.authorizeClusterAction(ctx, ClusterAuthorizationRequest{
+		NodeID:        nodeID,
+		Role:          role,
+		Principal:     principal,
+		Action:        ClusterAuthorizationActionIngress,
+		SessionID:     ingress.SessionID,
+		CorrelationID: ingress.CorrelationID,
+		Payload:       ingress.Payload,
+	}); err != nil {
+		return ClusterEgress{}, err
+	}
 
 	entry, err := n.log.Append(ctx, ClusterLogEntry{
 		Type:          ClusterLogEntryIngress,
@@ -426,6 +474,12 @@ func (n *ClusterNode) TakeSnapshot(ctx context.Context) (ClusterStateSnapshot, e
 		ctx = context.Background()
 	}
 
+	if err := n.authorizeClusterAction(ctx, ClusterAuthorizationRequest{
+		Action: ClusterAuthorizationActionSnapshot,
+	}); err != nil {
+		return ClusterStateSnapshot{}, err
+	}
+
 	n.applyMu.Lock()
 	defer n.applyMu.Unlock()
 
@@ -490,12 +544,13 @@ func (c *ClusterClient) Send(ctx context.Context, payload []byte) (ClusterEgress
 	c.mu.Lock()
 	correlationID := c.nextCorrelationID
 	c.nextCorrelationID++
+	principal := cloneClusterPrincipal(c.principal)
 	c.mu.Unlock()
-	return c.node.Submit(ctx, ClusterIngress{
+	return c.node.submit(ctx, ClusterIngress{
 		SessionID:     c.sessionID,
 		CorrelationID: correlationID,
 		Payload:       payload,
-	})
+	}, principal)
 }
 
 func (n *ClusterNode) start(ctx context.Context) error {

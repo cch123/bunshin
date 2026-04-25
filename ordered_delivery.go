@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"github.com/quic-go/quic-go"
 )
 
 type orderedDelivery struct {
@@ -21,11 +19,11 @@ type orderedState struct {
 }
 
 type orderedMessage struct {
-	ctx      context.Context
-	stream   *quic.Stream
-	msg      Message
-	ackFrame frame
-	done     chan error
+	ctx  context.Context
+	msg  Message
+	ack  func() error
+	fail func(error) error
+	done chan error
 }
 
 func newOrderedDelivery(sub *Subscription) *orderedDelivery {
@@ -37,7 +35,7 @@ func newOrderedDelivery(sub *Subscription) *orderedDelivery {
 
 func (d *orderedDelivery) deliver(ctx context.Context, item orderedMessage, handler Handler) error {
 	if item.msg.Sequence == 0 {
-		return d.sub.handleMessage(ctx, item.stream, item.msg, item.ackFrame, handler)
+		return d.sub.handleMessage(ctx, item, handler)
 	}
 
 	key := lossKey{
@@ -59,7 +57,10 @@ func (d *orderedDelivery) deliver(ctx context.Context, item orderedMessage, hand
 	if item.msg.Sequence < state.next {
 		d.mu.Unlock()
 		d.sub.metrics.incFramesDropped(1)
-		return d.sub.ack(item.stream, item.ackFrame)
+		if item.ack != nil {
+			return item.ack()
+		}
+		return nil
 	}
 	if _, exists := state.pending[item.msg.Sequence]; exists {
 		d.mu.Unlock()
@@ -95,7 +96,7 @@ func (d *orderedDelivery) deliverReady(key lossKey, state *orderedState, handler
 		state.next++
 		d.mu.Unlock()
 
-		err := d.sub.handleMessage(item.ctx, item.stream, item.msg, item.ackFrame, handler)
+		err := d.sub.handleMessage(item.ctx, *item, handler)
 		item.done <- err
 	}
 }

@@ -148,6 +148,16 @@ func (a termAppend) Bytes() []byte {
 	return a.buffer
 }
 
+func (l *termLog) position(termID, termOffset int32) (int64, error) {
+	if termOffset < 0 || int(termOffset) > l.termLength {
+		return 0, fmt.Errorf("invalid term offset: %d", termOffset)
+	}
+	if termID < l.initialTermID {
+		return 0, fmt.Errorf("invalid term id: %d", termID)
+	}
+	return computeTermPosition(termID, int(termOffset), l.positionBitsToShift, l.initialTermID), nil
+}
+
 func align(value, alignment int) int {
 	return (value + (alignment - 1)) & ^(alignment - 1)
 }

@@ -3,13 +3,13 @@
 Bunshin exposes observability at two layers:
 
 - Bunshin counters for stable application-level publication/subscription behavior.
-- `quic-go` qlog traces for transport-level packet, congestion, and recovery details.
+- `quic-go` qlog traces for QUIC packet, congestion, and recovery details.
 
 ## Aeron Reference Note
 
 Aeron exposes counters through its media driver and tooling. Bunshin's embeddable media driver exposes lifecycle counters through `MediaDriver.Snapshot`; the `Metrics` type remains a process-local counter set for stable application-level publication/subscription behavior.
 
-QUIC-specific details are exposed through qlog rather than being normalized into Bunshin counters. This keeps Bunshin counters stable while still allowing transport-level debugging.
+QUIC-specific details are exposed through qlog rather than being normalized into Bunshin counters. UDP exposes Bunshin frame-level counters, retransmit counts, RTT summaries, and transport feedback callbacks.
 
 ## Metrics
 
@@ -38,9 +38,11 @@ snapshot := metrics.Snapshot()
 fmt.Println(snapshot.MessagesSent, snapshot.MessagesReceived)
 ```
 
-Counters currently include connections opened/accepted, messages and bytes sent/received, application-level frames sent/received/dropped, application-level retransmits, ACKs, publication back-pressure events, sequence-gap observations, missing sequence counts, send/receive errors, and protocol errors.
+Counters currently include connections opened/accepted, messages and bytes sent/received, application-level frames sent/received/dropped, application-level retransmits, ACKs, publication back-pressure events, sequence-gap observations, missing sequence counts, send/receive errors, protocol errors, and UDP RTT summaries.
 
-`FramesSent` and `FramesReceived` count Bunshin protocol frames such as HELLO, DATA, ACK, and ERROR. `FramesDropped` counts valid or attempted Bunshin frames that are suppressed locally, such as duplicates or malformed/unsupported input. QUIC packet drops and QUIC retransmissions remain transport-level details exposed through qlog; Bunshin's `Retransmits` counter is reserved for future Bunshin-managed retransmission paths.
+`FramesSent` and `FramesReceived` count Bunshin protocol frames such as HELLO, DATA, ACK, ERROR, STATUS, and NAK across QUIC and UDP. `FramesDropped` counts valid or attempted Bunshin frames that are suppressed locally, such as duplicates or malformed/unsupported input. QUIC packet drops and QUIC retransmissions remain transport-level details exposed through qlog; Bunshin's `Retransmits` counter records Bunshin-managed retransmission paths such as UDP NAK repair.
+
+`PublicationConfig.TransportFeedback` receives UDP RTT observations after ACK and retransmit observations after NAK repair. This hook is intentionally low-level so applications can experiment with congestion-control policy without replacing the default QUIC transport.
 
 Subscriptions also keep process-local loss reports:
 

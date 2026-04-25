@@ -58,9 +58,9 @@ func newLossDetector(metrics *Metrics, handler LossHandler) *lossDetector {
 	}
 }
 
-func (d *lossDetector) observe(f frame, remote net.Addr) {
+func (d *lossDetector) observe(f frame, remote net.Addr) []LossObservation {
 	if d == nil || f.seq == 0 {
-		return
+		return nil
 	}
 
 	key := lossKey{
@@ -76,6 +76,7 @@ func (d *lossDetector) observe(f frame, remote net.Addr) {
 			d.handler(observation)
 		}
 	}
+	return observations
 }
 
 func (d *lossDetector) observeSequence(key lossKey, seq uint64, observedAt time.Time) []LossObservation {

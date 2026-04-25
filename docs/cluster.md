@@ -8,7 +8,7 @@ The first supported modes are:
 - `appointed-leader`: a configured node ID is leader; non-leader nodes reject local ingress.
 - `learner`: the node does not participate in consensus or accept ingress; it follows a configured master log and snapshots local service state.
 
-Network transport for member replication, backup catch-up, and rolling upgrades are future layers above this core.
+Network transport for member replication and rolling upgrades are future layers above this core.
 
 ## Node
 
@@ -36,6 +36,27 @@ fmt.Println(egress.LogPosition, egress.CorrelationID, string(egress.Payload))
 ```
 
 Applications can also submit an explicit `ClusterIngress` when they own session and correlation allocation.
+
+## Authentication And Authorization
+
+`ClusterConfig.Authenticator` runs when `NewClient` opens a session. It can validate credentials carried by the request context and return a `ClusterPrincipal` that is attached to the client session.
+
+```go
+node, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    Authenticator: func(ctx context.Context, request bunshin.ClusterAuthenticationRequest) (bunshin.ClusterPrincipal, error) {
+        return bunshin.ClusterPrincipal{Identity: "alice", Roles: []string{"writer"}}, nil
+    },
+    Authorizer: func(ctx context.Context, request bunshin.ClusterAuthorizationRequest) error {
+        if request.Action == bunshin.ClusterAuthorizationActionIngress && request.Principal.Identity == "" {
+            return errors.New("unauthorized")
+        }
+        return nil
+    },
+    Service: service,
+})
+```
+
+`ClusterConfig.Authorizer` is called before session open, ingress append, timer schedule/cancel, service message append, and explicit snapshots. The request includes node role, principal, session/correlation IDs, timer metadata, service routing metadata, and a cloned payload. Direct node operations can attach a principal to the context with `ContextWithClusterPrincipal`.
 
 ## Replicated Log
 
@@ -135,6 +156,54 @@ follower, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
 
 This is a Bunshin-native replication boundary over `ClusterLog`, not a network wire protocol. A future transport can expose a remote member log behind the same source-log shape.
 
+## Backup And Standby
+
+`StartClusterBackup` starts a separate backup agent. It copies a source cluster log into a local backup log. In cold backup mode it only persists the log and timer metadata; in standby mode it also applies deliverable entries into a local service.
+
+```go
+backup, err := bunshin.StartClusterBackup(ctx, bunshin.ClusterBackupConfig{
+    NodeID:        4,
+    SourceLog:     leaderLog,
+    Log:           backupLog,
+    SnapshotStore: backupSnapshots,
+    Service:       standbyService,
+    Standby:       true,
+})
+
+result, err := backup.Sync(ctx)
+```
+
+When `SnapshotStore` is configured, the service must implement `ClusterSnapshotService`. Snapshots include service state and pending timers. `SnapshotEvery` controls how many applied entries can accumulate before a backup snapshot is taken; the zero value snapshots after each successful sync batch. `DisableAutoRun` leaves sync scheduling to the application.
+
+Cold backup is useful when the process should only keep a durable log copy. Standby backup is useful when the process should keep deterministic service state warm. To promote a backup, start a normal `ClusterNode` with the backup log and snapshot store.
+
+## Membership And Rolling Upgrade
+
+Bunshin exposes membership-change and rolling-upgrade planning helpers for control planes. These helpers do not mutate running nodes; they validate quorum, leader, and catch-up constraints and return ordered steps that an external orchestrator can execute.
+
+```go
+plan, err := bunshin.PlanClusterMembershipChange(current, bunshin.ClusterMembershipChange{
+    Add: []bunshin.ClusterMember{{
+        NodeID:         4,
+        Version:        "1.0.0",
+        Voting:         true,
+        Active:         true,
+        SyncedPosition: current.LogPosition,
+    }},
+})
+```
+
+New voting members are planned as standby first, caught up to the current log position, then promoted into the voting set. Removing a leader requires an explicit leader transfer. Membership transitions are rejected when the resulting membership has no active quorum, no valid leader, or no voting-set overlap with the current membership.
+
+Rolling upgrades are planned one member at a time. Followers are upgraded before the current leader unless `AllowLeaderFirst` is set. The planner rejects a member upgrade if taking that active voter down would break quorum.
+
+```go
+upgrade, err := bunshin.PlanClusterRollingUpgrade(bunshin.ClusterRollingUpgradeConfig{
+    Membership:    current,
+    TargetVersion: "2.0.0",
+})
+```
+
 ## Snapshots
 
 Services that support snapshots implement `ClusterSnapshotService`:
@@ -201,7 +270,7 @@ err = client.Resume(ctx)
 err = client.Shutdown(ctx)
 ```
 
-`ClusterControlConfig.Authorizer` can reject control operations before they touch the node. Suspend makes local ingress return `ErrClusterSuspended`; resume re-enables ingress without changing the log. Shutdown closes the node through the same lifecycle path as `ClusterNode.Close`.
+`ClusterControlConfig.Authorizer` can reject control operations before they touch the node. Cluster node authorization is configured separately with `ClusterConfig.Authorizer`, so applications can keep data-plane/session policy and local control-plane policy distinct. Suspend makes local ingress return `ErrClusterSuspended`; resume re-enables ingress without changing the log. Shutdown closes the node through the same lifecycle path as `ClusterNode.Close`.
 
 ## Service Callbacks
 
@@ -217,4 +286,4 @@ type ClusterService interface {
 
 ## Scope
 
-The current cluster layer provides the local service container, in-process ingress/egress protocol, appointed-leader gating, heartbeat-based local election, replayable replicated-log abstraction, log-backed timers and service messages, follower log catch-up, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide remote member communication, quorum replication, or full backup promotion.
+The current cluster layer provides the local service container, in-process ingress/egress protocol, authentication and authorization hooks, appointed-leader gating, heartbeat-based local election, replayable replicated-log abstraction, log-backed timers and service messages, follower log catch-up, backup and standby replication, membership-change and rolling-upgrade planning, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide remote member communication, quorum replication, or automated backup promotion.

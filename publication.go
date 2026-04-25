@@ -16,6 +16,16 @@ import (
 
 var ErrClosed = errors.New("bunshin: closed")
 
+const defaultUDPTransportMTUBytes = 1400
+
+type TransportMode string
+
+const (
+	TransportQUIC TransportMode = "quic"
+	TransportUDP  TransportMode = "udp"
+	TransportIPC  TransportMode = "ipc"
+)
+
 type ProtocolError struct {
 	Code    uint16
 	Message string
@@ -27,21 +37,37 @@ func (e *ProtocolError) Error() string {
 
 type ReservedValueSupplier func(payload []byte) uint64
 
+type TransportFeedback struct {
+	Transport           TransportMode
+	Remote              string
+	StreamID            uint32
+	SessionID           uint32
+	Sequence            uint64
+	RTT                 time.Duration
+	RetransmittedFrames int
+	ObservedAt          time.Time
+}
+
+type TransportFeedbackHandler func(TransportFeedback)
+
 type PublicationConfig struct {
-	StreamID               uint32
-	SessionID              uint32
-	RemoteAddr             string
-	MaxPayloadBytes        int
-	MTUBytes               int
-	TermBufferLength       int
-	InitialTermID          int32
-	PublicationWindowBytes int
-	TLSConfig              *tls.Config
-	QUICConfig             *quic.Config
-	Metrics                *Metrics
-	Logger                 Logger
-	ReservedValue          ReservedValueSupplier
-	FlowControl            FlowControlStrategy
+	Transport                TransportMode
+	StreamID                 uint32
+	SessionID                uint32
+	RemoteAddr               string
+	MaxPayloadBytes          int
+	MTUBytes                 int
+	UDPRetransmitBufferBytes int
+	TermBufferLength         int
+	InitialTermID            int32
+	PublicationWindowBytes   int
+	TLSConfig                *tls.Config
+	QUICConfig               *quic.Config
+	Metrics                  *Metrics
+	Logger                   Logger
+	ReservedValue            ReservedValueSupplier
+	FlowControl              FlowControlStrategy
+	TransportFeedback        TransportFeedbackHandler
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, the caller owns closing it.
 	PacketConn net.PacketConn
@@ -54,24 +80,34 @@ type PublicationConfig struct {
 }
 
 type Publication struct {
-	conn       *quic.Conn
-	transport  *quic.Transport
-	metrics    *Metrics
-	logger     Logger
-	streamID   uint32
-	sessionID  uint32
-	maxPayload int
-	mtuPayload int
-	reserved   ReservedValueSupplier
-	terms      *termLog
-	window     *publicationWindow
-	flow       FlowControlStrategy
-	flowWindow int
-	flowLimit  int64
-	flowMu     sync.Mutex
-	nextSeq    atomic.Uint64
-	closed     chan struct{}
-	closeOnce  sync.Once
+	transportMode      TransportMode
+	conn               *quic.Conn
+	udpConn            net.PacketConn
+	udpOwnConn         bool
+	udpRemote          net.Addr
+	udpMu              sync.Mutex
+	udpRetransmit      map[uint64]udpRetransmitEntry
+	udpRetransmitOrder []uint64
+	udpRetransmitBytes int
+	udpRetransmitLimit int
+	transport          *quic.Transport
+	metrics            *Metrics
+	logger             Logger
+	streamID           uint32
+	sessionID          uint32
+	maxPayload         int
+	mtuPayload         int
+	reserved           ReservedValueSupplier
+	transportFeedback  TransportFeedbackHandler
+	terms              *termLog
+	window             *publicationWindow
+	flow               FlowControlStrategy
+	flowWindow         int
+	flowLimit          int64
+	flowMu             sync.Mutex
+	nextSeq            atomic.Uint64
+	closed             chan struct{}
+	closeOnce          sync.Once
 }
 
 func DialPublication(cfg PublicationConfig) (*Publication, error) {
@@ -88,6 +124,56 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 	window, err := newPublicationWindow(cfg.PublicationWindowBytes)
 	if err != nil {
 		return nil, err
+	}
+
+	if cfg.Transport == TransportUDP {
+		conn, remote, err := listenUDPTransport(cfg.LocalAddr, cfg.RemoteAddr, cfg.PacketConn)
+		if err != nil {
+			logEvent(context.Background(), cfg.Logger, LogEvent{
+				Level:     LogLevelError,
+				Component: "publication",
+				Operation: "dial",
+				Message:   "udp dial failed",
+				Fields: map[string]any{
+					"local_addr":  cfg.LocalAddr,
+					"remote_addr": cfg.RemoteAddr,
+					"stream_id":   cfg.StreamID,
+					"session_id":  cfg.SessionID,
+				},
+				Err: err,
+			})
+			return nil, fmt.Errorf("dial udp publication: %w", err)
+		}
+		cfg.Metrics.incConnectionsOpened()
+		p := &Publication{
+			transportMode:      cfg.Transport,
+			udpConn:            conn,
+			udpOwnConn:         cfg.PacketConn == nil,
+			udpRemote:          remote,
+			udpRetransmit:      make(map[uint64]udpRetransmitEntry),
+			udpRetransmitLimit: cfg.UDPRetransmitBufferBytes,
+			metrics:            cfg.Metrics,
+			logger:             cfg.Logger,
+			streamID:           cfg.StreamID,
+			sessionID:          cfg.SessionID,
+			maxPayload:         cfg.MaxPayloadBytes,
+			mtuPayload:         normalized.mtuPayload,
+			reserved:           cfg.ReservedValue,
+			transportFeedback:  cfg.TransportFeedback,
+			terms:              terms,
+			window:             window,
+			flow:               cfg.FlowControl,
+			flowWindow:         cfg.PublicationWindowBytes,
+			flowLimit:          normalized.flowLimit,
+			closed:             make(chan struct{}),
+		}
+		p.log(context.Background(), LogLevelInfo, "dial", "udp publication ready", map[string]any{
+			"local_addr":  p.LocalAddr().String(),
+			"remote_addr": cfg.RemoteAddr,
+			"stream_id":   cfg.StreamID,
+			"session_id":  cfg.SessionID,
+		}, nil)
+		return p, nil
 	}
 
 	conn, transport, err := dialQUIC(context.Background(), cfg.RemoteAddr, cfg.TLSConfig, cfg.QUICConfig, cfg.PacketConn)
@@ -109,21 +195,23 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 	cfg.Metrics.incConnectionsOpened()
 
 	p := &Publication{
-		conn:       conn,
-		transport:  transport,
-		metrics:    cfg.Metrics,
-		logger:     cfg.Logger,
-		streamID:   cfg.StreamID,
-		sessionID:  cfg.SessionID,
-		maxPayload: cfg.MaxPayloadBytes,
-		mtuPayload: normalized.mtuPayload,
-		reserved:   cfg.ReservedValue,
-		terms:      terms,
-		window:     window,
-		flow:       cfg.FlowControl,
-		flowWindow: cfg.PublicationWindowBytes,
-		flowLimit:  normalized.flowLimit,
-		closed:     make(chan struct{}),
+		transportMode:     cfg.Transport,
+		conn:              conn,
+		transport:         transport,
+		metrics:           cfg.Metrics,
+		logger:            cfg.Logger,
+		streamID:          cfg.StreamID,
+		sessionID:         cfg.SessionID,
+		maxPayload:        cfg.MaxPayloadBytes,
+		mtuPayload:        normalized.mtuPayload,
+		reserved:          cfg.ReservedValue,
+		transportFeedback: cfg.TransportFeedback,
+		terms:             terms,
+		window:            window,
+		flow:              cfg.FlowControl,
+		flowWindow:        cfg.PublicationWindowBytes,
+		flowLimit:         normalized.flowLimit,
+		closed:            make(chan struct{}),
 	}
 	if err := p.negotiate(context.Background()); err != nil {
 		p.log(context.Background(), LogLevelError, "negotiate", "negotiation failed", map[string]any{
@@ -146,6 +234,9 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 }
 
 func (p *Publication) Send(ctx context.Context, payload []byte) error {
+	if p != nil && p.transportMode == TransportUDP {
+		return p.sendUDP(ctx, payload)
+	}
 	if len(payload) > p.maxPayload {
 		err := fmt.Errorf("payload too large: %d bytes", len(payload))
 		p.metrics.incSendErrors()
@@ -259,22 +350,44 @@ func (p *Publication) Send(ctx context.Context, payload []byte) error {
 }
 
 func (p *Publication) updateFlowControl(receiverPosition int64) error {
-	p.flowMu.Lock()
-	defer p.flowMu.Unlock()
-
-	status := FlowControlStatus{
-		ReceiverID:   remoteAddrString(p.conn.RemoteAddr()),
+	return p.updateFlowControlStatus(FlowControlStatus{
+		ReceiverID:   p.receiverID(),
 		Position:     receiverPosition,
 		WindowLength: p.flowWindow,
 		ObservedAt:   time.Now(),
+	})
+}
+
+func (p *Publication) updateFlowControlStatus(status FlowControlStatus) error {
+	p.flowMu.Lock()
+	defer p.flowMu.Unlock()
+
+	if status.ReceiverID == "" {
+		status.ReceiverID = p.receiverID()
+	}
+	if status.WindowLength <= 0 {
+		status.WindowLength = p.flowWindow
+	}
+	if status.ObservedAt.IsZero() {
+		status.ObservedAt = time.Now()
 	}
 	p.flowLimit = p.flow.OnStatus(status, p.flowLimit)
 
-	limit := int(p.flowLimit - receiverPosition)
+	limit := int(p.flowLimit - status.Position)
 	if limit <= 0 {
 		limit = 1
 	}
 	return p.window.setLimit(limit)
+}
+
+func (p *Publication) receiverID() string {
+	if p.conn != nil {
+		return remoteAddrString(p.conn.RemoteAddr())
+	}
+	if p.udpRemote != nil {
+		return remoteAddrString(p.udpRemote)
+	}
+	return ""
 }
 
 func (p *Publication) encodeDataPacket(seq, reserved uint64, payload []byte, fragmentCount int) ([]byte, termAppend, error) {
@@ -353,6 +466,9 @@ func fragmentedPacketBytes(payloadLen, fragmentPayloadMax int) int {
 }
 
 func (p *Publication) LocalAddr() net.Addr {
+	if p.udpConn != nil {
+		return p.udpConn.LocalAddr()
+	}
 	return p.conn.LocalAddr()
 }
 
@@ -360,7 +476,15 @@ func (p *Publication) Close() error {
 	var err error
 	p.closeOnce.Do(func() {
 		close(p.closed)
-		err = p.conn.CloseWithError(0, "closed")
+		if p.udpConn != nil {
+			if p.udpOwnConn {
+				err = p.udpConn.Close()
+			} else {
+				err = p.udpConn.SetReadDeadline(time.Now())
+			}
+		} else {
+			err = p.conn.CloseWithError(0, "closed")
+		}
 		if p.transport != nil {
 			if transportErr := p.transport.Close(); err == nil {
 				err = transportErr
@@ -383,6 +507,30 @@ func (p *Publication) log(ctx context.Context, level LogLevel, operation, messag
 		Fields:    fields,
 		Err:       err,
 	})
+}
+
+func (p *Publication) observeTransportFeedback(feedback TransportFeedback) {
+	if feedback.Transport == "" {
+		feedback.Transport = p.transportMode
+	}
+	if feedback.Remote == "" {
+		feedback.Remote = p.receiverID()
+	}
+	if feedback.StreamID == 0 {
+		feedback.StreamID = p.streamID
+	}
+	if feedback.SessionID == 0 {
+		feedback.SessionID = p.sessionID
+	}
+	if feedback.ObservedAt.IsZero() {
+		feedback.ObservedAt = time.Now()
+	}
+	if feedback.RTT > 0 {
+		p.metrics.observeRTT(feedback.RTT)
+	}
+	if p.transportFeedback != nil {
+		p.transportFeedback(feedback)
+	}
 }
 
 func (p *Publication) negotiate(ctx context.Context) error {

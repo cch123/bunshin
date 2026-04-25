@@ -6,9 +6,9 @@ Implementation decisions should follow the Aeron-first principle documented in [
 
 The first cut focuses on a narrow, testable slice:
 
-- QUIC-backed publication/subscription.
+- QUIC-backed publication/subscription with an optional Bunshin-native UDP backend.
 - Binary frame header with stream, session, term, sequence, and payload fields.
-- Reliable send over `quic-go` streams with application-level ACK frames.
+- Reliable send over `quic-go` streams with application-level ACK frames; UDP sends Bunshin frames directly as datagrams and uses receiver STATUS, NAK repair, and application-level ACK/ERROR responses.
 - Publication back pressure through a bounded in-flight send window.
 - Configurable unicast/max-multicast/min-multicast flow control strategies.
 - Idle strategy primitives for low-latency polling loops.
@@ -17,12 +17,13 @@ The first cut focuses on a narrow, testable slice:
 - Ordered delivery per stream/session/source.
 - Subscriber-side duplicate suppression.
 - Typed publication/subscription configuration with validation and defaulting.
-- Metrics, qlog, and dependency-free structured logging hooks.
+- Bunshin channel URI parser/builder for `bunshin:quic`, `bunshin:udp`, and `bunshin:ipc`.
+- Metrics, qlog, transport feedback, and dependency-free structured logging hooks.
 - Embeddable media driver with lifecycle counters plus memory-mapped local IPC `Offer`/`Poll` primitives.
 
 Protocol details are documented in [docs/protocol.md](docs/protocol.md).
 
-Transport direction is documented in [docs/transport-decision.md](docs/transport-decision.md). The current default transport is `quic-go`; the built-in self-signed TLS configuration is intended for development and tests.
+Transport direction is documented in [docs/transport-decision.md](docs/transport-decision.md). The current default transport is `quic-go`; `TransportUDP` is available explicitly for Bunshin-native UDP experiments. The built-in self-signed TLS configuration is intended for development and tests on the QUIC path.
 
 Benchmark commands are documented in [docs/benchmarks.md](docs/benchmarks.md).
 
@@ -57,4 +58,4 @@ _ = pub.Send(context.Background(), []byte("hello"))
 
 ## Scope
 
-A full Aeron-compatible Go implementation would still need NAK repair, an external media-driver process, archive replication, cluster, tooling, and protocol compatibility work. This repository currently establishes the Go API, a QUIC-backed reliable transport baseline, and local IPC primitives to extend from.
+A full Aeron-inspired Go implementation still needs multicast, deeper driver agent loops, tooling, and protocol evolution work. This repository currently establishes the Go API, QUIC default transport, explicit UDP transport, media-driver boundary, archive, cluster, and local IPC primitives to extend from.

@@ -4,7 +4,7 @@ The reliable UDP layer should be delegated to an existing Go transport library. 
 
 ## Decision
 
-Use `github.com/quic-go/quic-go` as Bunshin's default reliable transport backend.
+Use `github.com/quic-go/quic-go` as Bunshin's default reliable transport backend. Keep a Bunshin-native UDP backend available as an explicit transport option for lower-level transport work and future Aeron-style repair experiments.
 
 Keep the transport boundary narrow enough that lower-level Aeron-backed options can still be evaluated later for specialized low-latency deployments.
 
@@ -27,6 +27,8 @@ For an Aeron-like goal, the evaluation must also consider:
 - The hand-written UDP ACK/retransmit implementation has been replaced by QUIC streams.
 - Reliability, retransmission, flow control, congestion control, and TLS are owned by `quic-go`.
 - Bunshin's ACK frame now confirms application-level handling over a reliable QUIC stream rather than packet-level delivery.
+- `TransportUDP` sends Bunshin DATA frames directly as UDP datagrams and waits for receiver STATUS plus application-level ACK or ERROR frames. It shares the publication/subscription API, term metadata, flow-control strategy hook, fragmentation, reassembly, ordered delivery, loss observation, NAK repair, RTT metrics, transport feedback hooks, and metrics path.
+- UDP does not yet provide full congestion control, multicast destinations, or transport-level security.
 - Bunshin does not perform a mandatory payload CRC32 on top of QUIC. Like Aeron, it exposes an application-defined reserved value that can carry a checksum or timestamp when needed.
 - Bunshin frame fields use little-endian byte order to align with Aeron's data-header convention.
 - Publications apply a bounded send window before appending to the term log. If the window is exhausted, `Send` waits for ACK capacity until its context is done and records a back-pressure event.
@@ -35,13 +37,14 @@ For an Aeron-like goal, the evaluation must also consider:
 - Subscriptions report sequence gaps per stream/session/source for diagnostics. QUIC still owns transport-level retransmission.
 - Subscriptions buffer out-of-order messages and invoke handlers in sequence order per stream/session/source. Application-level ACKs are withheld until delivery.
 - Publications can split a large application payload into MTU-sized DATA frames on one QUIC stream. Subscriptions reassemble those fragments before invoking the application handler.
+- `ParseChannelURI` and `ChannelURI.String` provide a stable `bunshin:quic`, `bunshin:udp`, and `bunshin:ipc` channel representation for future multicast, IPC, and dynamic-destination APIs.
 - Packet-loss recovery is benchmarked by injecting drops below `quic-go`, because QUIC owns retransmission for the default backend.
 - Benchmarks should still compare QUIC with any future Aeron-backed option under the same message workload.
 - The built-in self-signed TLS configuration is for development and tests. Production users should provide explicit TLS configuration.
-- The embeddable media driver owns client/resource lifecycle through in-process command/control channels while QUIC remains the default transport implementation.
+- The embeddable and external media driver paths own client/resource lifecycle through command/control channels while QUIC remains the default transport implementation.
 
 ## Next Implementation Steps
 
-1. Benchmark future Aeron-backed options against the QUIC default before adding another backend.
-2. Add shared-memory or memory-mapped IPC for local media-driver transports.
-3. Add non-blocking offer/poll APIs that use the idle strategy primitives.
+1. Add multicast and dynamic destinations for UDP.
+2. Add richer congestion-control strategies on top of the UDP transport feedback hook.
+3. Benchmark QUIC, UDP, IPC, and future Aeron-backed options under the same message workloads.

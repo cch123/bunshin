@@ -19,10 +19,12 @@ var frameByteOrder = binary.LittleEndian
 type frameType uint8
 
 const (
-	frameData  frameType = 1
-	frameAck   frameType = 2
-	frameHello frameType = 3
-	frameError frameType = 4
+	frameData   frameType = 1
+	frameAck    frameType = 2
+	frameHello  frameType = 3
+	frameError  frameType = 4
+	frameStatus frameType = 5
+	frameNak    frameType = 6
 )
 
 type frameFlag uint16
@@ -61,6 +63,15 @@ type helloPayload struct {
 type errorPayload struct {
 	code    protocolErrorCode
 	message string
+}
+
+type statusPayload struct {
+	windowLength int
+}
+
+type nakPayload struct {
+	fromSequence uint64
+	toSequence   uint64
 }
 
 func encodeFrame(f frame) ([]byte, error) {
@@ -119,6 +130,44 @@ func decodeErrorPayload(payload []byte) (errorPayload, error) {
 		code:    protocolErrorCode(frameByteOrder.Uint16(payload[0:2])),
 		message: string(payload[2:]),
 	}, nil
+}
+
+func encodeStatusPayload(s statusPayload) []byte {
+	buf := make([]byte, 4)
+	frameByteOrder.PutUint32(buf[0:4], uint32(s.windowLength))
+	return buf
+}
+
+func decodeStatusPayload(payload []byte) (statusPayload, error) {
+	if len(payload) != 4 {
+		return statusPayload{}, fmt.Errorf("invalid status payload length: %d", len(payload))
+	}
+	windowLength := int(frameByteOrder.Uint32(payload[0:4]))
+	if windowLength <= 0 {
+		return statusPayload{}, fmt.Errorf("invalid status window length: %d", windowLength)
+	}
+	return statusPayload{windowLength: windowLength}, nil
+}
+
+func encodeNakPayload(n nakPayload) []byte {
+	buf := make([]byte, 16)
+	frameByteOrder.PutUint64(buf[0:8], n.fromSequence)
+	frameByteOrder.PutUint64(buf[8:16], n.toSequence)
+	return buf
+}
+
+func decodeNakPayload(payload []byte) (nakPayload, error) {
+	if len(payload) != 16 {
+		return nakPayload{}, fmt.Errorf("invalid nak payload length: %d", len(payload))
+	}
+	nak := nakPayload{
+		fromSequence: frameByteOrder.Uint64(payload[0:8]),
+		toSequence:   frameByteOrder.Uint64(payload[8:16]),
+	}
+	if nak.fromSequence == 0 || nak.toSequence < nak.fromSequence {
+		return nakPayload{}, fmt.Errorf("invalid nak sequence range: %d-%d", nak.fromSequence, nak.toSequence)
+	}
+	return nak, nil
 }
 
 func frameHeaderVersion(buf []byte) (uint8, bool) {
