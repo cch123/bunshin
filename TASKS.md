@@ -97,11 +97,11 @@ This checklist tracks the work needed to evolve Bunshin from the current QUIC-ba
 - [x] Add recording progress events and recording signal callbacks.
 - [x] Add recording extension support for appending to existing recordings.
 - [x] Add segmented recording files with configurable segment length.
-- [ ] Add replay merge from recorded history into a live stream.
-- [ ] Add archive replication between nodes.
-- [ ] Add archive segment attach, detach, delete, and migrate operations.
-- [ ] Add archive describe, verify, and migrate tooling.
-- [ ] Add archive authentication and authorization hooks.
+- [x] Add replay merge from recorded history into a live stream.
+- [x] Add archive replication between nodes.
+- [x] Add archive segment attach, detach, delete, and migrate operations.
+- [x] Add archive describe, verify, and migrate tooling.
+- [x] Add archive authentication and authorization hooks.
 
 ## Cluster
 

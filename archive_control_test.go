@@ -83,6 +83,96 @@ func TestArchiveControlServerRequests(t *testing.T) {
 	}
 }
 
+func TestArchiveControlServerSegmentRequests(t *testing.T) {
+	archive, err := OpenArchive(ArchiveConfig{
+		Path:          filepath.Join(t.TempDir(), "archive"),
+		SegmentLength: 192,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+
+	first, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 1, Payload: []byte("0123456789012345678901234567890123456789")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 2, Payload: []byte("abcdefghijklmnopqrstuvwxyzabcdefghijklmn")}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := StartArchiveControlServer(archive, ArchiveControlConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client := server.Client()
+	ctx := context.Background()
+
+	segments, err := client.ListRecordingSegments(ctx, first.RecordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 2 || segments[0].State != ArchiveSegmentAttached {
+		t.Fatalf("unexpected control segments: %#v", segments)
+	}
+	detached, err := client.DetachRecordingSegment(ctx, first.RecordingID, first.SegmentBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detached.State != ArchiveSegmentDetached {
+		t.Fatalf("unexpected detached control segment: %#v", detached)
+	}
+	attached, err := client.AttachRecordingSegment(ctx, first.RecordingID, first.SegmentBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attached.State != ArchiveSegmentAttached {
+		t.Fatalf("unexpected attached control segment: %#v", attached)
+	}
+}
+
+func TestArchiveControlServerAuthorizer(t *testing.T) {
+	archive := openTestArchive(t)
+	defer archive.Close()
+	if _, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 1, Payload: []byte("one")}); err != nil {
+		t.Fatal(err)
+	}
+
+	errUnauthorized := errors.New("unauthorized archive operation")
+	var actions []ArchiveControlAction
+	server, err := StartArchiveControlServer(archive, ArchiveControlConfig{
+		Authorizer: func(_ context.Context, action ArchiveControlAction) error {
+			actions = append(actions, action)
+			if action == ArchiveControlActionPurge {
+				return errUnauthorized
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client := server.Client()
+
+	if _, err := client.ListRecordings(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Purge(context.Background()); !errors.Is(err, errUnauthorized) {
+		t.Fatalf("Purge() err = %v, want %v", err, errUnauthorized)
+	}
+	recordings, err := archive.ListRecordings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recordings) != 1 {
+		t.Fatalf("recordings were purged despite authorization failure: %#v", recordings)
+	}
+	if len(actions) != 2 || actions[0] != ArchiveControlActionListRecordings || actions[1] != ArchiveControlActionPurge {
+		t.Fatalf("unexpected authorized actions: %#v", actions)
+	}
+}
+
 func TestArchiveControlServerRejectsAfterClose(t *testing.T) {
 	archive := openTestArchive(t)
 	defer archive.Close()

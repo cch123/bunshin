@@ -1,6 +1,6 @@
 # Archive
 
-Bunshin includes a local append-only archive for recording and replaying delivered subscription messages. It is process-local and file-backed; replication, replay merge, and media-driver ownership are still future work.
+Bunshin includes a local append-only archive for recording and replaying delivered subscription messages. It is process-local and file-backed; external archive protocols and media-driver ownership are still future work.
 
 The storage layout follows Aeron's Archive shape at a high level: an archive directory contains a recording catalog and one or more segment files per recording. The wire format remains Bunshin-native.
 
@@ -40,7 +40,7 @@ fmt.Println(record.RecordingID, record.Position, record.NextPosition)
 
 `Archive.RecordingHandler` wraps an existing handler when explicit composition is more convenient than `SubscriptionConfig.Archive`.
 
-`Archive.ListRecordings` returns catalog descriptors. Each descriptor tracks `RecordingID`, start/stop positions, segment length, stream/session metadata when stable for the recording, and timestamps.
+`Archive.ListRecordings` returns catalog descriptors. Each descriptor tracks `RecordingID`, start/stop positions, segment length, stream/session metadata when stable for the recording, creation/update timestamps, and `StoppedAt` when the recording has been explicitly stopped.
 
 ## Recording Events
 
@@ -81,6 +81,19 @@ err = client.Purge(ctx)
 
 The control client supports start, stop, list, query, replay, truncate, purge, and integrity scan requests. The current server is an in-process goroutine with a command queue; an external command protocol can be layered on top later.
 
+`ArchiveControlConfig.Authorizer` can reject control operations before they touch the archive. The hook receives the request context and action, so an external server can attach authenticated identity to `context.Context` and centralize authorization.
+
+```go
+control, err := bunshin.StartArchiveControlServer(archive, bunshin.ArchiveControlConfig{
+    Authorizer: func(ctx context.Context, action bunshin.ArchiveControlAction) error {
+        if action == bunshin.ArchiveControlActionPurge && !isAdmin(ctx) {
+            return errors.New("unauthorized")
+        }
+        return nil
+    },
+})
+```
+
 ## Replay
 
 Replay starts from a recording position. A zero `RecordingID` replays all recordings in catalog order. A zero `StreamID` or `SessionID` in the replay config means "all".
@@ -98,6 +111,45 @@ err := archive.Replay(ctx, bunshin.ArchiveReplayConfig{
 
 Replay uses a snapshot of the catalog descriptors taken when replay begins, so concurrent appends after that point are not included until the next replay.
 
+## Replay Merge
+
+`Archive.NewReplayMerge` helps an application catch up from recorded history and then transition to live delivery. Start the live subscription with `merge.LiveHandler()` first so live messages are buffered while archive replay catches up, then call `merge.Replay(ctx)`.
+
+```go
+merge, err := archive.NewReplayMerge(bunshin.ArchiveReplayMergeConfig{
+    Replay: bunshin.ArchiveReplayConfig{
+        RecordingID:  descriptor.RecordingID,
+        FromPosition: descriptor.StartPosition,
+    },
+    LiveBufferLimit: 4096,
+}, handler)
+
+go func() {
+    _ = sub.Serve(ctx, merge.LiveHandler())
+}()
+
+result, err := merge.Replay(ctx)
+fmt.Println(result.Replayed, result.Live, result.DroppedLive)
+```
+
+Replay merge is based on Bunshin message metadata, not Aeron protocol state. Live messages that arrive before replay completes are buffered in memory. After replay, buffered and future live messages with a non-zero sequence less than or equal to the last delivered sequence for the same stream/session are dropped as duplicates.
+
+## Replication
+
+`ReplicateArchive` copies a stopped recording from one archive to another. The destination imports it as a new recording ID and rewrites segment filenames to that ID. This is a Bunshin-native snapshot replication primitive; it does not implement Aeron's wire protocol or live catch-up replication.
+
+```go
+src, err := bunshin.OpenArchive(bunshin.ArchiveConfig{Path: "/var/lib/bunshin/archive-a"})
+dst, err := bunshin.OpenArchive(bunshin.ArchiveConfig{Path: "/var/lib/bunshin/archive-b"})
+
+report, err := bunshin.ReplicateArchive(ctx, src, dst, bunshin.ArchiveReplicationConfig{
+    RecordingID: descriptor.RecordingID,
+})
+fmt.Println(report.SourceRecordingID, report.DestinationRecordingID, report.Segments)
+```
+
+Only stopped recordings with attached segments can be replicated. Active recordings should be stopped first, or streamed through an application-level live path and replay merge.
+
 ## Maintenance
 
 `IntegrityScan` reads every record and validates the per-record checksum:
@@ -109,12 +161,46 @@ fmt.Println(report.Records, report.Bytes, report.CorruptPosition, err)
 
 `Truncate(position)` trims the latest recording at a valid record boundary. `TruncateRecording(recordingID, position)` targets a specific recording. `Purge()` deletes segment files and resets the catalog.
 
+## Segment Management
+
+`ListRecordingSegments(recordingID)` reports each segment base and whether the file is `attached`, `detached`, or `missing`. Segment attach/detach follows the Aeron Archive lifecycle shape, but uses Bunshin-native filenames.
+
+```go
+segments, err := archive.ListRecordingSegments(recordingID)
+detached, err := archive.DetachRecordingSegment(recordingID, segments[0].SegmentBase)
+attached, err := archive.AttachRecordingSegment(recordingID, detached.SegmentBase)
+err = archive.DeleteDetachedRecordingSegment(recordingID, detached.SegmentBase)
+migrated, err := archive.MigrateDetachedRecordingSegment(recordingID, detached.SegmentBase, "/var/lib/bunshin/archive-cold")
+```
+
+Only complete historical segments can be detached. The active or final partial segment stays attached because replay and append still depend on it. A detached segment is renamed from `<recordingId>-<segmentBasePosition>.rec` to `<recordingId>-<segmentBasePosition>.detached`; replay that needs a detached or migrated segment fails until the segment is attached again.
+
+## Tools
+
+The archive package exposes tool-oriented helpers that are also available through the `bunshin-archive` command.
+
+```go
+description, err := bunshin.DescribeArchive("/var/lib/bunshin/archive")
+verification, err := bunshin.VerifyArchive("/var/lib/bunshin/archive")
+migration, err := bunshin.MigrateArchive("/var/lib/bunshin/archive", "/var/lib/bunshin/archive-copy")
+```
+
+```sh
+bunshin-archive describe /var/lib/bunshin/archive
+bunshin-archive verify /var/lib/bunshin/archive
+bunshin-archive migrate /var/lib/bunshin/archive /var/lib/bunshin/archive-copy
+bunshin-archive replicate /var/lib/bunshin/archive-a /var/lib/bunshin/archive-b 1
+```
+
+`DescribeArchive` reports catalog descriptors and segment states. `VerifyArchive` runs an integrity scan and flags detached or missing segments. `MigrateArchive` copies a healthy archive to an empty destination directory, then verifies the destination before returning.
+
 ## Storage Layout
 
 The archive directory contains:
 
 - `catalog.json`: recording descriptors and the next recording ID.
 - `<recordingId>-<segmentBasePosition>.rec`: segment files for recording data, matching Aeron's segment naming pattern.
+- `<recordingId>-<segmentBasePosition>.detached`: detached segment files kept in the archive directory until attached, deleted, or migrated.
 
 Each segment stores a sequence of Bunshin archive records. Each record is a 64-byte little-endian header followed by the payload bytes. When a record cannot fit in the remaining bytes of a segment, Bunshin writes a padding record when there is room for a header, then continues at the next segment base position.
 

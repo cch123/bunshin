@@ -21,6 +21,7 @@ const (
 	archiveMaxPayload                 = uint64(^uint32(0))
 	archiveRecordFlagPadding    uint8 = 1
 	archiveCatalogFile                = "catalog.json"
+	archiveDetachedSegmentExt         = ".detached"
 	defaultArchiveSegmentLength       = 64 * 1024 * 1024
 	minArchiveSegmentLength           = archiveHeaderLen
 )
@@ -83,14 +84,15 @@ type ArchiveRecordingEvent struct {
 }
 
 type ArchiveRecordingDescriptor struct {
-	RecordingID   int64     `json:"recording_id"`
-	StartPosition int64     `json:"start_position"`
-	StopPosition  int64     `json:"stop_position"`
-	SegmentLength int64     `json:"segment_length"`
-	StreamID      uint32    `json:"stream_id"`
-	SessionID     uint32    `json:"session_id"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	RecordingID   int64      `json:"recording_id"`
+	StartPosition int64      `json:"start_position"`
+	StopPosition  int64      `json:"stop_position"`
+	SegmentLength int64      `json:"segment_length"`
+	StreamID      uint32     `json:"stream_id"`
+	SessionID     uint32     `json:"session_id"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	StoppedAt     *time.Time `json:"stopped_at,omitempty"`
 }
 
 type ArchiveRecord struct {
@@ -117,6 +119,23 @@ type ArchiveIntegrityReport struct {
 	Bytes           int64
 	LastPosition    int64
 	CorruptPosition int64
+}
+
+type ArchiveSegmentState string
+
+const (
+	ArchiveSegmentAttached ArchiveSegmentState = "attached"
+	ArchiveSegmentDetached ArchiveSegmentState = "detached"
+	ArchiveSegmentMissing  ArchiveSegmentState = "missing"
+)
+
+type ArchiveSegmentDescriptor struct {
+	RecordingID   int64               `json:"recording_id"`
+	SegmentBase   int64               `json:"segment_base"`
+	SegmentLength int64               `json:"segment_length"`
+	Path          string              `json:"path"`
+	Size          int64               `json:"size"`
+	State         ArchiveSegmentState `json:"state"`
 }
 
 type archiveCatalog struct {
@@ -166,10 +185,8 @@ func OpenArchive(cfg ArchiveConfig) (*Archive, error) {
 	if err := a.loadCatalog(); err != nil {
 		return nil, err
 	}
-	a.extensionSignalPending = len(a.catalog.Recordings) > 0
-	if len(a.catalog.Recordings) > 0 {
-		a.activeRecordingID = a.catalog.Recordings[len(a.catalog.Recordings)-1].RecordingID
-	}
+	a.activeRecordingID = a.activeRecordingIDFromCatalog()
+	a.extensionSignalPending = a.activeRecordingID != 0
 	if len(a.catalog.Recordings) == 0 {
 		if err := a.saveCatalogLocked(); err != nil {
 			return nil, err
@@ -240,6 +257,7 @@ func (a *Archive) StopRecording(recordingID int64) (ArchiveRecordingDescriptor, 
 	}
 	desc := &a.catalog.Recordings[index]
 	desc.UpdatedAt = now
+	desc.StoppedAt = &now
 	a.activeRecordingID = 0
 	a.extensionSignalPending = false
 	if err := a.saveCatalogLocked(); err != nil {
@@ -464,15 +482,17 @@ func (a *Archive) Purge() error {
 		return ErrArchiveClosed
 	}
 	purged := append([]ArchiveRecordingDescriptor(nil), a.catalog.Recordings...)
-	matches, err := filepath.Glob(filepath.Join(a.dir, "*.rec"))
-	if err != nil {
-		a.mu.Unlock()
-		return err
-	}
-	for _, path := range matches {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	for _, pattern := range []string{"*.rec", "*" + archiveDetachedSegmentExt} {
+		matches, err := filepath.Glob(filepath.Join(a.dir, pattern))
+		if err != nil {
 			a.mu.Unlock()
 			return err
+		}
+		for _, path := range matches {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				a.mu.Unlock()
+				return err
+			}
 		}
 	}
 	a.catalog = archiveCatalog{
@@ -522,6 +542,156 @@ func (a *Archive) RecordingDescriptor(recordingID int64) (ArchiveRecordingDescri
 	return recordings[0], nil
 }
 
+func (a *Archive) ListRecordingSegments(recordingID int64) ([]ArchiveSegmentDescriptor, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return nil, ErrArchiveClosed
+	}
+	index, err := a.recordingIndexLocked(recordingID)
+	if err != nil {
+		return nil, err
+	}
+	desc := a.catalog.Recordings[index]
+	var segments []ArchiveSegmentDescriptor
+	for base := desc.StartPosition; base < desc.StopPosition; base += desc.SegmentLength {
+		segments = append(segments, a.segmentDescriptorLocked(desc, base))
+	}
+	return segments, nil
+}
+
+func (a *Archive) DetachRecordingSegment(recordingID, segmentBase int64) (ArchiveSegmentDescriptor, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return ArchiveSegmentDescriptor{}, ErrArchiveClosed
+	}
+	index, err := a.recordingIndexLocked(recordingID)
+	if err != nil {
+		return ArchiveSegmentDescriptor{}, err
+	}
+	desc := a.catalog.Recordings[index]
+	if err := validateArchiveSegmentBase(desc, segmentBase); err != nil {
+		return ArchiveSegmentDescriptor{}, err
+	}
+	attached := a.segmentPath(desc.RecordingID, segmentBase)
+	detached := a.detachedSegmentPath(desc.RecordingID, segmentBase)
+	if _, err := os.Stat(detached); err == nil {
+		return a.segmentDescriptorLocked(desc, segmentBase), nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("stat detached archive segment: %w", err)
+	}
+	if err := os.Rename(attached, detached); err != nil {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("detach archive segment: %w", err)
+	}
+	return a.segmentDescriptorLocked(desc, segmentBase), nil
+}
+
+func (a *Archive) AttachRecordingSegment(recordingID, segmentBase int64) (ArchiveSegmentDescriptor, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return ArchiveSegmentDescriptor{}, ErrArchiveClosed
+	}
+	index, err := a.recordingIndexLocked(recordingID)
+	if err != nil {
+		return ArchiveSegmentDescriptor{}, err
+	}
+	desc := a.catalog.Recordings[index]
+	if err := validateArchiveSegmentBase(desc, segmentBase); err != nil {
+		return ArchiveSegmentDescriptor{}, err
+	}
+	attached := a.segmentPath(desc.RecordingID, segmentBase)
+	detached := a.detachedSegmentPath(desc.RecordingID, segmentBase)
+	if _, err := os.Stat(attached); err == nil {
+		return a.segmentDescriptorLocked(desc, segmentBase), nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("stat attached archive segment: %w", err)
+	}
+	if err := os.Rename(detached, attached); err != nil {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("attach archive segment: %w", err)
+	}
+	return a.segmentDescriptorLocked(desc, segmentBase), nil
+}
+
+func (a *Archive) DeleteDetachedRecordingSegment(recordingID, segmentBase int64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return ErrArchiveClosed
+	}
+	index, err := a.recordingIndexLocked(recordingID)
+	if err != nil {
+		return err
+	}
+	desc := a.catalog.Recordings[index]
+	if err := validateArchiveSegmentBase(desc, segmentBase); err != nil {
+		return err
+	}
+	if _, err := os.Stat(a.segmentPath(desc.RecordingID, segmentBase)); err == nil {
+		return fmt.Errorf("%w: attached segment %d", ErrArchivePosition, segmentBase)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat attached archive segment: %w", err)
+	}
+	if err := os.Remove(a.detachedSegmentPath(desc.RecordingID, segmentBase)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete detached archive segment: %w", err)
+	}
+	return nil
+}
+
+func (a *Archive) MigrateDetachedRecordingSegment(recordingID, segmentBase int64, dstDir string) (ArchiveSegmentDescriptor, error) {
+	if dstDir == "" {
+		return ArchiveSegmentDescriptor{}, invalidConfigf("archive segment migration destination is required")
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return ArchiveSegmentDescriptor{}, ErrArchiveClosed
+	}
+	index, err := a.recordingIndexLocked(recordingID)
+	if err != nil {
+		return ArchiveSegmentDescriptor{}, err
+	}
+	desc := a.catalog.Recordings[index]
+	if err := validateArchiveSegmentBase(desc, segmentBase); err != nil {
+		return ArchiveSegmentDescriptor{}, err
+	}
+	src := a.detachedSegmentPath(desc.RecordingID, segmentBase)
+	if _, err := os.Stat(src); err != nil {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("stat detached archive segment: %w", err)
+	}
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("create archive segment migration directory: %w", err)
+	}
+	dst := filepath.Join(dstDir, filepath.Base(src))
+	if _, err := os.Stat(dst); err == nil {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("%w: destination segment exists: %s", ErrArchivePosition, dst)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("stat archive segment migration destination: %w", err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("migrate detached archive segment: %w", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		return ArchiveSegmentDescriptor{}, fmt.Errorf("stat migrated archive segment: %w", err)
+	}
+	return ArchiveSegmentDescriptor{
+		RecordingID:   desc.RecordingID,
+		SegmentBase:   segmentBase,
+		SegmentLength: desc.SegmentLength,
+		Path:          dst,
+		Size:          info.Size(),
+		State:         ArchiveSegmentDetached,
+	}, nil
+}
+
 func (a *Archive) loadCatalog() error {
 	data, err := os.ReadFile(a.catalogPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -551,10 +721,18 @@ func (a *Archive) loadCatalog() error {
 			a.catalog.NextRecordingID = desc.RecordingID + 1
 		}
 	}
-	sort.Slice(a.catalog.Recordings, func(i, j int) bool {
-		return a.catalog.Recordings[i].RecordingID < a.catalog.Recordings[j].RecordingID
-	})
+	sortArchiveRecordings(a.catalog.Recordings)
 	return nil
+}
+
+func (a *Archive) activeRecordingIDFromCatalog() int64 {
+	for i := len(a.catalog.Recordings) - 1; i >= 0; i-- {
+		desc := a.catalog.Recordings[i]
+		if desc.StoppedAt == nil {
+			return desc.RecordingID
+		}
+	}
+	return 0
 }
 
 func (a *Archive) saveCatalogLocked() error {
@@ -674,9 +852,7 @@ func (a *Archive) recordingSnapshot(recordingID int64) ([]ArchiveRecordingDescri
 	}
 	if recordingID == 0 {
 		recordings := append([]ArchiveRecordingDescriptor(nil), a.catalog.Recordings...)
-		sort.Slice(recordings, func(i, j int) bool {
-			return recordings[i].RecordingID < recordings[j].RecordingID
-		})
+		sortArchiveRecordings(recordings)
 		return recordings, nil
 	}
 	for _, desc := range a.catalog.Recordings {
@@ -685,6 +861,12 @@ func (a *Archive) recordingSnapshot(recordingID int64) ([]ArchiveRecordingDescri
 		}
 	}
 	return nil, fmt.Errorf("%w: recording %d", ErrArchivePosition, recordingID)
+}
+
+func sortArchiveRecordings(recordings []ArchiveRecordingDescriptor) {
+	sort.Slice(recordings, func(i, j int) bool {
+		return recordings[i].RecordingID < recordings[j].RecordingID
+	})
 }
 
 func (a *Archive) recordingIndexLocked(recordingID int64) (int, error) {
@@ -728,19 +910,23 @@ func (a *Archive) truncateSegmentsLocked(desc *ArchiveRecordingDescriptor, posit
 		keepBase = -1
 	}
 	for base := desc.StartPosition; base < desc.StopPosition; base += desc.SegmentLength {
-		path := a.segmentPath(desc.RecordingID, base)
 		if keepBase >= 0 && base < keepBase {
 			continue
 		}
 		if base == keepBase {
 			offset := position - base
-			if err := os.Truncate(path, offset); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := os.Truncate(a.segmentPath(desc.RecordingID, base), offset); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("truncate archive segment: %w", err)
 			}
 			continue
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove archive segment: %w", err)
+		for _, path := range []string{
+			a.segmentPath(desc.RecordingID, base),
+			a.detachedSegmentPath(desc.RecordingID, base),
+		} {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove archive segment: %w", err)
+			}
 		}
 	}
 	return nil
@@ -789,6 +975,41 @@ func (a *Archive) segmentPath(recordingID, segmentBase int64) string {
 	return filepath.Join(a.dir, fmt.Sprintf("%d-%d.rec", recordingID, segmentBase))
 }
 
+func (a *Archive) detachedSegmentPath(recordingID, segmentBase int64) string {
+	return filepath.Join(a.dir, fmt.Sprintf("%d-%d%s", recordingID, segmentBase, archiveDetachedSegmentExt))
+}
+
+func (a *Archive) segmentDescriptorLocked(desc ArchiveRecordingDescriptor, segmentBase int64) ArchiveSegmentDescriptor {
+	attached := a.segmentPath(desc.RecordingID, segmentBase)
+	if info, err := os.Stat(attached); err == nil {
+		return ArchiveSegmentDescriptor{
+			RecordingID:   desc.RecordingID,
+			SegmentBase:   segmentBase,
+			SegmentLength: desc.SegmentLength,
+			Path:          attached,
+			Size:          info.Size(),
+			State:         ArchiveSegmentAttached,
+		}
+	}
+	detached := a.detachedSegmentPath(desc.RecordingID, segmentBase)
+	if info, err := os.Stat(detached); err == nil {
+		return ArchiveSegmentDescriptor{
+			RecordingID:   desc.RecordingID,
+			SegmentBase:   segmentBase,
+			SegmentLength: desc.SegmentLength,
+			Path:          detached,
+			Size:          info.Size(),
+			State:         ArchiveSegmentDetached,
+		}
+	}
+	return ArchiveSegmentDescriptor{
+		RecordingID:   desc.RecordingID,
+		SegmentBase:   segmentBase,
+		SegmentLength: desc.SegmentLength,
+		State:         ArchiveSegmentMissing,
+	}
+}
+
 func (a *Archive) emitRecordingEvents(events []ArchiveRecordingEvent) {
 	for _, event := range events {
 		if event.Signal == ArchiveRecordingSignalProgress {
@@ -831,6 +1052,19 @@ func archiveRecordingSignalEvent(signal ArchiveRecordingSignal, descriptor Archi
 		Descriptor:   descriptor,
 		RecordedAt:   recordedAt,
 	}
+}
+
+func validateArchiveSegmentBase(desc ArchiveRecordingDescriptor, segmentBase int64) error {
+	if segmentBase < desc.StartPosition || segmentBase >= desc.StopPosition {
+		return fmt.Errorf("%w: segment %d", ErrArchivePosition, segmentBase)
+	}
+	if archiveSegmentBase(segmentBase, desc.SegmentLength) != segmentBase {
+		return fmt.Errorf("%w: segment %d", ErrArchivePosition, segmentBase)
+	}
+	if segmentBase+desc.SegmentLength > desc.StopPosition {
+		return fmt.Errorf("%w: segment %d is active or incomplete", ErrArchivePosition, segmentBase)
+	}
+	return nil
 }
 
 func encodeArchiveRecord(msg Message, recordedAt time.Time) []byte {

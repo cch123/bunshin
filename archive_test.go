@@ -324,6 +324,141 @@ func TestArchiveRecordsAcrossSegmentFiles(t *testing.T) {
 	}
 }
 
+func TestArchiveDetachAndAttachRecordingSegment(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "archive")
+	archive, err := OpenArchive(ArchiveConfig{
+		Path:          dir,
+		SegmentLength: 192,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+
+	first, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 1, Payload: []byte("0123456789012345678901234567890123456789")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 2, Payload: []byte("abcdefghijklmnopqrstuvwxyzabcdefghijklmn")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	segments, err := archive.ListRecordingSegments(first.RecordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 2 || segments[0].State != ArchiveSegmentAttached || segments[1].State != ArchiveSegmentAttached {
+		t.Fatalf("unexpected attached segments: %#v", segments)
+	}
+	detached, err := archive.DetachRecordingSegment(first.RecordingID, first.SegmentBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detached.State != ArchiveSegmentDetached || detached.SegmentBase != first.SegmentBase {
+		t.Fatalf("unexpected detached segment: %#v", detached)
+	}
+	if _, err := os.Stat(archive.segmentPath(first.RecordingID, first.SegmentBase)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("attached segment stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(archive.detachedSegmentPath(first.RecordingID, first.SegmentBase)); err != nil {
+		t.Fatal(err)
+	}
+
+	err = archive.Replay(context.Background(), ArchiveReplayConfig{RecordingID: first.RecordingID}, func(context.Context, Message) error {
+		return nil
+	})
+	if !errors.Is(err, ErrArchiveCorrupt) {
+		t.Fatalf("Replay() err = %v, want %v", err, ErrArchiveCorrupt)
+	}
+
+	attached, err := archive.AttachRecordingSegment(first.RecordingID, first.SegmentBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attached.State != ArchiveSegmentAttached {
+		t.Fatalf("unexpected attached segment: %#v", attached)
+	}
+	var replayed []Message
+	if err := archive.Replay(context.Background(), ArchiveReplayConfig{RecordingID: first.RecordingID}, func(_ context.Context, msg Message) error {
+		replayed = append(replayed, msg)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 2 || replayed[0].Sequence != first.Message.Sequence || replayed[1].Sequence != second.Message.Sequence {
+		t.Fatalf("unexpected replay after attach: %#v", replayed)
+	}
+	if _, err := archive.DetachRecordingSegment(first.RecordingID, second.SegmentBase); !errors.Is(err, ErrArchivePosition) {
+		t.Fatalf("DetachRecordingSegment() err = %v, want %v", err, ErrArchivePosition)
+	}
+}
+
+func TestArchiveMigrateAndDeleteDetachedRecordingSegments(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "archive")
+	archive, err := OpenArchive(ArchiveConfig{
+		Path:          dir,
+		SegmentLength: 192,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+
+	first, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 1, Payload: []byte("0123456789012345678901234567890123456789")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.Record(Message{StreamID: 1, SessionID: 1, Sequence: 2, Payload: []byte("abcdefghijklmnopqrstuvwxyzabcdefghijklmn")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.DetachRecordingSegment(first.RecordingID, first.SegmentBase); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := archive.MigrateDetachedRecordingSegment(first.RecordingID, first.SegmentBase, filepath.Join(t.TempDir(), "migrated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.State != ArchiveSegmentDetached || migrated.Path == "" {
+		t.Fatalf("unexpected migrated segment: %#v", migrated)
+	}
+	if _, err := os.Stat(migrated.Path); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := archive.ListRecordingSegments(first.RecordingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 2 || segments[0].State != ArchiveSegmentMissing {
+		t.Fatalf("unexpected segments after migration: %#v", segments)
+	}
+
+	archive2, err := OpenArchive(ArchiveConfig{
+		Path:          filepath.Join(t.TempDir(), "archive"),
+		SegmentLength: 192,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive2.Close()
+	first, err = archive2.Record(Message{StreamID: 1, SessionID: 1, Sequence: 1, Payload: []byte("0123456789012345678901234567890123456789")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive2.Record(Message{StreamID: 1, SessionID: 1, Sequence: 2, Payload: []byte("abcdefghijklmnopqrstuvwxyzabcdefghijklmn")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive2.DetachRecordingSegment(first.RecordingID, first.SegmentBase); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive2.DeleteDetachedRecordingSegment(first.RecordingID, first.SegmentBase); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(archive2.detachedSegmentPath(first.RecordingID, first.SegmentBase)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("detached segment stat err = %v, want not exist", err)
+	}
+}
+
 func TestArchiveReopensCatalogAndExtendsRecording(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "archive")
 	archive, err := OpenArchive(ArchiveConfig{Path: dir})
