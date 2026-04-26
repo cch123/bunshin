@@ -54,15 +54,18 @@ type DriverMarkFile struct {
 	CommandBuffer   int                   `json:"command_buffer"`
 	ClientTimeout   string                `json:"client_timeout"`
 	CleanupInterval string                `json:"cleanup_interval"`
+	StallThreshold  string                `json:"stall_threshold"`
 }
 
 type DriverCountersFile struct {
-	UpdatedAt     time.Time       `json:"updated_at"`
-	Counters      DriverCounters  `json:"counters"`
-	Metrics       MetricsSnapshot `json:"metrics"`
-	Clients       int             `json:"clients"`
-	Publications  int             `json:"publications"`
-	Subscriptions int             `json:"subscriptions"`
+	UpdatedAt        time.Time            `json:"updated_at"`
+	Counters         DriverCounters       `json:"counters"`
+	StatusCounters   DriverStatusCounters `json:"status_counters"`
+	Metrics          MetricsSnapshot      `json:"metrics"`
+	CounterSnapshots []CounterSnapshot    `json:"counter_snapshots"`
+	Clients          int                  `json:"clients"`
+	Publications     int                  `json:"publications"`
+	Subscriptions    int                  `json:"subscriptions"`
 }
 
 type DriverLossReportFile struct {
@@ -131,6 +134,9 @@ func openDriverDirectory(cfg DriverConfig) (*driverDirectory, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := recoverStaleDriverDirectory(layout, cfg.DirectoryStaleTimeout); err != nil {
+		return nil, err
+	}
 	for _, dir := range []string{
 		layout.Directory,
 		layout.ReportsDirectory,
@@ -156,14 +162,16 @@ func openDriverDirectory(cfg DriverConfig) (*driverDirectory, error) {
 			CommandBuffer:   cfg.CommandBuffer,
 			ClientTimeout:   cfg.ClientTimeout.String(),
 			CleanupInterval: cfg.CleanupInterval.String(),
+			StallThreshold:  cfg.StallThreshold.String(),
 		},
 	}
 	report := DriverDirectoryReport{
 		Layout: directory.layout,
 		Mark:   directory.mark,
 		Counters: DriverCountersFile{
-			UpdatedAt: now,
-			Metrics:   cfg.Metrics.Snapshot(),
+			UpdatedAt:        now,
+			Metrics:          cfg.Metrics.Snapshot(),
+			CounterSnapshots: buildDriverCounterSnapshots(DriverCounters{}, DriverStatusCounters{}, cfg.Metrics),
 		},
 		Loss: DriverLossReportFile{
 			UpdatedAt: now,
@@ -173,6 +181,37 @@ func openDriverDirectory(cfg DriverConfig) (*driverDirectory, error) {
 		},
 	}
 	return directory, directory.writeReport(report)
+}
+
+func recoverStaleDriverDirectory(layout DriverDirectoryLayout, staleTimeout time.Duration) error {
+	data, err := os.ReadFile(layout.MarkFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("%w: read driver mark file: %w", ErrDriverProcessUnavailable, err)
+	}
+	var mark DriverMarkFile
+	if err := json.Unmarshal(data, &mark); err != nil {
+		return fmt.Errorf("%w: decode driver mark file: %w", ErrDriverProcessUnavailable, err)
+	}
+	if mark.Status != DriverDirectoryStatusActive {
+		return nil
+	}
+	if staleTimeout <= 0 {
+		staleTimeout = defaultDriverProcessStaleTimeout
+	}
+	now := time.Now().UTC()
+	if !mark.UpdatedAt.IsZero() && now.Sub(mark.UpdatedAt) <= staleTimeout {
+		return fmt.Errorf("%w: pid=%d heartbeat_age=%s stale_timeout=%s", ErrDriverDirectoryActive, mark.PID, now.Sub(mark.UpdatedAt), staleTimeout)
+	}
+	mark.Status = DriverDirectoryStatusClosed
+	mark.UpdatedAt = now
+	mark.ClosedAt = &now
+	if err := writeDriverJSONFile(layout.MarkFile, mark); err != nil {
+		return fmt.Errorf("recover stale driver mark file: %w", err)
+	}
+	return nil
 }
 
 func (state *driverState) flushDriverDirectory(now time.Time, status DriverDirectoryStatus) (DriverDirectoryReport, error) {
@@ -191,12 +230,14 @@ func (state *driverState) flushDriverDirectory(now time.Time, status DriverDirec
 		Layout: state.directory.layout,
 		Mark:   state.directory.mark,
 		Counters: DriverCountersFile{
-			UpdatedAt:     now,
-			Counters:      snapshot.Counters,
-			Metrics:       state.metrics.Snapshot(),
-			Clients:       len(snapshot.Clients),
-			Publications:  len(snapshot.Publications),
-			Subscriptions: len(snapshot.Subscriptions),
+			UpdatedAt:        now,
+			Counters:         snapshot.Counters,
+			StatusCounters:   snapshot.StatusCounters,
+			Metrics:          state.metrics.Snapshot(),
+			CounterSnapshots: snapshot.CounterSnapshots,
+			Clients:          len(snapshot.Clients),
+			Publications:     len(snapshot.Publications),
+			Subscriptions:    len(snapshot.Subscriptions),
 		},
 		Loss: DriverLossReportFile{
 			UpdatedAt: now,

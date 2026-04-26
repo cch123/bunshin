@@ -3,6 +3,8 @@ package bunshin
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 )
@@ -78,6 +80,104 @@ func TestPublicationSubscription(t *testing.T) {
 	}
 }
 
+func TestPublicationOfferReturnsPosition(t *testing.T) {
+	testPublicationOfferReturnsPosition(t, TransportQUIC, 100)
+}
+
+func TestUDPPublicationOfferReturnsPosition(t *testing.T) {
+	testPublicationOfferReturnsPosition(t, TransportUDP, 101)
+}
+
+func TestPublicationOfferVectored(t *testing.T) {
+	testPublicationOfferVectored(t, TransportQUIC, 103)
+}
+
+func TestUDPPublicationOfferVectored(t *testing.T) {
+	testPublicationOfferVectored(t, TransportUDP, 104)
+}
+
+func TestPublicationOfferBackPressured(t *testing.T) {
+	sub, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  105,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		_ = sub.Serve(ctx, func(context.Context, Message) error {
+			return nil
+		})
+	}()
+
+	pubMetrics := &Metrics{}
+	pub, err := DialPublication(PublicationConfig{
+		StreamID:               105,
+		RemoteAddr:             sub.LocalAddr().String(),
+		PublicationWindowBytes: headerLen,
+		Metrics:                pubMetrics,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	result := pub.Offer(ctx, []byte("payload"))
+	if result.Status != OfferBackPressured || !errors.Is(result.Err, ErrBackPressure) || result.Position != 0 {
+		t.Fatalf("Offer() = %#v, want back pressured", result)
+	}
+	if snapshot := pubMetrics.Snapshot(); snapshot.BackPressureEvents != 1 || snapshot.SendErrors != 1 {
+		t.Fatalf("unexpected offer backpressure metrics: %#v", snapshot)
+	}
+}
+
+func TestPublicationClaimCommit(t *testing.T) {
+	testPublicationClaimCommit(t, TransportQUIC, 134)
+}
+
+func TestUDPPublicationClaimCommit(t *testing.T) {
+	testPublicationClaimCommit(t, TransportUDP, 135)
+}
+
+func TestPublicationClaimAbort(t *testing.T) {
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   136,
+		RemoteAddr: "127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	claim, err := pub.Claim(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(claim.Buffer(), "discard")
+	if err := claim.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim.Buffer(); got != nil {
+		t.Fatalf("aborted claim buffer = %#v, want nil", got)
+	}
+	result := claim.Commit(context.Background())
+	if result.Status != OfferClosed || !errors.Is(result.Err, ErrPublicationClaimAborted) {
+		t.Fatalf("aborted claim Commit() = %#v, want aborted", result)
+	}
+}
+
+func TestExclusivePublicationSendOfferAndClaim(t *testing.T) {
+	testExclusivePublicationSendOfferAndClaim(t, TransportQUIC, 137)
+}
+
+func TestUDPExclusivePublicationSendOfferAndClaim(t *testing.T) {
+	testExclusivePublicationSendOfferAndClaim(t, TransportUDP, 138)
+}
+
 func TestPublicationSubscriptionFragmentsLargePayload(t *testing.T) {
 	pubMetrics := &Metrics{}
 	subMetrics := &Metrics{}
@@ -137,6 +237,618 @@ func TestPublicationSubscriptionFragmentsLargePayload(t *testing.T) {
 	subSnapshot := subMetrics.Snapshot()
 	if subSnapshot.MessagesReceived != 1 || subSnapshot.BytesReceived != uint64(len(payload)) || subSnapshot.AcksSent != 1 {
 		t.Fatalf("unexpected subscription metrics: %#v", subSnapshot)
+	}
+}
+
+func testPublicationOfferVectored(t *testing.T, transport TransportMode, streamID uint32) {
+	t.Helper()
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport: transport,
+		StreamID:  streamID,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	received := make(chan Message, 1)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  transport,
+		StreamID:   streamID,
+		SessionID:  203,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	result := pub.OfferVectored(ctx, []byte("vec"), []byte("-"), []byte("payload"))
+	if result.Status != OfferAccepted || result.Position <= 0 || result.Err != nil {
+		t.Fatalf("OfferVectored() = %#v, want accepted position", result)
+	}
+	expectMessagePayload(t, ctx, received, "vec-payload")
+}
+
+func testPublicationOfferReturnsPosition(t *testing.T, transport TransportMode, streamID uint32) {
+	t.Helper()
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport: transport,
+		StreamID:  streamID,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	received := make(chan Message, 1)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  transport,
+		StreamID:   streamID,
+		SessionID:  202,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	result := pub.Offer(ctx, []byte("offer-payload"))
+	if result.Status != OfferAccepted || result.Position <= 0 || result.Err != nil {
+		t.Fatalf("Offer() = %#v, want accepted position", result)
+	}
+	expectMessagePayload(t, ctx, received, "offer-payload")
+}
+
+func testPublicationClaimCommit(t *testing.T, transport TransportMode, streamID uint32) {
+	t.Helper()
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport: transport,
+		StreamID:  streamID,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	received := make(chan Message, 1)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  transport,
+		StreamID:   streamID,
+		SessionID:  233,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	claim, err := pub.Claim(len("claimed-payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(claim.Buffer(), "claimed-payload")
+	result := claim.Commit(ctx)
+	if result.Status != OfferAccepted || result.Position <= 0 || result.Err != nil {
+		t.Fatalf("claim Commit() = %#v, want accepted position", result)
+	}
+	expectMessagePayload(t, ctx, received, "claimed-payload")
+	if again := claim.Commit(ctx); again.Status != OfferClosed || !errors.Is(again.Err, ErrPublicationClaimClosed) {
+		t.Fatalf("second claim Commit() = %#v, want closed", again)
+	}
+}
+
+func testExclusivePublicationSendOfferAndClaim(t *testing.T, transport TransportMode, streamID uint32) {
+	t.Helper()
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport: transport,
+		StreamID:  streamID,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	received := make(chan Message, 3)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		})
+	}()
+
+	pub, err := DialExclusivePublication(PublicationConfig{
+		Transport:  transport,
+		StreamID:   streamID,
+		SessionID:  234,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.Send(ctx, []byte("exclusive-send")); err != nil {
+		t.Fatal(err)
+	}
+	result := pub.OfferVectored(ctx, []byte("exclusive"), []byte("-offer"))
+	if result.Status != OfferAccepted || result.Position <= 0 || result.Err != nil {
+		t.Fatalf("OfferVectored() = %#v, want accepted", result)
+	}
+	claim, err := pub.Claim(len("exclusive-claim"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(claim.Buffer(), "exclusive-claim")
+	result = claim.Commit(ctx)
+	if result.Status != OfferAccepted || result.Position <= 0 || result.Err != nil {
+		t.Fatalf("claim Commit() = %#v, want accepted", result)
+	}
+
+	for _, want := range []string{"exclusive-send", "exclusive-offer", "exclusive-claim"} {
+		msg := expectMessagePayload(t, ctx, received, want)
+		if msg.StreamID != streamID || msg.SessionID != 234 {
+			t.Fatalf("unexpected exclusive message: %#v", msg)
+		}
+	}
+	if pub.LocalAddr() == nil {
+		t.Fatal("exclusive local addr is nil")
+	}
+	if ch := pub.ChannelURI(); ch.Transport != transport || ch.Endpoint == "" {
+		t.Fatalf("unexpected exclusive channel uri: %#v", ch)
+	}
+}
+
+func TestSubscriptionPollReceivesPublication(t *testing.T) {
+	sub, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  129,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	received := make(chan Message, 1)
+	polled := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		n, err := sub.Poll(ctx, func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		})
+		polled <- struct {
+			n   int
+			err error
+		}{n: n, err: err}
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		StreamID:   129,
+		SessionID:  228,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.Send(ctx, []byte("poll-payload")); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-polled:
+		if result.err != nil || result.n != 1 {
+			t.Fatalf("Poll() = %d, %v; want 1, nil", result.n, result.err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	msg := expectMessagePayload(t, ctx, received, "poll-payload")
+	if msg.StreamID != 129 || msg.SessionID != 228 || msg.Sequence != 1 {
+		t.Fatalf("unexpected polled message: %#v", msg)
+	}
+}
+
+func TestUDPPollNFragmentLimitDefersIncompleteMessage(t *testing.T) {
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  130,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	pub, err := DialPublication(PublicationConfig{
+		Transport:              TransportUDP,
+		StreamID:               130,
+		SessionID:              229,
+		RemoteAddr:             sub.LocalAddr().String(),
+		MaxPayloadBytes:        16,
+		MTUBytes:               headerLen + 5,
+		PublicationWindowBytes: 256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	payload := []byte("abcdefghijklmnop")
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- pub.Send(ctx, payload)
+	}()
+
+	handlerCalled := false
+	n, err := sub.PollN(ctx, 1, func(context.Context, Message) error {
+		handlerCalled = true
+		return nil
+	})
+	if err != nil || n != 0 {
+		t.Fatalf("first PollN() = %d, %v; want 0, nil", n, err)
+	}
+	if handlerCalled {
+		t.Fatal("handler ran before all UDP fragments were available")
+	}
+	select {
+	case err := <-sendErr:
+		t.Fatalf("Send() completed before fragmented message was delivered: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	received := make(chan Message, 1)
+	n, err = sub.PollN(ctx, 4, func(_ context.Context, msg Message) error {
+		received <- msg
+		return nil
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("second PollN() = %d, %v; want 1, nil", n, err)
+	}
+	msg := expectMessagePayload(t, ctx, received, string(payload))
+	if msg.StreamID != 130 || msg.SessionID != 229 || msg.Sequence != 1 {
+		t.Fatalf("unexpected polled udp message: %#v", msg)
+	}
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestLocalSpyPollReceivesPublication(t *testing.T) {
+	server, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  131,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		_ = server.Serve(ctx, func(context.Context, Message) error {
+			return nil
+		})
+	}()
+
+	spy, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  131,
+		LocalAddr: server.LocalAddr().String(),
+		LocalSpy:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spy.Close()
+
+	pub, err := DialPublication(PublicationConfig{
+		StreamID:   131,
+		SessionID:  230,
+		RemoteAddr: server.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.Send(ctx, []byte("spy-poll")); err != nil {
+		t.Fatal(err)
+	}
+
+	received := make(chan Message, 1)
+	n, err := spy.Poll(ctx, func(_ context.Context, msg Message) error {
+		received <- msg
+		return nil
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("spy Poll() = %d, %v; want 1, nil", n, err)
+	}
+	msg := expectMessagePayload(t, ctx, received, "spy-poll")
+	if msg.StreamID != 131 || msg.SessionID != 230 || msg.Remote.String() != server.LocalAddr().String() {
+		t.Fatalf("unexpected spy poll message: %#v", msg)
+	}
+}
+
+func TestSubscriptionImageLifecycle(t *testing.T) {
+	available := make(chan *Image, 1)
+	unavailable := make(chan *Image, 1)
+	sub, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  132,
+		LocalAddr: "127.0.0.1:0",
+		AvailableImage: func(_ context.Context, image *Image) {
+			available <- image
+		},
+		UnavailableImage: func(_ context.Context, image *Image) {
+			unavailable <- image
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	delivered := make(chan *Image, 1)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			if msg.Image == nil {
+				return errors.New("missing image")
+			}
+			if msg.Position <= msg.Image.JoinPosition {
+				return errors.New("message position did not advance image")
+			}
+			delivered <- msg.Image
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		StreamID:      132,
+		SessionID:     231,
+		InitialTermID: 42,
+		RemoteAddr:    sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.Send(ctx, []byte("image-payload")); err != nil {
+		t.Fatal(err)
+	}
+
+	var image *Image
+	select {
+	case image = <-available:
+		if image.StreamID != 132 || image.SessionID != 231 || image.InitialTermID != 42 ||
+			image.TermBufferLength != minTermLength || image.Source == "" {
+			t.Fatalf("unexpected available image: %#v", image.Snapshot())
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case deliveredImage := <-delivered:
+		if deliveredImage != image {
+			t.Fatal("handler received a different image instance")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if image.CurrentPosition() <= image.JoinPosition || image.LastSequence() != 1 {
+		t.Fatalf("image was not advanced: %#v", image.Snapshot())
+	}
+	snapshots := sub.Images()
+	if len(snapshots) != 1 || snapshots[0].CurrentPosition != image.CurrentPosition() ||
+		snapshots[0].JoinPosition != image.JoinPosition {
+		t.Fatalf("unexpected image snapshots: %#v", snapshots)
+	}
+	if err := sub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case closedImage := <-unavailable:
+		if closedImage != image || closedImage.UnavailableAt().IsZero() {
+			t.Fatalf("unexpected unavailable image: %#v", closedImage.Snapshot())
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestSubscriptionLagReports(t *testing.T) {
+	sub, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  139,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	handlerStarted := make(chan Message, 1)
+	releaseHandler := make(chan struct{})
+	go func() {
+		_ = sub.Serve(ctx, func(ctx context.Context, msg Message) error {
+			handlerStarted <- msg
+			select {
+			case <-releaseHandler:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		StreamID:   139,
+		SessionID:  235,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- pub.Send(ctx, []byte("lagging"))
+	}()
+
+	select {
+	case msg := <-handlerStarted:
+		if msg.Image == nil || msg.Position <= msg.Image.JoinPosition {
+			t.Fatalf("unexpected lag test message: %#v", msg)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	reports := sub.LagReports()
+	if len(reports) != 1 || reports[0].StreamID != 139 || reports[0].SessionID != 235 ||
+		reports[0].ObservedPosition <= reports[0].CurrentPosition ||
+		reports[0].LagBytes != reports[0].ObservedPosition-reports[0].CurrentPosition ||
+		reports[0].LastObservedSequence != 1 || reports[0].LastSequence != 0 {
+		t.Fatalf("unexpected lag report while handler is blocked: %#v", reports)
+	}
+
+	close(releaseHandler)
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	reports = sub.LagReports()
+	if len(reports) != 1 || reports[0].LagBytes != 0 || reports[0].CurrentPosition != reports[0].ObservedPosition ||
+		reports[0].LastSequence != 1 || reports[0].LastObservedSequence != 1 {
+		t.Fatalf("unexpected lag report after handler finished: %#v", reports)
+	}
+}
+
+func TestControlledPollActions(t *testing.T) {
+	server, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  133,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		_ = server.Serve(ctx, func(context.Context, Message) error {
+			return nil
+		})
+	}()
+
+	spy, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  133,
+		LocalAddr: server.LocalAddr().String(),
+		LocalSpy:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spy.Close()
+
+	pub, err := DialPublication(PublicationConfig{
+		StreamID:   133,
+		SessionID:  232,
+		RemoteAddr: server.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	for _, payload := range [][]byte{[]byte("one"), []byte("two"), []byte("three")} {
+		if err := pub.Send(ctx, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var payloads []string
+	n, err := spy.ControlledPollN(ctx, 10, func(_ context.Context, msg Message) ControlledPollAction {
+		payloads = append(payloads, string(msg.Payload))
+		switch len(payloads) {
+		case 1:
+			return ControlledPollContinue
+		case 2:
+			return ControlledPollCommit
+		default:
+			return ControlledPollBreak
+		}
+	})
+	if err != nil || n != 3 {
+		t.Fatalf("ControlledPollN() = %d, %v; want 3, nil", n, err)
+	}
+	if fmt.Sprint(payloads) != "[one two three]" {
+		t.Fatalf("controlled payloads = %#v", payloads)
+	}
+
+	if err := pub.Send(ctx, []byte("four")); err != nil {
+		t.Fatal(err)
+	}
+	n, err = spy.ControlledPoll(ctx, func(context.Context, Message) ControlledPollAction {
+		return ControlledPollAbort
+	})
+	if !errors.Is(err, ErrControlledPollAbort) || n != 0 {
+		t.Fatalf("ControlledPoll() = %d, %v; want abort", n, err)
 	}
 }
 
@@ -212,6 +924,160 @@ func TestUDPPublicationSubscription(t *testing.T) {
 	}
 }
 
+func TestPublicationResponseChannel(t *testing.T) {
+	testPublicationResponseChannel(t, TransportQUIC, 118, 119)
+}
+
+func TestUDPPublicationResponseChannel(t *testing.T) {
+	testPublicationResponseChannel(t, TransportUDP, 120, 121)
+}
+
+func TestLocalSpySubscriptionObservesPublication(t *testing.T) {
+	testLocalSpySubscriptionObservesPublication(t, TransportQUIC, 122)
+}
+
+func TestUDPLocalSpySubscriptionObservesPublication(t *testing.T) {
+	testLocalSpySubscriptionObservesPublication(t, TransportUDP, 123)
+}
+
+func TestUDPPublicationReResolveDestinations(t *testing.T) {
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  124,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	received := make(chan Message, 1)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:                 TransportUDP,
+		StreamID:                  124,
+		SessionID:                 227,
+		RemoteAddr:                sub.LocalAddr().String(),
+		UDPNameResolutionInterval: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	endpoints := pub.DestinationEndpoints()
+	if len(endpoints) != 1 || endpoints[0] != sub.LocalAddr().String() {
+		t.Fatalf("destination endpoints = %#v", endpoints)
+	}
+	if err := pub.ReResolveDestinations(); err != nil {
+		t.Fatal(err)
+	}
+	if got := pub.Destinations(); len(got) != 1 || got[0] != sub.LocalAddr().String() {
+		t.Fatalf("resolved destinations = %#v", got)
+	}
+	if err := pub.Send(ctx, []byte("resolved")); err != nil {
+		t.Fatal(err)
+	}
+	expectMessagePayload(t, ctx, received, "resolved")
+	if ch := pub.ChannelURI(); ch.Transport != TransportUDP || ch.Endpoint != sub.LocalAddr().String() ||
+		ch.NameResolutionInterval != time.Nanosecond {
+		t.Fatalf("unexpected publication channel uri: %#v", ch)
+	}
+}
+
+func TestUDPChannelURIWildcardPort(t *testing.T) {
+	ch, err := ParseChannelURI("bunshin:udp?endpoint=127.0.0.1%3A0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := ListenSubscription(ch.SubscriptionConfig(SubscriptionConfig{StreamID: 125}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	bound := sub.ChannelURI()
+	if bound.Transport != TransportUDP || bound.Endpoint == "" || bound.Endpoint == "127.0.0.1:0" {
+		t.Fatalf("unexpected bound channel uri: %#v", bound)
+	}
+	addr, err := net.ResolveUDPAddr("udp", bound.Endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr.Port == 0 {
+		t.Fatalf("wildcard port was not resolved: %#v", bound)
+	}
+}
+
+func TestUDPMulticastPublicationSubscription(t *testing.T) {
+	ifi := multicastTestInterface(t)
+	group := fmt.Sprintf("239.255.0.1:%d", freeUDPPort(t))
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport:             TransportUDP,
+		StreamID:              126,
+		LocalAddr:             group,
+		UDPMulticastInterface: ifi.Name,
+	})
+	if err != nil {
+		t.Skipf("multicast unavailable: %v", err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	received := make(chan Message, 1)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:             TransportUDP,
+		StreamID:              126,
+		SessionID:             224,
+		RemoteAddr:            group,
+		UDPMulticastInterface: ifi.Name,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.Send(ctx, []byte("multicast")); err != nil {
+		var netErr net.Error
+		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+			t.Skipf("multicast loopback unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-received:
+		if msg.StreamID != 126 || msg.SessionID != 224 || string(msg.Payload) != "multicast" {
+			t.Fatalf("unexpected multicast message: %#v", msg)
+		}
+	case <-ctx.Done():
+		t.Skipf("multicast loopback unavailable: %v", ctx.Err())
+	}
+}
+
+func TestPublicationResponseChannelFragments(t *testing.T) {
+	testPublicationResponseChannelPayload(t, TransportQUIC, 127, 128, []byte("abcdefghijklmnopqrstuvwxyz"), func(cfg *PublicationConfig) {
+		cfg.MTUBytes = headerLen + 32
+		cfg.MaxPayloadBytes = 64
+		cfg.PublicationWindowBytes = 1024
+	})
+}
+
 func TestUDPPublicationSubscriptionFragmentsLargePayload(t *testing.T) {
 	pubMetrics := &Metrics{}
 	subMetrics := &Metrics{}
@@ -275,6 +1141,154 @@ func TestUDPPublicationSubscriptionFragmentsLargePayload(t *testing.T) {
 	if subSnapshot.ConnectionsAccepted != 1 || subSnapshot.MessagesReceived != 1 || subSnapshot.BytesReceived != uint64(len(payload)) ||
 		subSnapshot.AcksSent != 1 || subSnapshot.FramesSent != 2 || subSnapshot.FramesReceived != 4 {
 		t.Fatalf("unexpected udp subscription metrics: %#v", subSnapshot)
+	}
+}
+
+func testPublicationResponseChannel(t *testing.T, transport TransportMode, requestStream, responseStream uint32) {
+	t.Helper()
+	testPublicationResponseChannelPayload(t, transport, requestStream, responseStream, []byte("hello"), nil)
+}
+
+func testPublicationResponseChannelPayload(t *testing.T, transport TransportMode, requestStream, responseStream uint32, payload []byte, configureClient func(*PublicationConfig)) {
+	t.Helper()
+	server, err := ListenSubscription(SubscriptionConfig{
+		Transport: transport,
+		StreamID:  requestStream,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	replies, err := ListenSubscription(SubscriptionConfig{
+		Transport: transport,
+		StreamID:  responseStream,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replies.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	responseCh := make(chan Message, 1)
+	go func() {
+		_ = replies.Serve(ctx, func(_ context.Context, msg Message) error {
+			responseCh <- msg
+			return nil
+		})
+	}()
+	go func() {
+		_ = server.Serve(ctx, func(ctx context.Context, msg Message) error {
+			if !msg.HasResponseChannel() {
+				return errors.New("missing response channel")
+			}
+			if msg.ResponseChannel.Transport != transport || msg.ResponseChannel.RemoteAddr != replies.LocalAddr().String() ||
+				msg.ResponseChannel.StreamID != responseStream {
+				return errors.New("unexpected response channel")
+			}
+			return msg.Respond(ctx, []byte("response: "+string(msg.Payload)), PublicationConfig{})
+		})
+	}()
+
+	clientConfig := PublicationConfig{
+		Transport:  transport,
+		StreamID:   requestStream,
+		SessionID:  221,
+		RemoteAddr: server.LocalAddr().String(),
+		ResponseChannel: ResponseChannel{
+			Transport:  transport,
+			RemoteAddr: replies.LocalAddr().String(),
+			StreamID:   responseStream,
+		},
+	}
+	if configureClient != nil {
+		configureClient(&clientConfig)
+	}
+	client, err := DialPublication(clientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Send(ctx, payload); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case response := <-responseCh:
+		if response.StreamID != responseStream || string(response.Payload) != "response: "+string(payload) {
+			t.Fatalf("unexpected response: %#v", response)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func testLocalSpySubscriptionObservesPublication(t *testing.T, transport TransportMode, streamID uint32) {
+	t.Helper()
+	server, err := ListenSubscription(SubscriptionConfig{
+		Transport: transport,
+		StreamID:  streamID,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	serverCh := make(chan Message, 1)
+	go func() {
+		_ = server.Serve(ctx, func(_ context.Context, msg Message) error {
+			serverCh <- msg
+			return nil
+		})
+	}()
+
+	spyMetrics := &Metrics{}
+	spy, err := ListenSubscription(SubscriptionConfig{
+		Transport: transport,
+		StreamID:  streamID,
+		LocalAddr: server.LocalAddr().String(),
+		LocalSpy:  true,
+		Metrics:   spyMetrics,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spy.Close()
+	spyCh := make(chan Message, 1)
+	go func() {
+		_ = spy.Serve(ctx, func(_ context.Context, msg Message) error {
+			spyCh <- msg
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  transport,
+		StreamID:   streamID,
+		SessionID:  226,
+		RemoteAddr: server.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.Send(ctx, []byte("spy-payload")); err != nil {
+		t.Fatal(err)
+	}
+	expectMessagePayload(t, ctx, serverCh, "spy-payload")
+	spyMsg := expectMessagePayload(t, ctx, spyCh, "spy-payload")
+	if spyMsg.StreamID != streamID || spyMsg.SessionID != 226 || spyMsg.Remote.String() != server.LocalAddr().String() {
+		t.Fatalf("unexpected spy message: %#v", spyMsg)
+	}
+	if snapshot := spyMetrics.Snapshot(); snapshot.MessagesReceived != 1 || snapshot.BytesReceived != uint64(len("spy-payload")) ||
+		snapshot.FramesReceived != 1 || snapshot.FramesDropped != 0 {
+		t.Fatalf("unexpected spy metrics: %#v", snapshot)
 	}
 }
 
@@ -383,6 +1397,92 @@ func TestUDPPublicationReportsTransportFeedback(t *testing.T) {
 	}
 }
 
+func TestUDPPublicationDynamicDestinations(t *testing.T) {
+	subA, err := ListenSubscription(SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  117,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subA.Close()
+	subB, err := ListenSubscription(SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  117,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subB.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	receivedA := make(chan string, 2)
+	receivedB := make(chan string, 2)
+	go func() {
+		_ = subA.Serve(ctx, func(_ context.Context, msg Message) error {
+			receivedA <- string(msg.Payload)
+			return nil
+		})
+	}()
+	go func() {
+		_ = subB.Serve(ctx, func(_ context.Context, msg Message) error {
+			receivedB <- string(msg.Payload)
+			return nil
+		})
+	}()
+
+	pubMetrics := &Metrics{}
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   117,
+		SessionID:  219,
+		RemoteAddr: subA.LocalAddr().String(),
+		Metrics:    pubMetrics,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.AddDestination(subB.LocalAddr().String()); err != nil {
+		t.Fatal(err)
+	}
+	destinations := pub.Destinations()
+	if len(destinations) != 2 {
+		t.Fatalf("destinations = %#v, want two", destinations)
+	}
+	if err := pub.Send(ctx, []byte("both")); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ctx, receivedA, "both")
+	expectPayload(t, ctx, receivedB, "both")
+
+	if err := pub.RemoveDestination(subA.LocalAddr().String()); err != nil {
+		t.Fatal(err)
+	}
+	destinations = pub.Destinations()
+	if len(destinations) != 1 || destinations[0] != subB.LocalAddr().String() {
+		t.Fatalf("destinations after remove = %#v, want %s", destinations, subB.LocalAddr().String())
+	}
+	if err := pub.Send(ctx, []byte("only-b")); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ctx, receivedB, "only-b")
+	select {
+	case got := <-receivedA:
+		t.Fatalf("subscription A received %q after destination was removed", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	snapshot := pubMetrics.Snapshot()
+	if snapshot.MessagesSent != 2 || snapshot.AcksReceived != 3 {
+		t.Fatalf("unexpected publication metrics: %#v", snapshot)
+	}
+}
+
 func TestUDPNakRepairRetransmitsCachedFrames(t *testing.T) {
 	pubMetrics := &Metrics{}
 	subMetrics := &Metrics{}
@@ -428,12 +1528,12 @@ func TestUDPNakRepairRetransmitsCachedFrames(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, statusApplied, err := pub.readUDPResponse(ctx, secondAppend, 2)
+	acks, err := pub.readUDPResponses(ctx, secondAppend, 2, []net.Addr{pub.udpRemote}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.typ != frameAck || !statusApplied {
-		t.Fatalf("udp response = %#v statusApplied=%v, want ack with status", resp, statusApplied)
+	if acks != 1 {
+		t.Fatalf("udp acks = %d, want 1", acks)
 	}
 
 	for _, want := range []uint64{1, 2} {
@@ -686,7 +1786,15 @@ func sendDataFrame(ctx context.Context, pub *Publication, streamID, sessionID ui
 
 func udpDatagramsForTest(t *testing.T, pub *Publication, seq uint64, payload []byte) (termAppend, [][]byte) {
 	t.Helper()
-	packet, appendResult, err := pub.encodeDataPacket(seq, 0, payload, countFragments(len(payload), pub.mtuPayload))
+	firstPayloadOverhead, err := responseChannelPayloadOverhead(pub.responseChannel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragmentCount, err := countFragmentsWithFirstOverhead(len(payload), pub.mtuPayload, firstPayloadOverhead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, appendResult, err := pub.encodeDataPacket(seq, 0, payload, fragmentCount, pub.responseChannel, firstPayloadOverhead)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,4 +1811,87 @@ func udpDatagramsForTest(t *testing.T, pub *Publication, seq uint64, payload []b
 		datagrams = append(datagrams, encoded)
 	}
 	return appendResult, datagrams
+}
+
+func expectPayload(t *testing.T, ctx context.Context, ch <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if got != want {
+			t.Fatalf("payload = %q, want %q", got, want)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func expectMessagePayload(t *testing.T, ctx context.Context, ch <-chan Message, want string) Message {
+	t.Helper()
+	select {
+	case msg := <-ch:
+		if string(msg.Payload) != want {
+			t.Fatalf("payload = %q, want %q", msg.Payload, want)
+		}
+		return msg
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	return Message{}
+}
+
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("unexpected udp addr: %T", conn.LocalAddr())
+	}
+	return addr.Port
+}
+
+func multicastTestInterface(t *testing.T) net.Interface {
+	t.Helper()
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ifi := range interfaces {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		if ifi.Flags&net.FlagLoopback == 0 && interfaceHasIPv4(ifi) {
+			return ifi
+		}
+	}
+	for _, ifi := range interfaces {
+		if ifi.Flags&net.FlagUp != 0 && ifi.Flags&net.FlagMulticast != 0 && interfaceHasIPv4(ifi) {
+			return ifi
+		}
+	}
+	t.Skip("no multicast-capable interface")
+	return net.Interface{}
+}
+
+func interfaceHasIPv4(ifi net.Interface) bool {
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		switch value := addr.(type) {
+		case *net.IPNet:
+			if value.IP.To4() != nil {
+				return true
+			}
+		case *net.IPAddr:
+			if value.IP.To4() != nil {
+				return true
+			}
+		}
+	}
+	return false
 }

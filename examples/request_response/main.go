@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/xargin/bunshin"
@@ -25,19 +24,10 @@ func main() {
 
 	go func() {
 		_ = server.Serve(ctx, func(ctx context.Context, msg bunshin.Message) error {
-			replyAddr, body, ok := strings.Cut(string(msg.Payload), "\n")
-			if !ok || !strings.HasPrefix(replyAddr, "reply=") {
-				return fmt.Errorf("request is missing reply address")
+			if !msg.HasResponseChannel() {
+				return fmt.Errorf("request is missing response channel")
 			}
-			pub, err := bunshin.DialPublication(bunshin.PublicationConfig{
-				StreamID:   2,
-				RemoteAddr: strings.TrimPrefix(replyAddr, "reply="),
-			})
-			if err != nil {
-				return err
-			}
-			defer pub.Close()
-			return pub.Send(ctx, []byte("response: "+body))
+			return msg.Respond(ctx, []byte("response: "+string(msg.Payload)), bunshin.PublicationConfig{})
 		})
 	}()
 
@@ -61,14 +51,17 @@ func main() {
 	client, err := bunshin.DialPublication(bunshin.PublicationConfig{
 		StreamID:   1,
 		RemoteAddr: server.LocalAddr().String(),
+		ResponseChannel: bunshin.ResponseChannel{
+			RemoteAddr: replies.LocalAddr().String(),
+			StreamID:   2,
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer client.Close()
 
-	request := "reply=" + replies.LocalAddr().String() + "\nhello"
-	if err := client.Send(ctx, []byte(request)); err != nil {
+	if err := client.Send(ctx, []byte("hello")); err != nil {
 		log.Fatal(err)
 	}
 

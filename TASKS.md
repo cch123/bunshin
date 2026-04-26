@@ -9,9 +9,9 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 - [x] Add protocol negotiation and explicit error frames.
 - [x] Add optional reserved value support for application-level integrity metadata.
 - [x] Add fuzz tests for frame decoding and malformed packets.
-- [ ] Document the intentional compatibility boundary: Aeron-inspired concepts, not Aeron wire/API compatibility.
-- [ ] Add protocol conformance tests for version negotiation, unknown frame handling, and error frames across future versions.
-- [ ] Add migration notes for evolving the Bunshin-native protocol without breaking existing recordings or peers.
+- [x] Document the intentional compatibility boundary: Aeron-inspired concepts, not Aeron wire/API compatibility.
+- [x] Add protocol conformance tests for version negotiation, unknown frame handling, and error frames across future versions.
+- [x] Add migration notes for evolving the Bunshin-native protocol without breaking existing recordings or peers.
 
 ## Transport Core
 
@@ -33,11 +33,11 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 - [x] Add receiver status/position feedback frames for non-QUIC transports.
 - [x] Add NAK-style repair for UDP/backend transports while keeping QUIC reliability as the default path.
 - [x] Add RTT measurement and congestion-control hooks for non-QUIC transports.
-- [ ] Add multicast transport support for UDP publications and subscriptions.
-- [ ] Add multi-destination send and receive support with dynamic destination add/remove.
-- [ ] Add response-channel support for request/response without application-encoded reply addresses.
-- [ ] Add local spy subscriptions for observing outbound publications without network loopback.
-- [ ] Add name re-resolution and wildcard port management for UDP channels.
+- [x] Add multicast transport support for UDP publications and subscriptions.
+- [x] Add multi-destination send and receive support with dynamic destination add/remove.
+- [x] Add response-channel support for request/response without application-encoded reply addresses.
+- [x] Add local spy subscriptions for observing outbound publications without network loopback.
+- [x] Add name re-resolution and wildcard port management for UDP channels.
 
 ## Media Driver
 
@@ -50,41 +50,41 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 - [x] Implement a typed driver command protocol over local IPC with correlation IDs and async driver events.
 - [x] Add an out-of-process media driver binary with heartbeat, termination, and stale-driver detection.
 - [x] Move publication/subscription resource ownership behind the external driver boundary while preserving embeddable mode.
-- [ ] Back driver-managed term buffers with mmap files shared between clients and driver.
+- [x] Back driver-managed term buffers with mmap files shared between clients and driver.
 - [ ] Add driver conductor/sender/receiver agent loops with configurable threading and idle strategies.
-- [ ] Add active-directory detection and stale mark-file recovery.
+- [x] Add active-directory detection and stale mark-file recovery.
 
 ## API
 
-- [ ] Stabilize public package names, constructors, and error types.
+- [x] Stabilize public package names, constructors, and error types.
 - [x] Add non-blocking offer/poll APIs similar to high-performance messaging systems.
 - [x] Add context-aware blocking helpers on top of non-blocking primitives.
 - [x] Add typed configuration with validation and sane defaults.
 - [x] Add examples for publication, subscription, request/response, and embedded driver usage.
-- [ ] Add publication-level non-blocking `Offer` returning stream position or stable status values.
-- [ ] Add subscription-level pull `Poll`/`PollN` APIs with fragment limits.
-- [ ] Add an `Image` abstraction with source identity, join position, current position, and lifecycle callbacks.
-- [ ] Add available/unavailable image handlers for subscriptions.
-- [ ] Add controlled polling actions for continue, break, abort, and commit semantics.
-- [ ] Add vectored offer APIs for gathering multiple buffers into one message.
-- [ ] Add zero-copy claim/commit APIs for single-message writes.
-- [ ] Add an exclusive publication API for single-writer hot paths.
+- [x] Add publication-level non-blocking `Offer` returning stream position or stable status values.
+- [x] Add subscription-level pull `Poll`/`PollN` APIs with fragment limits.
+- [x] Add an `Image` abstraction with source identity, join position, current position, and lifecycle callbacks.
+- [x] Add available/unavailable image handlers for subscriptions.
+- [x] Add controlled polling actions for continue, break, abort, and commit semantics.
+- [x] Add vectored offer APIs for gathering multiple buffers into one message.
+- [x] Add zero-copy claim/commit APIs for single-message writes.
+- [x] Add an exclusive publication API for single-writer hot paths.
 - [x] Add a Bunshin channel URI parser/builder for `bunshin:quic`, `bunshin:udp`, and `bunshin:ipc`.
-- [ ] Add channel-level dynamic destination APIs.
+- [x] Add channel-level dynamic destination APIs.
 
 ## Observability
 
 - [x] Add counters for sent frames, received frames, retransmits, and drops.
 - [x] Add structured logging hooks without forcing a logging dependency.
-- [ ] Add subscription lag reporting.
-- [ ] Add optional pprof/expvar integration examples.
-- [ ] Add benchmark output for latency and throughput.
-- [ ] Add CnC-style counters with stable type IDs, labels, and client-readable snapshots.
-- [ ] Add tooling-readable distinct error log files.
-- [ ] Add tooling-readable loss report files.
-- [ ] Add channel endpoint, publication, subscription, and image status counters.
-- [ ] Add driver duty-cycle and stall counters.
-- [ ] Add CLI tools for counters, errors, loss reports, stream status, and driver control.
+- [x] Add subscription lag reporting.
+- [x] Add optional pprof/expvar integration examples.
+- [x] Add benchmark output for latency and throughput.
+- [x] Add CnC-style counters with stable type IDs, labels, and client-readable snapshots.
+- [x] Add tooling-readable distinct error log files.
+- [x] Add tooling-readable loss report files.
+- [x] Add channel endpoint, publication, subscription, and image status counters.
+- [x] Add driver duty-cycle and stall counters.
+- [x] Add CLI tools for counters, errors, loss reports, stream status, and driver control.
 
 ## Archive
 
@@ -124,39 +124,43 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 
 ## Performance
 
-- [ ] Add microbenchmarks for frame encode/decode, send/receive, and handler dispatch.
-- [ ] Reduce allocations in hot paths.
-- [ ] Add buffer pooling where it improves throughput without complicating ownership.
-- [ ] Measure latency percentiles under load.
-- [ ] Add Linux-specific socket tuning documentation.
-- [ ] Evaluate runtime pinning and busy-spin options for low-latency deployments.
-- [ ] Add mmap IPC and shared term-buffer throughput benchmarks.
-- [ ] Add p99/p999 latency benchmarks for QUIC, UDP, and IPC transports.
-- [ ] Add fanout, multi-destination, archive replay, and replay-merge benchmarks.
-- [ ] Add memory and GC profile benchmarks for publication, subscription, archive, and driver loops.
+- [x] Add microbenchmarks for frame encode/decode, send/receive, and handler dispatch.
+- [x] Reduce allocations in hot paths.
+- [x] Add buffer pooling where it improves throughput without complicating ownership.
+- [x] Measure latency percentiles under load.
+- [x] Add Linux-specific socket tuning documentation.
+- [x] Evaluate runtime pinning and busy-spin options for low-latency deployments.
+- [x] Add mmap IPC and shared term-buffer throughput benchmarks.
+- [x] Add p99/p999 latency benchmarks for QUIC, UDP, and IPC transports.
+- [x] Add fanout, multi-destination, archive replay, and replay-merge benchmarks.
+- [x] Add memory and GC profile benchmarks for publication, subscription, archive, and driver loops.
 
 ## Testing
 
 - [x] Add unit tests for timeout, close, duplicate suppression, and invalid config behavior.
-- [ ] Add integration tests for retransmission after packet loss.
-- [ ] Add race tests to CI.
-- [ ] Add soak tests for long-running publications/subscriptions.
-- [ ] Add packet-loss and jitter simulation tests.
-- [ ] Add cross-platform CI for macOS and Linux.
-- [ ] Add driver restart, stale client, stale driver, and mark-file recovery tests.
-- [ ] Add shared mmap buffer corruption and recovery tests.
+- [x] Add integration tests for retransmission after packet loss.
+- [x] Add race tests to CI.
+- [x] Add soak tests for long-running publications/subscriptions.
+- [x] Add packet-loss and jitter simulation tests.
+- [x] Add cross-platform CI for macOS and Linux.
+- [x] Add driver restart, stale client, stale driver, and mark-file recovery tests.
+- [x] Add shared mmap buffer corruption and recovery tests.
 - [x] Add UDP transport integration tests.
 - [x] Add NAK repair integration tests.
-- [ ] Add multicast and multi-destination integration tests.
-- [ ] Add response-channel and dynamic destination system tests.
-- [ ] Add archive catalog, recording extension, replay merge, and replication tests.
-- [ ] Add cluster network partition, leader failover, snapshot recovery, and backup tests.
+- [x] Add multi-destination integration tests.
+- [x] Add multicast integration tests.
+- [x] Add dynamic destination system tests.
+- [x] Add response-channel system tests.
+- [x] Add local spy integration tests.
+- [x] Add UDP name re-resolution and wildcard port tests.
+- [x] Add archive catalog, recording extension, replay merge, and replication tests.
+- [x] Add cluster network partition, leader failover, snapshot recovery, and backup tests.
 
 ## Documentation And Licensing
 
-- [ ] Keep README clear that Bunshin is not an official Aeron distribution.
-- [ ] Add Apache-2.0 license compatibility notes for any code or design borrowed from upstream projects.
-- [ ] Avoid using Aeron trademarks in product naming.
-- [ ] Add architecture diagrams for client, driver, transport, archive, and cluster layers.
-- [ ] Add Bunshin protocol evolution and recording migration notes.
-- [ ] Document Aeron feature parity gaps without implying interoperability.
+- [x] Keep README clear that Bunshin is not an official Aeron distribution.
+- [x] Add Apache-2.0 license compatibility notes for any code or design borrowed from upstream projects.
+- [x] Avoid using Aeron trademarks in product naming.
+- [x] Add architecture diagrams for client, driver, transport, archive, and cluster layers.
+- [x] Add Bunshin protocol evolution and recording migration notes.
+- [x] Document Aeron feature parity gaps without implying interoperability.

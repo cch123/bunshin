@@ -46,7 +46,7 @@ pub, err := client.AddPublication(ctx, bunshin.PublicationConfig{
 err = pub.Send(ctx, []byte("hello"))
 ```
 
-`DriverPublication` exposes `Send`, `LocalAddr`, `ID`, and `Close`. `DriverSubscription` exposes `Serve`, `LocalAddr`, `LossReports`, `ID`, and `Close`. Closing a `DriverClient` closes all of its managed publications and subscriptions.
+`DriverPublication` exposes `Send`, `LocalAddr`, `ID`, and `Close`. `DriverSubscription` exposes `Serve`, `Poll`, `PollN`, `ControlledPoll`, `ControlledPollN`, `LocalAddr`, `Images`, `LossReports`, `ID`, and `Close`. Closing a `DriverClient` closes all of its managed publications and subscriptions.
 
 In embedded mode, the returned handles wrap in-process resources. Against an external driver, `ConnectMediaDriver` returns the same client-facing handle shape, but publication and subscription ownership stays in the driver process:
 
@@ -74,7 +74,7 @@ snapshot, err := driver.Snapshot(ctx)
 fmt.Println(snapshot.Counters.ClientsRegistered, len(snapshot.Publications))
 ```
 
-Counters include processed/failed commands, registered/closed clients, registered/closed publications, registered/closed subscriptions, cleanup runs, and stale client cleanup count.
+Counters include processed/failed commands, registered/closed clients, registered/closed publications, registered/closed subscriptions, cleanup runs, stale client cleanup count, duty-cycle time, and stall time. `DriverConfig.StallThreshold` controls when a duty cycle is counted as a stall and defaults to 50 ms. `snapshot.StatusCounters` reports the current active client, channel endpoint, publication, subscription, and image counts. `snapshot.CounterSnapshots` exposes driver counters, status counters, and configured `Metrics` counters as stable type IDs, labels, names, scopes, and numeric values for tools.
 
 ## Driver Directory
 
@@ -82,10 +82,12 @@ Counters include processed/failed commands, registered/closed clients, registere
 
 - `driver.mark`: JSON mark file with PID, status, start time, update time, and timeout configuration.
 - `command.ring` and `events.ring`: typed IPC ring paths for driver commands and async events.
-- `reports/counters.json`: driver counters, inherited transport metrics, and active resource counts.
+- `reports/counters.json`: driver counters, driver status counters, inherited transport metrics, CnC-style counter snapshots, and active resource counts.
 - `reports/loss-report.json`: aggregated loss reports from driver-managed subscriptions.
 - `reports/error-report.json`: driver command and lifecycle errors.
 - `clients/`, `publications/`, `subscriptions/`, and `buffers/`: reserved ownership and shared-buffer directories.
+
+When a driver directory is configured, driver-managed publications use mmap-backed term-buffer partitions under `buffers/publications/publication-<id>/`. Publication snapshots expose the mapped term-buffer file paths so tools can inspect ownership and file lifecycle without parsing transport state.
 
 `MediaDriver.FlushReports` writes the latest counters, loss reports, and error reports atomically:
 
@@ -95,6 +97,18 @@ fmt.Println(report.Layout.MarkFile, report.Counters.Counters.ClientsRegistered)
 ```
 
 `MediaDriver.Directory` returns the resolved layout for tools that need to locate these files. On `Close`, the mark file is updated to `closed`.
+
+The `bunshin-driver` CLI can inspect and control a driver directory:
+
+```sh
+bunshin-driver status -dir /tmp/bunshin-driver
+bunshin-driver counters -dir /tmp/bunshin-driver
+bunshin-driver errors -dir /tmp/bunshin-driver
+bunshin-driver loss -dir /tmp/bunshin-driver
+bunshin-driver streams -dir /tmp/bunshin-driver
+bunshin-driver flush -dir /tmp/bunshin-driver
+bunshin-driver terminate -dir /tmp/bunshin-driver
+```
 
 ## Cleanup
 
@@ -145,6 +159,8 @@ bunshin-driver status -dir /var/run/bunshin/default
 
 `CheckDriverProcess` reads the same mark file and reports a driver as stale when it is still marked `active` but its heartbeat age exceeds the configured stale timeout. A normal shutdown updates the mark file to `closed`.
 
+Driver startup refuses to reuse a directory that still has a fresh `active` mark file, returning `ErrDriverDirectoryActive`. If the mark file is `active` but stale, startup first recovers it by writing a closed mark with `closed_at`, then creates the new active mark. `DriverConfig.DirectoryStaleTimeout` and `DriverProcessConfig.StaleTimeout` control this recovery window; the default is 5 seconds.
+
 Terminate a running process through the typed IPC command ring:
 
 ```sh
@@ -180,4 +196,4 @@ _, err = ring.Poll(func(payload []byte) error {
 
 For blocking loops, `OfferContext`, `PollContext`, and `PollNContext` retry the non-blocking operations until work succeeds, the ring closes, or the context expires. The caller can provide an `IdleStrategy`; a default backoff strategy is used when nil is passed.
 
-The ring can be opened by multiple handles that map the same file, which is enough for the typed driver IPC protocol and local driver tests. Mmap-backed driver term buffers, active-driver detection, and stale mark-file recovery are the next layers above this primitive.
+The ring can be opened by multiple handles that map the same file, which is enough for the typed driver IPC protocol and local driver tests. Driver-managed publications use the same mmap primitive for term-buffer files when a driver directory is configured.

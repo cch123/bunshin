@@ -24,6 +24,7 @@ type DriverProcessConfig struct {
 	EventRingCapacity   int
 	ResetIPC            bool
 	HeartbeatInterval   time.Duration
+	StaleTimeout        time.Duration
 	PollLimit           int
 	IdleStrategy        IdleStrategy
 }
@@ -215,6 +216,15 @@ func normalizeDriverProcessConfig(cfg DriverProcessConfig) (DriverProcessConfig,
 	}
 	if cfg.HeartbeatInterval == 0 {
 		cfg.HeartbeatInterval = defaultDriverProcessHeartbeatInterval
+	}
+	if cfg.StaleTimeout < 0 {
+		return DriverProcessConfig{}, invalidConfigf("invalid driver process stale timeout: %s", cfg.StaleTimeout)
+	}
+	if cfg.StaleTimeout == 0 {
+		cfg.StaleTimeout = defaultDriverProcessStaleTimeout
+	}
+	if cfg.Driver.DirectoryStaleTimeout == 0 {
+		cfg.Driver.DirectoryStaleTimeout = cfg.StaleTimeout
 	}
 	if cfg.PollLimit < 0 {
 		return DriverProcessConfig{}, invalidConfigf("invalid driver process poll limit: %d", cfg.PollLimit)

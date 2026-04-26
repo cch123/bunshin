@@ -19,11 +19,15 @@ type orderedState struct {
 }
 
 type orderedMessage struct {
-	ctx  context.Context
-	msg  Message
-	ack  func() error
-	fail func(error) error
-	done chan error
+	ctx                context.Context
+	msg                Message
+	position           int64
+	positionTermID     int32
+	positionTermOffset int
+	hasFramePosition   bool
+	ack                func() error
+	fail               func(error) error
+	done               chan error
 }
 
 func newOrderedDelivery(sub *Subscription) *orderedDelivery {

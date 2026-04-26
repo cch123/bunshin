@@ -30,7 +30,8 @@ const (
 type frameFlag uint16
 
 const (
-	frameFlagFragment frameFlag = 1 << 0
+	frameFlagFragment        frameFlag = 1 << 0
+	frameFlagResponseChannel frameFlag = 1 << 1
 )
 
 type protocolErrorCode uint16
@@ -72,6 +73,81 @@ type statusPayload struct {
 type nakPayload struct {
 	fromSequence uint64
 	toSequence   uint64
+}
+
+func encodeResponseChannelPayload(r ResponseChannel) ([]byte, error) {
+	transport := []byte(r.Transport)
+	remoteAddr := []byte(r.RemoteAddr)
+	if len(transport) > int(^uint16(0)) {
+		return nil, fmt.Errorf("response channel transport too large: %d bytes", len(transport))
+	}
+	if len(remoteAddr) > int(^uint16(0)) {
+		return nil, fmt.Errorf("response channel remote address too large: %d bytes", len(remoteAddr))
+	}
+	buf := make([]byte, 8+len(transport)+len(remoteAddr))
+	frameByteOrder.PutUint32(buf[0:4], r.StreamID)
+	frameByteOrder.PutUint16(buf[4:6], uint16(len(transport)))
+	frameByteOrder.PutUint16(buf[6:8], uint16(len(remoteAddr)))
+	copy(buf[8:8+len(transport)], transport)
+	copy(buf[8+len(transport):], remoteAddr)
+	return buf, nil
+}
+
+func decodeResponseChannelPayload(payload []byte) (ResponseChannel, error) {
+	if len(payload) < 8 {
+		return ResponseChannel{}, fmt.Errorf("invalid response channel payload length: %d", len(payload))
+	}
+	streamID := frameByteOrder.Uint32(payload[0:4])
+	transportLen := int(frameByteOrder.Uint16(payload[4:6]))
+	remoteAddrLen := int(frameByteOrder.Uint16(payload[6:8]))
+	if len(payload) != 8+transportLen+remoteAddrLen {
+		return ResponseChannel{}, fmt.Errorf("invalid response channel payload length: %d", len(payload))
+	}
+	if transportLen == 0 || remoteAddrLen == 0 {
+		return ResponseChannel{}, errors.New("invalid empty response channel")
+	}
+	response := ResponseChannel{
+		Transport:  TransportMode(string(payload[8 : 8+transportLen])),
+		RemoteAddr: string(payload[8+transportLen:]),
+		StreamID:   streamID,
+	}
+	return normalizeResponseChannel(response, response.Transport)
+}
+
+func encodeDataPayload(response ResponseChannel, payload []byte) ([]byte, error) {
+	if response.IsZero() {
+		return payload, nil
+	}
+	responsePayload, err := encodeResponseChannelPayload(response)
+	if err != nil {
+		return nil, err
+	}
+	if len(responsePayload) > int(^uint16(0)) {
+		return nil, fmt.Errorf("response channel payload too large: %d bytes", len(responsePayload))
+	}
+	buf := make([]byte, 2+len(responsePayload)+len(payload))
+	frameByteOrder.PutUint16(buf[0:2], uint16(len(responsePayload)))
+	copy(buf[2:2+len(responsePayload)], responsePayload)
+	copy(buf[2+len(responsePayload):], payload)
+	return buf, nil
+}
+
+func decodeDataPayload(f frame) (ResponseChannel, []byte, error) {
+	if f.flags&frameFlagResponseChannel == 0 {
+		return ResponseChannel{}, f.payload, nil
+	}
+	if len(f.payload) < 2 {
+		return ResponseChannel{}, nil, fmt.Errorf("invalid response data payload length: %d", len(f.payload))
+	}
+	responsePayloadLen := int(frameByteOrder.Uint16(f.payload[0:2]))
+	if len(f.payload) < 2+responsePayloadLen {
+		return ResponseChannel{}, nil, fmt.Errorf("invalid response data payload length: %d", len(f.payload))
+	}
+	response, err := decodeResponseChannelPayload(f.payload[2 : 2+responsePayloadLen])
+	if err != nil {
+		return ResponseChannel{}, nil, err
+	}
+	return response, f.payload[2+responsePayloadLen:], nil
 }
 
 func encodeFrame(f frame) ([]byte, error) {
@@ -178,6 +254,14 @@ func frameHeaderVersion(buf []byte) (uint8, bool) {
 }
 
 func decodeFrame(buf []byte) (frame, error) {
+	return decodeFrameWithPayload(buf, true)
+}
+
+func decodeFrameView(buf []byte) (frame, error) {
+	return decodeFrameWithPayload(buf, false)
+}
+
+func decodeFrameWithPayload(buf []byte, copyPayload bool) (frame, error) {
 	if len(buf) < headerLen {
 		return frame{}, errors.New("frame too short")
 	}
@@ -193,6 +277,9 @@ func decodeFrame(buf []byte) (frame, error) {
 		return frame{}, errors.New("invalid payload length")
 	}
 	payload := buf[headerLen : headerLen+payloadLen]
+	if copyPayload {
+		payload = append([]byte(nil), payload...)
+	}
 
 	return frame{
 		typ:           frameType(buf[5]),
@@ -205,11 +292,19 @@ func decodeFrame(buf []byte) (frame, error) {
 		reserved:      frameByteOrder.Uint64(buf[36:44]),
 		fragmentIndex: frameByteOrder.Uint16(buf[44:46]),
 		fragmentCount: frameByteOrder.Uint16(buf[46:48]),
-		payload:       append([]byte(nil), payload...),
+		payload:       payload,
 	}, nil
 }
 
 func decodeFrames(buf []byte) ([]frame, error) {
+	return decodeFramesWithPayload(buf, true)
+}
+
+func decodeFramesView(buf []byte) ([]frame, error) {
+	return decodeFramesWithPayload(buf, false)
+}
+
+func decodeFramesWithPayload(buf []byte, copyPayload bool) ([]frame, error) {
 	if len(buf) == 0 {
 		return nil, errors.New("frame too short")
 	}
@@ -224,7 +319,7 @@ func decodeFrames(buf []byte) ([]frame, error) {
 		if payloadLen < 0 || frameEnd > len(buf) {
 			return nil, errors.New("invalid payload length")
 		}
-		f, err := decodeFrame(buf[offset:frameEnd])
+		f, err := decodeFrameWithPayload(buf[offset:frameEnd], copyPayload)
 		if err != nil {
 			return nil, err
 		}

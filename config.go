@@ -50,6 +50,9 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 	if cfg.UDPRetransmitBufferBytes < 0 {
 		return normalizedPublicationConfig{}, invalidConfigf("invalid UDP retransmit buffer bytes: %d", cfg.UDPRetransmitBufferBytes)
 	}
+	if cfg.UDPNameResolutionInterval < 0 {
+		return normalizedPublicationConfig{}, invalidConfigf("invalid UDP name resolution interval: %s", cfg.UDPNameResolutionInterval)
+	}
 	if cfg.StreamID == 0 {
 		cfg.StreamID = defaultStreamID
 	}
@@ -85,6 +88,11 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 	if cfg.FlowControl == nil {
 		cfg.FlowControl = UnicastFlowControl{}
 	}
+	responseChannel, err := normalizeResponseChannel(cfg.ResponseChannel, cfg.Transport)
+	if err != nil {
+		return normalizedPublicationConfig{}, err
+	}
+	cfg.ResponseChannel = responseChannel
 
 	flowLimit := cfg.FlowControl.InitialLimit(cfg.TermBufferLength)
 	if flowLimit <= 0 {
@@ -124,7 +132,7 @@ func normalizeSubscriptionConfig(cfg SubscriptionConfig) (SubscriptionConfig, er
 	default:
 		return SubscriptionConfig{}, invalidConfigf("invalid subscription transport: %s", cfg.Transport)
 	}
-	if cfg.LocalAddr == "" && cfg.PacketConn == nil {
+	if cfg.LocalAddr == "" && (cfg.PacketConn == nil || cfg.LocalSpy) {
 		return SubscriptionConfig{}, invalidConfigf("local address is required")
 	}
 	if cfg.ReadBufferBytes < 0 {
@@ -136,11 +144,29 @@ func normalizeSubscriptionConfig(cfg SubscriptionConfig) (SubscriptionConfig, er
 	if cfg.ReceiverWindowBytes < 0 {
 		return SubscriptionConfig{}, invalidConfigf("invalid receiver window bytes: %d", cfg.ReceiverWindowBytes)
 	}
+	if cfg.TermBufferLength < 0 {
+		return SubscriptionConfig{}, invalidConfigf("invalid subscription term buffer length: %d", cfg.TermBufferLength)
+	}
+	if cfg.LocalSpyBuffer < 0 {
+		return SubscriptionConfig{}, invalidConfigf("invalid local spy buffer: %d", cfg.LocalSpyBuffer)
+	}
 	if cfg.StreamID == 0 {
 		cfg.StreamID = defaultStreamID
 	}
 	if cfg.ReceiverWindowBytes == 0 {
 		cfg.ReceiverWindowBytes = minTermLength
+	}
+	if cfg.TermBufferLength == 0 {
+		cfg.TermBufferLength = minTermLength
+	}
+	if err := validateTermLength(cfg.TermBufferLength); err != nil {
+		return SubscriptionConfig{}, invalidConfigWrap(err)
+	}
+	if cfg.LocalSpyBuffer == 0 {
+		cfg.LocalSpyBuffer = defaultLocalSpyBuffer
+	}
+	if cfg.LocalSpy {
+		return cfg, nil
 	}
 
 	if cfg.Transport == TransportQUIC {

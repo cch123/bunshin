@@ -67,6 +67,23 @@ func TestPublicationConfigNormalizeUDPDefaults(t *testing.T) {
 	}
 }
 
+func TestPublicationConfigNormalizeResponseChannel(t *testing.T) {
+	cfg, err := normalizePublicationConfig(PublicationConfig{
+		Transport:  TransportUDP,
+		RemoteAddr: "127.0.0.1:40456",
+		ResponseChannel: ResponseChannel{
+			RemoteAddr: "127.0.0.1:40457",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ResponseChannel.Transport != TransportUDP || cfg.ResponseChannel.RemoteAddr != "127.0.0.1:40457" ||
+		cfg.ResponseChannel.StreamID != defaultStreamID {
+		t.Fatalf("response channel = %#v", cfg.ResponseChannel)
+	}
+}
+
 func TestPublicationConfigNormalizeClonesTLSConfig(t *testing.T) {
 	base := &tls.Config{}
 	cfg, err := normalizePublicationConfig(PublicationConfig{
@@ -99,12 +116,15 @@ func TestPublicationConfigValidateRejectsInvalidValues(t *testing.T) {
 		{name: "negative write buffer", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", WriteBufferBytes: -1}},
 		{name: "negative retransmit", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", RetransmitEvery: -time.Nanosecond}},
 		{name: "negative udp retransmit buffer", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", UDPRetransmitBufferBytes: -1}},
+		{name: "negative udp name resolution interval", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", UDPNameResolutionInterval: -time.Nanosecond}},
 		{name: "small mtu", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MTUBytes: headerLen}},
 		{name: "large mtu", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MTUBytes: maxFrameSize + 1}},
 		{name: "negative max payload", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MaxPayloadBytes: -1}},
 		{name: "invalid term", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", TermBufferLength: minTermLength - 1}},
 		{name: "invalid window", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", PublicationWindowBytes: -1}},
 		{name: "invalid flow", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", FlowControl: zeroFlowControl{}}},
+		{name: "response channel missing remote", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", ResponseChannel: ResponseChannel{StreamID: 2}}},
+		{name: "response channel invalid transport", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", ResponseChannel: ResponseChannel{Transport: TransportIPC, RemoteAddr: "127.0.0.1:2"}}},
 	}
 
 	for _, tt := range tests {
@@ -133,6 +153,9 @@ func TestSubscriptionConfigNormalizeAppliesDefaults(t *testing.T) {
 	if cfg.ReceiverWindowBytes != minTermLength {
 		t.Fatalf("receiver window = %d, want %d", cfg.ReceiverWindowBytes, minTermLength)
 	}
+	if cfg.TermBufferLength != minTermLength {
+		t.Fatalf("term buffer length = %d, want %d", cfg.TermBufferLength, minTermLength)
+	}
 	if cfg.TLSConfig == nil || len(cfg.TLSConfig.NextProtos) != 1 || cfg.TLSConfig.NextProtos[0] != quicALPN {
 		t.Fatalf("tls config was not defaulted: %#v", cfg.TLSConfig)
 	}
@@ -152,6 +175,24 @@ func TestSubscriptionConfigNormalizeUDPDefaults(t *testing.T) {
 	}
 	if cfg.TLSConfig != nil {
 		t.Fatalf("udp tls config = %#v, want nil", cfg.TLSConfig)
+	}
+}
+
+func TestSubscriptionConfigNormalizeLocalSpy(t *testing.T) {
+	cfg, err := normalizeSubscriptionConfig(SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  12,
+		LocalAddr: "127.0.0.1:40456",
+		LocalSpy:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LocalSpy || cfg.Transport != TransportUDP || cfg.StreamID != 12 || cfg.LocalSpyBuffer != defaultLocalSpyBuffer {
+		t.Fatalf("unexpected local spy config: %#v", cfg)
+	}
+	if cfg.TLSConfig != nil {
+		t.Fatalf("local spy tls config = %#v, want nil", cfg.TLSConfig)
 	}
 }
 
@@ -186,6 +227,10 @@ func TestSubscriptionConfigValidateRejectsInvalidValues(t *testing.T) {
 		{name: "negative read buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", ReadBufferBytes: -1}},
 		{name: "negative write buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", WriteBufferBytes: -1}},
 		{name: "negative receiver window", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", ReceiverWindowBytes: -1}},
+		{name: "negative term buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", TermBufferLength: -1}},
+		{name: "invalid term buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", TermBufferLength: minTermLength + 1}},
+		{name: "negative local spy buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", LocalSpy: true, LocalSpyBuffer: -1}},
+		{name: "local spy missing local address", cfg: SubscriptionConfig{LocalSpy: true}},
 	}
 
 	for _, tt := range tests {

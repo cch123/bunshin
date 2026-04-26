@@ -28,6 +28,16 @@ func main() {
 		err = runDriver(os.Args[2:])
 	case "status":
 		value, err = statusDriver(os.Args[2:])
+	case "counters":
+		value, err = countersDriver(os.Args[2:])
+	case "errors":
+		value, err = errorsDriver(os.Args[2:])
+	case "loss":
+		value, err = lossDriver(os.Args[2:])
+	case "streams":
+		value, err = streamsDriver(os.Args[2:])
+	case "flush":
+		value, err = flushDriver(os.Args[2:])
 	case "terminate":
 		value, err = terminateDriver(os.Args[2:])
 	default:
@@ -58,6 +68,7 @@ func runDriver(args []string) error {
 	heartbeat := flags.Duration("heartbeat", time.Second, "driver heartbeat/report interval")
 	clientTimeout := flags.Duration("client-timeout", 30*time.Second, "stale client timeout")
 	cleanupInterval := flags.Duration("cleanup-interval", time.Second, "stale client cleanup interval")
+	staleTimeout := flags.Duration("stale-timeout", 5*time.Second, "active driver directory stale timeout")
 	commandBuffer := flags.Int("command-buffer", 64, "in-process driver command buffer")
 	commandRingCapacity := flags.Int("command-ring-capacity", 64*1024, "driver IPC command ring capacity")
 	eventRingCapacity := flags.Int("event-ring-capacity", 64*1024, "driver IPC event ring capacity")
@@ -74,15 +85,17 @@ func runDriver(args []string) error {
 	return bunshin.RunMediaDriverProcess(ctx, bunshin.DriverProcessConfig{
 		Directory: *dir,
 		Driver: bunshin.DriverConfig{
-			Directory:       *dir,
-			CommandBuffer:   *commandBuffer,
-			ClientTimeout:   *clientTimeout,
-			CleanupInterval: *cleanupInterval,
+			Directory:             *dir,
+			CommandBuffer:         *commandBuffer,
+			ClientTimeout:         *clientTimeout,
+			CleanupInterval:       *cleanupInterval,
+			DirectoryStaleTimeout: *staleTimeout,
 		},
 		CommandRingCapacity: *commandRingCapacity,
 		EventRingCapacity:   *eventRingCapacity,
 		ResetIPC:            !*preserveIPC,
 		HeartbeatInterval:   *heartbeat,
+		StaleTimeout:        *staleTimeout,
 		PollLimit:           *pollLimit,
 	})
 }
@@ -100,6 +113,96 @@ func statusDriver(args []string) (bunshin.DriverProcessStatus, error) {
 	return bunshin.CheckDriverProcess(*dir, *staleTimeout)
 }
 
+func countersDriver(args []string) (bunshin.DriverCountersFile, error) {
+	flags := flag.NewFlagSet("counters", flag.ExitOnError)
+	dir := flags.String("dir", "", "driver directory")
+	if err := flags.Parse(args); err != nil {
+		return bunshin.DriverCountersFile{}, err
+	}
+	if *dir == "" {
+		return bunshin.DriverCountersFile{}, errors.New("driver directory is required")
+	}
+	return readDriverReport[bunshin.DriverCountersFile](*dir, func(layout bunshin.DriverDirectoryLayout) string {
+		return layout.CountersFile
+	})
+}
+
+func errorsDriver(args []string) (bunshin.DriverErrorReportFile, error) {
+	flags := flag.NewFlagSet("errors", flag.ExitOnError)
+	dir := flags.String("dir", "", "driver directory")
+	if err := flags.Parse(args); err != nil {
+		return bunshin.DriverErrorReportFile{}, err
+	}
+	if *dir == "" {
+		return bunshin.DriverErrorReportFile{}, errors.New("driver directory is required")
+	}
+	return readDriverReport[bunshin.DriverErrorReportFile](*dir, func(layout bunshin.DriverDirectoryLayout) string {
+		return layout.ErrorReportFile
+	})
+}
+
+func lossDriver(args []string) (bunshin.DriverLossReportFile, error) {
+	flags := flag.NewFlagSet("loss", flag.ExitOnError)
+	dir := flags.String("dir", "", "driver directory")
+	if err := flags.Parse(args); err != nil {
+		return bunshin.DriverLossReportFile{}, err
+	}
+	if *dir == "" {
+		return bunshin.DriverLossReportFile{}, errors.New("driver directory is required")
+	}
+	return readDriverReport[bunshin.DriverLossReportFile](*dir, func(layout bunshin.DriverDirectoryLayout) string {
+		return layout.LossReportFile
+	})
+}
+
+func streamsDriver(args []string) (bunshin.DriverSnapshot, error) {
+	flags := flag.NewFlagSet("streams", flag.ExitOnError)
+	dir := flags.String("dir", "", "driver directory")
+	timeout := flags.Duration("timeout", 5*time.Second, "snapshot timeout")
+	if err := flags.Parse(args); err != nil {
+		return bunshin.DriverSnapshot{}, err
+	}
+	if *dir == "" {
+		return bunshin.DriverSnapshot{}, errors.New("driver directory is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	event, err := sendDriverIPCCommand(ctx, *dir, bunshin.DriverIPCCommand{
+		Type: bunshin.DriverIPCCommandSnapshot,
+	})
+	if err != nil {
+		return bunshin.DriverSnapshot{}, err
+	}
+	if event.Snapshot == nil {
+		return bunshin.DriverSnapshot{}, errors.New("driver returned no snapshot")
+	}
+	return *event.Snapshot, nil
+}
+
+func flushDriver(args []string) (bunshin.DriverDirectoryReport, error) {
+	flags := flag.NewFlagSet("flush", flag.ExitOnError)
+	dir := flags.String("dir", "", "driver directory")
+	timeout := flags.Duration("timeout", 5*time.Second, "flush timeout")
+	if err := flags.Parse(args); err != nil {
+		return bunshin.DriverDirectoryReport{}, err
+	}
+	if *dir == "" {
+		return bunshin.DriverDirectoryReport{}, errors.New("driver directory is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	event, err := sendDriverIPCCommand(ctx, *dir, bunshin.DriverIPCCommand{
+		Type: bunshin.DriverIPCCommandFlushReports,
+	})
+	if err != nil {
+		return bunshin.DriverDirectoryReport{}, err
+	}
+	if event.Directory == nil {
+		return bunshin.DriverDirectoryReport{}, errors.New("driver returned no directory report")
+	}
+	return *event.Directory, nil
+}
+
 func terminateDriver(args []string) (bunshin.DriverIPCEvent, error) {
 	flags := flag.NewFlagSet("terminate", flag.ExitOnError)
 	dir := flags.String("dir", "", "driver directory")
@@ -115,8 +218,78 @@ func terminateDriver(args []string) (bunshin.DriverIPCEvent, error) {
 	return bunshin.TerminateDriverProcess(ctx, *dir)
 }
 
+func readDriverReport[T any](dir string, path func(bunshin.DriverDirectoryLayout) string) (T, error) {
+	var zero T
+	layout, err := bunshin.ResolveDriverDirectoryLayout(dir)
+	if err != nil {
+		return zero, err
+	}
+	data, err := os.ReadFile(path(layout))
+	if err != nil {
+		return zero, err
+	}
+	var report T
+	if err := json.Unmarshal(data, &report); err != nil {
+		return zero, err
+	}
+	return report, nil
+}
+
+func sendDriverIPCCommand(ctx context.Context, dir string, command bunshin.DriverIPCCommand) (bunshin.DriverIPCEvent, error) {
+	ipc, err := bunshin.OpenDriverIPC(bunshin.DriverIPCConfig{
+		Directory: dir,
+	})
+	if err != nil {
+		return bunshin.DriverIPCEvent{}, err
+	}
+	defer ipc.Close()
+
+	correlationID, err := ipc.SendCommand(ctx, command, nil)
+	if err != nil {
+		return bunshin.DriverIPCEvent{}, err
+	}
+	idle := bunshin.NewDefaultBackoffIdleStrategy()
+	for {
+		select {
+		case <-ctx.Done():
+			return bunshin.DriverIPCEvent{}, ctx.Err()
+		default:
+		}
+		var matched bunshin.DriverIPCEvent
+		polled, err := ipc.PollEvents(1, func(event bunshin.DriverIPCEvent) error {
+			if event.CorrelationID == correlationID {
+				matched = event
+			}
+			return nil
+		})
+		if err != nil {
+			if !errors.Is(err, bunshin.ErrIPCRingEmpty) {
+				return bunshin.DriverIPCEvent{}, err
+			}
+			idle.Idle(0)
+			continue
+		}
+		if matched.Type != "" {
+			if matched.Type == bunshin.DriverIPCEventCommandError {
+				return bunshin.DriverIPCEvent{}, errors.New(matched.Error)
+			}
+			return matched, nil
+		}
+		if polled > 0 {
+			idle.Reset()
+			continue
+		}
+		idle.Idle(0)
+	}
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: bunshin-driver run -dir PATH [options]")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver status -dir PATH [options]")
+	fmt.Fprintln(os.Stderr, "       bunshin-driver counters -dir PATH")
+	fmt.Fprintln(os.Stderr, "       bunshin-driver errors -dir PATH")
+	fmt.Fprintln(os.Stderr, "       bunshin-driver loss -dir PATH")
+	fmt.Fprintln(os.Stderr, "       bunshin-driver streams -dir PATH [options]")
+	fmt.Fprintln(os.Stderr, "       bunshin-driver flush -dir PATH [options]")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver terminate -dir PATH [options]")
 }

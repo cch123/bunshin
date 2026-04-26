@@ -5,6 +5,7 @@ package bunshin
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -167,6 +168,68 @@ func TestIPCRingSharedMapping(t *testing.T) {
 	}
 	if snapshot.Used != 0 || snapshot.ReadPosition != snapshot.WritePosition {
 		t.Fatalf("writer did not observe reader progress: %#v", snapshot)
+	}
+}
+
+func TestIPCRingSharedMappingCorruptionAndResetRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ipc.ring")
+	writer, err := OpenIPCRing(IPCRingConfig{
+		Path:     path,
+		Capacity: 256,
+		Reset:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenIPCRing(IPCRingConfig{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writer.mu.Lock()
+	read := writer.readPositionLocked()
+	binary.LittleEndian.PutUint64(writer.data[ipcRingWriteOffset:], read+uint64(writer.capacity)+1)
+	writer.mu.Unlock()
+
+	if _, err := reader.Snapshot(); !errors.Is(err, ErrIPCRingCorrupt) {
+		t.Fatalf("Snapshot() err = %v, want %v", err, ErrIPCRingCorrupt)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recoveredWriter, err := OpenIPCRing(IPCRingConfig{
+		Path:     path,
+		Capacity: 256,
+		Reset:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredWriter.Close()
+	recoveredReader, err := OpenIPCRing(IPCRingConfig{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredReader.Close()
+
+	if err := recoveredWriter.Offer([]byte("recovered")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := recoveredReader.Poll(func(payload []byte) error {
+		if string(payload) != "recovered" {
+			t.Fatalf("payload = %q, want recovered", payload)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("Poll() n = %d, want 1", n)
 	}
 }
 

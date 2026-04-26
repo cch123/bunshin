@@ -7,9 +7,17 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 var ErrArchiveReplicationActiveRecording = errors.New("bunshin archive replication: recording is active")
+
+var archiveCopyBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 32*1024)
+		return &buffer
+	},
+}
 
 type ArchiveReplicationConfig struct {
 	RecordingID int64
@@ -185,7 +193,10 @@ func copyArchiveFile(ctx context.Context, src, dst string) (int64, error) {
 }
 
 func copyArchiveFileWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
-	buf := make([]byte, 32*1024)
+	bufp := archiveCopyBufferPool.Get().(*[]byte)
+	defer archiveCopyBufferPool.Put(bufp)
+
+	buf := *bufp
 	var written int64
 	for {
 		if err := ctx.Err(); err != nil {

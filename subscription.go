@@ -22,29 +22,38 @@ import (
 const quicALPN = "bunshin/4"
 
 type Message struct {
-	StreamID      uint32
-	SessionID     uint32
-	TermID        int32
-	TermOffset    int32
-	Sequence      uint64
-	ReservedValue uint64
-	Payload       []byte
-	Remote        net.Addr
+	StreamID        uint32
+	SessionID       uint32
+	TermID          int32
+	TermOffset      int32
+	Position        int64
+	Sequence        uint64
+	ReservedValue   uint64
+	Payload         []byte
+	Remote          net.Addr
+	ResponseChannel ResponseChannel
+	Image           *Image
 }
 
 type Handler func(context.Context, Message) error
 
 type SubscriptionConfig struct {
-	Transport           TransportMode
-	StreamID            uint32
-	LocalAddr           string
-	TLSConfig           *tls.Config
-	QUICConfig          *quic.Config
-	Metrics             *Metrics
-	Logger              Logger
-	LossHandler         LossHandler
-	Archive             *Archive
-	ReceiverWindowBytes int
+	Transport             TransportMode
+	StreamID              uint32
+	LocalAddr             string
+	TLSConfig             *tls.Config
+	QUICConfig            *quic.Config
+	Metrics               *Metrics
+	Logger                Logger
+	LossHandler           LossHandler
+	AvailableImage        ImageHandler
+	UnavailableImage      ImageHandler
+	UDPMulticastInterface string
+	LocalSpy              bool
+	LocalSpyBuffer        int
+	Archive               *Archive
+	ReceiverWindowBytes   int
+	TermBufferLength      int
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, LocalAddr is ignored and the caller owns closing it.
 	PacketConn net.PacketConn
@@ -55,23 +64,36 @@ type SubscriptionConfig struct {
 }
 
 type Subscription struct {
-	transportMode  TransportMode
-	listener       *quic.Listener
-	udpConn        net.PacketConn
-	udpOwnConn     bool
-	udpMu          sync.Mutex
-	udpFragments   map[udpFragmentKey]*udpFragmentSet
-	udpPeers       map[string]struct{}
-	transport      *quic.Transport
-	metrics        *Metrics
-	logger         Logger
-	loss           *lossDetector
-	archive        *Archive
-	ordered        *orderedDelivery
-	streamID       uint32
-	receiverWindow int
-	closed         chan struct{}
-	closeOnce      sync.Once
+	transportMode            TransportMode
+	listener                 *quic.Listener
+	udpConn                  net.PacketConn
+	udpOwnConn               bool
+	udpMu                    sync.Mutex
+	udpFragments             map[udpFragmentKey]*udpFragmentSet
+	udpPeers                 map[string]struct{}
+	localSpy                 bool
+	localSpyID               uint64
+	localSpyKey              localSpyKey
+	localSpyCh               chan Message
+	localSpyAddr             net.Addr
+	pollMu                   sync.Mutex
+	pollConn                 *quic.Conn
+	imagesMu                 sync.Mutex
+	images                   map[lossKey]*Image
+	transport                *quic.Transport
+	metrics                  *Metrics
+	logger                   Logger
+	loss                     *lossDetector
+	availableImage           ImageHandler
+	unavailableImage         ImageHandler
+	archive                  *Archive
+	ordered                  *orderedDelivery
+	streamID                 uint32
+	receiverWindow           int
+	imageTermLength          int
+	imagePositionBitsToShift uint
+	closed                   chan struct{}
+	closeOnce                sync.Once
 }
 
 func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
@@ -80,8 +102,37 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 		return nil, err
 	}
 
+	if cfg.LocalSpy {
+		sub := &Subscription{
+			transportMode:            cfg.Transport,
+			localSpy:                 true,
+			localSpyKey:              newLocalSpyKey(cfg.Transport, cfg.StreamID, cfg.LocalAddr),
+			localSpyCh:               make(chan Message, cfg.LocalSpyBuffer),
+			localSpyAddr:             localSpyAddr(cfg.LocalAddr),
+			metrics:                  cfg.Metrics,
+			logger:                   cfg.Logger,
+			loss:                     newLossDetector(cfg.Metrics, cfg.LossHandler),
+			availableImage:           cfg.AvailableImage,
+			unavailableImage:         cfg.UnavailableImage,
+			archive:                  cfg.Archive,
+			streamID:                 cfg.StreamID,
+			receiverWindow:           cfg.ReceiverWindowBytes,
+			imageTermLength:          cfg.TermBufferLength,
+			imagePositionBitsToShift: termPositionBitsToShift(cfg.TermBufferLength),
+			closed:                   make(chan struct{}),
+		}
+		sub.ordered = newOrderedDelivery(sub)
+		registerLocalSpy(sub)
+		sub.log(context.Background(), LogLevelInfo, "listen", "local spy subscription listening", map[string]any{
+			"transport":  cfg.Transport,
+			"local_addr": cfg.LocalAddr,
+			"stream_id":  sub.streamID,
+		}, nil)
+		return sub, nil
+	}
+
 	if cfg.Transport == TransportUDP {
-		conn, err := listenUDPSubscription(cfg.LocalAddr, cfg.PacketConn)
+		conn, err := listenUDPSubscription(cfg.LocalAddr, cfg.UDPMulticastInterface, cfg.PacketConn)
 		if err != nil {
 			logEvent(context.Background(), cfg.Logger, LogEvent{
 				Level:     LogLevelError,
@@ -97,18 +148,22 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 			return nil, fmt.Errorf("listen udp subscription: %w", err)
 		}
 		sub := &Subscription{
-			transportMode:  cfg.Transport,
-			udpConn:        conn,
-			udpOwnConn:     cfg.PacketConn == nil,
-			udpFragments:   make(map[udpFragmentKey]*udpFragmentSet),
-			udpPeers:       make(map[string]struct{}),
-			metrics:        cfg.Metrics,
-			logger:         cfg.Logger,
-			loss:           newLossDetector(cfg.Metrics, cfg.LossHandler),
-			archive:        cfg.Archive,
-			streamID:       cfg.StreamID,
-			receiverWindow: cfg.ReceiverWindowBytes,
-			closed:         make(chan struct{}),
+			transportMode:            cfg.Transport,
+			udpConn:                  conn,
+			udpOwnConn:               cfg.PacketConn == nil,
+			udpFragments:             make(map[udpFragmentKey]*udpFragmentSet),
+			udpPeers:                 make(map[string]struct{}),
+			metrics:                  cfg.Metrics,
+			logger:                   cfg.Logger,
+			loss:                     newLossDetector(cfg.Metrics, cfg.LossHandler),
+			availableImage:           cfg.AvailableImage,
+			unavailableImage:         cfg.UnavailableImage,
+			archive:                  cfg.Archive,
+			streamID:                 cfg.StreamID,
+			receiverWindow:           cfg.ReceiverWindowBytes,
+			imageTermLength:          cfg.TermBufferLength,
+			imagePositionBitsToShift: termPositionBitsToShift(cfg.TermBufferLength),
+			closed:                   make(chan struct{}),
 		}
 		sub.ordered = newOrderedDelivery(sub)
 		sub.log(context.Background(), LogLevelInfo, "listen", "udp subscription listening", map[string]any{
@@ -135,16 +190,20 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 	}
 
 	sub := &Subscription{
-		transportMode:  cfg.Transport,
-		listener:       listener,
-		transport:      transport,
-		metrics:        cfg.Metrics,
-		logger:         cfg.Logger,
-		loss:           newLossDetector(cfg.Metrics, cfg.LossHandler),
-		archive:        cfg.Archive,
-		streamID:       cfg.StreamID,
-		receiverWindow: cfg.ReceiverWindowBytes,
-		closed:         make(chan struct{}),
+		transportMode:            cfg.Transport,
+		listener:                 listener,
+		transport:                transport,
+		metrics:                  cfg.Metrics,
+		logger:                   cfg.Logger,
+		loss:                     newLossDetector(cfg.Metrics, cfg.LossHandler),
+		availableImage:           cfg.AvailableImage,
+		unavailableImage:         cfg.UnavailableImage,
+		archive:                  cfg.Archive,
+		streamID:                 cfg.StreamID,
+		receiverWindow:           cfg.ReceiverWindowBytes,
+		imageTermLength:          cfg.TermBufferLength,
+		imagePositionBitsToShift: termPositionBitsToShift(cfg.TermBufferLength),
+		closed:                   make(chan struct{}),
 	}
 	sub.ordered = newOrderedDelivery(sub)
 	sub.log(context.Background(), LogLevelInfo, "listen", "subscription listening", map[string]any{
@@ -155,6 +214,9 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 }
 
 func (s *Subscription) Serve(ctx context.Context, handler Handler) error {
+	if s != nil && s.localSpy {
+		return s.serveLocalSpy(ctx, handler)
+	}
 	if s != nil && s.transportMode == TransportUDP {
 		return s.serveUDP(ctx, handler)
 	}
@@ -213,10 +275,30 @@ func (s *Subscription) Serve(ctx context.Context, handler Handler) error {
 }
 
 func (s *Subscription) LocalAddr() net.Addr {
+	if s.localSpy {
+		return s.localSpyAddr
+	}
 	if s.udpConn != nil {
 		return s.udpConn.LocalAddr()
 	}
 	return s.listener.Addr()
+}
+
+func (s *Subscription) ChannelURI() ChannelURI {
+	if s == nil {
+		return ChannelURI{}
+	}
+	if s.localSpy {
+		return ChannelURI{
+			Transport: s.transportMode,
+			Endpoint:  s.localSpyKey.endpoint,
+			Spy:       true,
+		}
+	}
+	return ChannelURI{
+		Transport: s.transportMode,
+		Endpoint:  s.LocalAddr().String(),
+	}
 }
 
 func (s *Subscription) LossReports() []LossReport {
@@ -227,7 +309,9 @@ func (s *Subscription) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		if s.udpConn != nil {
+		if s.localSpy {
+			unregisterLocalSpy(s)
+		} else if s.udpConn != nil {
 			if s.udpOwnConn {
 				err = s.udpConn.Close()
 			} else {
@@ -236,11 +320,19 @@ func (s *Subscription) Close() error {
 		} else {
 			err = s.listener.Close()
 		}
+		s.pollMu.Lock()
+		pollConn := s.pollConn
+		s.pollConn = nil
+		s.pollMu.Unlock()
+		if pollConn != nil {
+			err = errors.Join(err, pollConn.CloseWithError(0, "closed"))
+		}
 		if s.transport != nil {
 			if transportErr := s.transport.Close(); err == nil {
 				err = transportErr
 			}
 		}
+		s.closeImages(context.Background())
 		s.log(context.Background(), LogLevelInfo, "close", "subscription closed", map[string]any{
 			"stream_id": s.streamID,
 		}, err)
@@ -268,7 +360,7 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 		return
 	}
 
-	frames, err := decodeFrames(buf)
+	frames, err := decodeFramesView(buf)
 	if err != nil {
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
@@ -307,14 +399,18 @@ func (s *Subscription) serveStream(ctx context.Context, remote net.Addr, stream 
 }
 
 func (s *Subscription) data(ctx context.Context, remote net.Addr, stream *quic.Stream, frames []frame, handler Handler) {
-	payload, ackFrame, err := reassembleDataFrames(frames)
+	_, _ = s.deliverQUICData(ctx, remote, stream, frames, handler)
+}
+
+func (s *Subscription) deliverQUICData(ctx context.Context, remote net.Addr, stream *quic.Stream, frames []frame, handler Handler) (bool, error) {
+	payload, responseChannel, ackFrame, err := reassembleDataFrames(frames)
 	if err != nil {
 		s.metrics.incReceiveErrors()
 		s.metrics.incProtocolErrors()
 		s.metrics.incFramesDropped(len(frames))
 		first := frames[0]
 		_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorMalformedFrame, err.Error())
-		return
+		return false, err
 	}
 	first := frames[0]
 	if first.streamID != s.streamID {
@@ -322,23 +418,28 @@ func (s *Subscription) data(ctx context.Context, remote net.Addr, stream *quic.S
 		s.metrics.incProtocolErrors()
 		s.metrics.incFramesDropped(len(frames))
 		_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorUnsupportedType, "unsupported stream id")
-		return
+		return false, &ProtocolError{Code: uint16(protocolErrorUnsupportedType), Message: "unsupported stream id"}
 	}
 
 	s.loss.observe(first, remote)
 	msg := Message{
-		StreamID:      first.streamID,
-		SessionID:     first.sessionID,
-		TermID:        first.termID,
-		TermOffset:    first.termOffset,
-		Sequence:      first.seq,
-		ReservedValue: first.reserved,
-		Payload:       payload,
-		Remote:        remote,
+		StreamID:        first.streamID,
+		SessionID:       first.sessionID,
+		TermID:          first.termID,
+		TermOffset:      first.termOffset,
+		Sequence:        first.seq,
+		ReservedValue:   first.reserved,
+		Payload:         payload,
+		Remote:          remote,
+		ResponseChannel: responseChannel,
 	}
+	positionTermID, positionTermOffset, hasFramePosition := framePosition(ackFrame)
 	if err := s.ordered.deliver(ctx, orderedMessage{
-		ctx: ctx,
-		msg: msg,
+		ctx:                ctx,
+		msg:                msg,
+		positionTermID:     positionTermID,
+		positionTermOffset: positionTermOffset,
+		hasFramePosition:   hasFramePosition,
 		ack: func() error {
 			return s.ack(stream, ackFrame)
 		},
@@ -347,12 +448,18 @@ func (s *Subscription) data(ctx context.Context, remote net.Addr, stream *quic.S
 		},
 	}, handler); err != nil {
 		s.metrics.incReceiveErrors()
-		return
+		return false, err
 	}
+	return true, nil
 }
 
 func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, handler Handler) error {
 	msg := item.msg
+	msg.Image = s.imageForMessage(ctx, msg)
+	msg.Position = s.messagePosition(msg.Image, item)
+	if msg.Image != nil {
+		msg.Image.observe(msg.Position, msg.Sequence)
+	}
 	if s.archive != nil {
 		record, err := s.archive.Record(msg)
 		if err != nil {
@@ -389,6 +496,9 @@ func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, h
 		return err
 	}
 	s.metrics.incMessagesReceived(len(msg.Payload))
+	if msg.Image != nil {
+		msg.Image.update(msg.Position, msg.Sequence)
+	}
 	if item.ack == nil {
 		return nil
 	}
@@ -411,49 +521,75 @@ func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, h
 	return nil
 }
 
-func reassembleDataFrames(frames []frame) ([]byte, frame, error) {
+func (s *Subscription) messagePosition(image *Image, item orderedMessage) int64 {
+	if item.hasFramePosition && image != nil {
+		return computeTermPosition(item.positionTermID, item.positionTermOffset, s.imagePositionBitsToShift, image.InitialTermID)
+	}
+	if item.position > 0 {
+		return item.position
+	}
+	return s.imageJoinPosition(item.msg)
+}
+
+func reassembleDataFrames(frames []frame) ([]byte, ResponseChannel, frame, error) {
 	if len(frames) == 0 {
-		return nil, frame{}, errors.New("empty data frame stream")
+		return nil, ResponseChannel{}, frame{}, errors.New("empty data frame stream")
 	}
 	first := frames[0]
 	if len(frames) == 1 {
 		if first.typ != frameData {
-			return nil, frame{}, errors.New("non-data frame in data stream")
+			return nil, ResponseChannel{}, frame{}, errors.New("non-data frame in data stream")
 		}
 		if first.fragmentCount > 1 {
-			return nil, frame{}, errors.New("incomplete fragmented data stream")
+			return nil, ResponseChannel{}, frame{}, errors.New("incomplete fragmented data stream")
 		}
-		return first.payload, first, nil
+		responseChannel, payload, err := decodeDataPayload(first)
+		if err != nil {
+			return nil, ResponseChannel{}, frame{}, err
+		}
+		return payload, responseChannel, first, nil
 	}
 
 	fragmentCount := int(first.fragmentCount)
 	if fragmentCount != len(frames) || fragmentCount < 2 {
-		return nil, frame{}, fmt.Errorf("invalid fragment count: got %d frames, header count %d", len(frames), first.fragmentCount)
+		return nil, ResponseChannel{}, frame{}, fmt.Errorf("invalid fragment count: got %d frames, header count %d", len(frames), first.fragmentCount)
 	}
 	parts := make([][]byte, fragmentCount)
 	seen := make([]bool, fragmentCount)
 	total := 0
 	ackFrame := first
+	var responseChannel ResponseChannel
 
 	for _, f := range frames {
 		if f.typ != frameData {
-			return nil, frame{}, errors.New("non-data frame in fragmented data stream")
+			return nil, ResponseChannel{}, frame{}, errors.New("non-data frame in fragmented data stream")
 		}
 		if f.streamID != first.streamID || f.sessionID != first.sessionID || f.seq != first.seq || f.reserved != first.reserved {
-			return nil, frame{}, errors.New("fragment metadata mismatch")
+			return nil, ResponseChannel{}, frame{}, errors.New("fragment metadata mismatch")
 		}
 		if f.flags&frameFlagFragment == 0 {
-			return nil, frame{}, errors.New("fragment flag missing")
+			return nil, ResponseChannel{}, frame{}, errors.New("fragment flag missing")
 		}
 		if int(f.fragmentCount) != fragmentCount || int(f.fragmentIndex) >= fragmentCount {
-			return nil, frame{}, errors.New("invalid fragment metadata")
+			return nil, ResponseChannel{}, frame{}, errors.New("invalid fragment metadata")
 		}
 		if seen[f.fragmentIndex] {
-			return nil, frame{}, errors.New("duplicate fragment")
+			return nil, ResponseChannel{}, frame{}, errors.New("duplicate fragment")
 		}
 		seen[f.fragmentIndex] = true
-		parts[f.fragmentIndex] = f.payload
-		total += len(f.payload)
+		fragmentPayload := f.payload
+		if f.flags&frameFlagResponseChannel != 0 {
+			if f.fragmentIndex != 0 {
+				return nil, ResponseChannel{}, frame{}, errors.New("response channel flag on non-initial fragment")
+			}
+			var err error
+			responseChannel, fragmentPayload, err = decodeDataPayload(f)
+			if err != nil {
+				return nil, ResponseChannel{}, frame{}, err
+			}
+		}
+		parts[f.fragmentIndex] = fragmentPayload
+		total += len(fragmentPayload)
 		if int(f.fragmentIndex) == fragmentCount-1 {
 			ackFrame = f
 		}
@@ -462,11 +598,11 @@ func reassembleDataFrames(frames []frame) ([]byte, frame, error) {
 	payload := make([]byte, 0, total)
 	for i, part := range parts {
 		if !seen[i] {
-			return nil, frame{}, errors.New("missing fragment")
+			return nil, ResponseChannel{}, frame{}, errors.New("missing fragment")
 		}
 		payload = append(payload, part...)
 	}
-	return payload, ackFrame, nil
+	return payload, responseChannel, ackFrame, nil
 }
 
 func (s *Subscription) hello(stream *quic.Stream, f frame) error {

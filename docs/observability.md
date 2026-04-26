@@ -38,6 +38,16 @@ snapshot := metrics.Snapshot()
 fmt.Println(snapshot.MessagesSent, snapshot.MessagesReceived)
 ```
 
+For tooling, read the same metrics as a stable counter list:
+
+```go
+for _, counter := range metrics.CounterSnapshots() {
+    fmt.Println(counter.TypeID, counter.Name, counter.Label, counter.Value)
+}
+```
+
+Counter type IDs are stable and new counters are appended with new IDs. RTT duration counters are exposed in nanoseconds in this list.
+
 Counters currently include connections opened/accepted, messages and bytes sent/received, application-level frames sent/received/dropped, application-level retransmits, ACKs, publication back-pressure events, sequence-gap observations, missing sequence counts, send/receive errors, protocol errors, and UDP RTT summaries.
 
 `FramesSent` and `FramesReceived` count Bunshin protocol frames such as HELLO, DATA, ACK, ERROR, STATUS, and NAK across QUIC and UDP. `FramesDropped` counts valid or attempted Bunshin frames that are suppressed locally, such as duplicates or malformed/unsupported input. QUIC packet drops and QUIC retransmissions remain transport-level details exposed through qlog; Bunshin's `Retransmits` counter records Bunshin-managed retransmission paths such as UDP NAK repair.
@@ -53,6 +63,28 @@ for _, report := range sub.LossReports() {
 ```
 
 These reports mirror the diagnostic intent of Aeron's LossStat (https://aeron.io/docs/aeron/aeron-tooling/#loss-stat), but they are based on Bunshin publisher sequence gaps rather than media-driver packet loss.
+
+Subscriptions expose image snapshots for stream/session/source status:
+
+```go
+for _, image := range sub.Images() {
+    fmt.Println(image.StreamID, image.SessionID, image.Source, image.CurrentPosition)
+}
+```
+
+`Subscription.LagReports` returns the same source/session view focused on receiver lag. `ObservedPosition` advances when a message is being handled, and `CurrentPosition` advances after successful handler completion. `LagBytes` is the positive difference between those positions:
+
+```go
+for _, lag := range sub.LagReports() {
+    fmt.Println(lag.StreamID, lag.SessionID, lag.Source, lag.LagBytes)
+}
+```
+
+The embeddable media driver includes the same image state in `MediaDriver.Snapshot().Images`, along with the owning client and subscription resource IDs.
+
+`MediaDriver.Snapshot().StatusCounters` reports current active clients, channel endpoints, publication endpoints, subscription endpoints, publications, subscriptions, images, unavailable images, and lagging images. `MediaDriver.Snapshot().CounterSnapshots` combines those status counters, driver lifecycle counters, and the configured transport/application `Metrics` counters into one client-readable list. The driver directory writes the same list to `reports/counters.json` under `counter_snapshots`.
+
+Driver counters also include duty-cycle count, cumulative duty-cycle nanoseconds, max duty-cycle nanoseconds, stall count, cumulative stall nanoseconds, and max stall nanoseconds. `DriverConfig.StallThreshold` controls stall classification.
 
 ## Structured Logging
 
@@ -93,3 +125,13 @@ QLOGDIR=/tmp/bunshin-qlog go test ./...
 ```
 
 The helper clones the supplied `quic.Config` before setting `Tracer`, so callers can reuse their base config safely.
+
+## pprof And expvar
+
+The optional example in `examples/observability_pprof_expvar` exposes Bunshin metrics through `expvar` and enables the standard library pprof handlers:
+
+```sh
+go run ./examples/observability_pprof_expvar
+```
+
+Open `http://127.0.0.1:6060/debug/vars` for counters or `http://127.0.0.1:6060/debug/pprof/` for runtime profiles.

@@ -3,6 +3,8 @@ package bunshin
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -80,6 +82,23 @@ func TestMediaDriverManagesPublicationSubscription(t *testing.T) {
 	if snapshot.Counters.ClientsRegistered != 1 || snapshot.Counters.PublicationsRegistered != 1 || snapshot.Counters.SubscriptionsRegistered != 1 {
 		t.Fatalf("unexpected counters: %#v", snapshot.Counters)
 	}
+	if snapshot.StatusCounters.ActiveClients != 1 || snapshot.StatusCounters.ActivePublications != 1 ||
+		snapshot.StatusCounters.ActiveSubscriptions != 1 || snapshot.StatusCounters.Images != 1 ||
+		snapshot.StatusCounters.AvailableImages != 1 || snapshot.StatusCounters.ChannelEndpoints != 1 {
+		t.Fatalf("unexpected status counters: %#v", snapshot.StatusCounters)
+	}
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverActivePublications, CounterScopeDriver, "driver_active_publications", 1)
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverActiveSubscriptions, CounterScopeDriver, "driver_active_subscriptions", 1)
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverAvailableImages, CounterScopeDriver, "driver_available_images", 1)
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterMetricsMessagesSent, CounterScopeMetrics, "messages_sent", 1)
+	if len(snapshot.Images) != 1 || snapshot.Images[0].ResourceID != sub.ID() ||
+		snapshot.Images[0].StreamID != 120 || snapshot.Images[0].SessionID != 220 ||
+		snapshot.Images[0].CurrentPosition <= snapshot.Images[0].JoinPosition ||
+		snapshot.Images[0].ObservedPosition != snapshot.Images[0].CurrentPosition ||
+		snapshot.Images[0].LagBytes != 0 ||
+		snapshot.Images[0].LastSequence != 1 || snapshot.Images[0].LastObservedSequence != 1 {
+		t.Fatalf("unexpected image snapshots: %#v", snapshot.Images)
+	}
 	if metrics.Snapshot().MessagesSent != 1 {
 		t.Fatalf("driver metrics were not inherited: %#v", metrics.Snapshot())
 	}
@@ -88,6 +107,82 @@ func TestMediaDriverManagesPublicationSubscription(t *testing.T) {
 		driverEventKey("publication", "publication registered"),
 		driverEventKey("subscription", "subscription registered"),
 	)
+}
+
+func TestMediaDriverCreatesMmapTermBuffers(t *testing.T) {
+	driver, err := StartMediaDriver(DriverConfig{
+		Directory: filepath.Join(t.TempDir(), "driver"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	client, err := driver.NewClient(ctx, "mmap-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close(ctx)
+
+	sub, err := client.AddSubscription(ctx, SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  129,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan struct{}, 1)
+	go func() {
+		_ = sub.Serve(ctx, func(context.Context, Message) error {
+			received <- struct{}{}
+			return nil
+		})
+	}()
+	pub, err := client.AddPublication(ctx, PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   129,
+		SessionID:  229,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Send(ctx, []byte("mmap-term-buffer")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-received:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	snapshot, err := driver.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Publications) != 1 || !snapshot.Publications[0].TermBufferMapped ||
+		len(snapshot.Publications[0].TermBufferFiles) != termPartitionCount {
+		t.Fatalf("unexpected mapped publication snapshot: %#v", snapshot.Publications)
+	}
+	for _, path := range snapshot.Publications[0].TermBufferFiles {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() != minTermLength {
+			t.Fatalf("term buffer %s size = %d, want %d", path, info.Size(), minTermLength)
+		}
+	}
+	data, err := os.ReadFile(snapshot.Publications[0].TermBufferFiles[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < len(frameMagic) || string(data[:len(frameMagic)]) != frameMagic {
+		t.Fatalf("mapped term buffer does not contain a data frame header: %x", data[:min(len(data), headerLen)])
+	}
 }
 
 func TestMediaDriverClientCloseClosesResources(t *testing.T) {
@@ -209,6 +304,37 @@ func TestMediaDriverHeartbeatKeepsClientActive(t *testing.T) {
 	if len(snapshot.Clients) != 1 {
 		t.Fatalf("client was cleaned up too early: %#v", snapshot)
 	}
+}
+
+func TestMediaDriverDutyCycleAndStallCounters(t *testing.T) {
+	driver, err := StartMediaDriver(DriverConfig{
+		StallThreshold: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := driver.dispatch(ctx, func(*driverState) (any, error) {
+		time.Sleep(time.Millisecond)
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := driver.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Counters.DutyCycles == 0 || snapshot.Counters.DutyCycleNanos == 0 ||
+		snapshot.Counters.DutyCycleMaxNanos == 0 || snapshot.Counters.Stalls == 0 ||
+		snapshot.Counters.StallNanos == 0 || snapshot.Counters.StallMaxNanos == 0 {
+		t.Fatalf("unexpected duty-cycle counters: %#v", snapshot.Counters)
+	}
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverDutyCycles, CounterScopeDriver, "driver_duty_cycles", snapshot.Counters.DutyCycles)
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverStalls, CounterScopeDriver, "driver_stalls", snapshot.Counters.Stalls)
 }
 
 func TestMediaDriverRejectsCommandsAfterClose(t *testing.T) {

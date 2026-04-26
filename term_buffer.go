@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -34,6 +36,9 @@ type termLog struct {
 	initialTermID       int32
 	activeTermCount     int64
 	terms               [termPartitionCount]termBuffer
+	files               []*os.File
+	paths               []string
+	mapped              bool
 }
 
 type termBuffer struct {
@@ -41,6 +46,7 @@ type termBuffer struct {
 	tail   int
 	state  termState
 	data   []byte
+	path   string
 }
 
 type termAppend struct {
@@ -62,7 +68,7 @@ func newTermLog(termLength int, initialTermID int32) (*termLog, error) {
 
 	l := &termLog{
 		termLength:          termLength,
-		positionBitsToShift: uint(bits.TrailingZeros(uint(termLength))),
+		positionBitsToShift: termPositionBitsToShift(termLength),
 		initialTermID:       initialTermID,
 	}
 	for i := range l.terms {
@@ -70,6 +76,54 @@ func newTermLog(termLength int, initialTermID int32) (*termLog, error) {
 			termID: initialTermID + int32(i),
 			state:  termClean,
 			data:   make([]byte, termLength),
+		}
+	}
+	l.terms[0].state = termActive
+	return l, nil
+}
+
+func newMappedTermLog(termLength int, initialTermID int32, directory string) (*termLog, error) {
+	if directory == "" {
+		return newTermLog(termLength, initialTermID)
+	}
+	if err := validateTermLength(termLength); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return nil, fmt.Errorf("create term buffer directory: %w", err)
+	}
+
+	l := &termLog{
+		termLength:          termLength,
+		positionBitsToShift: termPositionBitsToShift(termLength),
+		initialTermID:       initialTermID,
+		files:               make([]*os.File, 0, termPartitionCount),
+		paths:               make([]string, 0, termPartitionCount),
+		mapped:              true,
+	}
+	for i := range l.terms {
+		path := filepath.Join(directory, fmt.Sprintf("term-%d.buf", i))
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o666)
+		if err != nil {
+			_ = l.close()
+			return nil, fmt.Errorf("open term buffer file: %w", err)
+		}
+		l.files = append(l.files, file)
+		l.paths = append(l.paths, path)
+		if err := file.Truncate(int64(termLength)); err != nil {
+			_ = l.close()
+			return nil, fmt.Errorf("truncate term buffer file: %w", err)
+		}
+		data, err := mmapFile(file, termLength)
+		if err != nil {
+			_ = l.close()
+			return nil, fmt.Errorf("mmap term buffer file: %w", err)
+		}
+		l.terms[i] = termBuffer{
+			termID: initialTermID + int32(i),
+			state:  termClean,
+			data:   data,
+			path:   path,
 		}
 	}
 	l.terms[0].state = termActive
@@ -148,6 +202,42 @@ func (a termAppend) Bytes() []byte {
 	return a.buffer
 }
 
+func (l *termLog) close() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var err error
+	for i := range l.terms {
+		if l.mapped && l.terms[i].data != nil {
+			err = errors.Join(err, munmapFile(l.terms[i].data))
+		}
+		l.terms[i].data = nil
+	}
+	for _, file := range l.files {
+		if file != nil {
+			err = errors.Join(err, file.Close())
+		}
+	}
+	l.files = nil
+	return err
+}
+
+func (l *termLog) mappedFiles() []string {
+	if l == nil || !l.mapped {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.paths...)
+}
+
+func (l *termLog) isMapped() bool {
+	return l != nil && l.mapped
+}
+
 func (l *termLog) position(termID, termOffset int32) (int64, error) {
 	if termOffset < 0 || int(termOffset) > l.termLength {
 		return 0, fmt.Errorf("invalid term offset: %d", termOffset)
@@ -165,4 +255,8 @@ func align(value, alignment int) int {
 func computeTermPosition(termID int32, termOffset int, positionBitsToShift uint, initialTermID int32) int64 {
 	termCount := int64(termID - initialTermID)
 	return (termCount << positionBitsToShift) + int64(termOffset)
+}
+
+func termPositionBitsToShift(termLength int) uint {
+	return uint(bits.TrailingZeros(uint(termLength)))
 }

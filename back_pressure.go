@@ -68,6 +68,28 @@ func (w *publicationWindow) reserve(ctx context.Context, bytes int, closed <-cha
 	}
 }
 
+func (w *publicationWindow) tryReserve(bytes int, closed <-chan struct{}) error {
+	if bytes <= 0 {
+		return fmt.Errorf("invalid publication window reservation bytes: %d", bytes)
+	}
+	select {
+	case <-closed:
+		return ErrClosed
+	default:
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if bytes > w.limit {
+		return fmt.Errorf("%w: frame requires %d bytes, window has %d", ErrBackPressure, bytes, w.limit)
+	}
+	if w.used+bytes > w.limit {
+		return ErrBackPressure
+	}
+	w.used += bytes
+	return nil
+}
+
 func (w *publicationWindow) release(bytes int) {
 	w.mu.Lock()
 	w.used -= bytes

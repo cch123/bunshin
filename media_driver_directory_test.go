@@ -41,7 +41,8 @@ func TestMediaDriverDirectoryWritesMarkCountersAndReports(t *testing.T) {
 
 	mark := readDriverJSON[DriverMarkFile](t, layout.MarkFile)
 	if mark.Version != driverDirectoryLayoutVersion || mark.Status != DriverDirectoryStatusActive ||
-		mark.PID == 0 || mark.ClientTimeout != time.Second.String() {
+		mark.PID == 0 || mark.ClientTimeout != time.Second.String() ||
+		mark.StallThreshold != defaultDriverStallThreshold.String() {
 		t.Fatalf("unexpected mark file: %#v", mark)
 	}
 
@@ -63,6 +64,14 @@ func TestMediaDriverDirectoryWritesMarkCountersAndReports(t *testing.T) {
 		report.Counters.Clients != 1 {
 		t.Fatalf("unexpected flushed counters: %#v", report.Counters)
 	}
+	if report.Counters.StatusCounters.ActiveClients != 1 || report.Counters.StatusCounters.ActivePublications != 0 ||
+		report.Counters.StatusCounters.ActiveSubscriptions != 0 {
+		t.Fatalf("unexpected status counters: %#v", report.Counters.StatusCounters)
+	}
+	assertCounterSnapshot(t, report.Counters.CounterSnapshots, CounterDriverClientsRegistered, CounterScopeDriver, "driver_clients_registered", 1)
+	assertCounterSnapshot(t, report.Counters.CounterSnapshots, CounterDriverCommandsFailed, CounterScopeDriver, "driver_commands_failed", 1)
+	assertCounterSnapshot(t, report.Counters.CounterSnapshots, CounterDriverActiveClients, CounterScopeDriver, "driver_active_clients", 1)
+	assertCounterSnapshot(t, report.Counters.CounterSnapshots, CounterMetricsMessagesSent, CounterScopeMetrics, "messages_sent", 0)
 	if len(report.Errors.Reports) != 1 || report.Errors.Reports[0].Operation != "command" {
 		t.Fatalf("unexpected error reports: %#v", report.Errors.Reports)
 	}
@@ -72,6 +81,12 @@ func TestMediaDriverDirectoryWritesMarkCountersAndReports(t *testing.T) {
 		counters.Clients != 1 {
 		t.Fatalf("unexpected counters file: %#v", counters)
 	}
+	if counters.StatusCounters.ActiveClients != 1 {
+		t.Fatalf("unexpected counters file status counters: %#v", counters.StatusCounters)
+	}
+	assertCounterSnapshot(t, counters.CounterSnapshots, CounterDriverClientsRegistered, CounterScopeDriver, "driver_clients_registered", 1)
+	assertCounterSnapshot(t, counters.CounterSnapshots, CounterDriverCommandsFailed, CounterScopeDriver, "driver_commands_failed", 1)
+	assertCounterSnapshot(t, counters.CounterSnapshots, CounterDriverActiveClients, CounterScopeDriver, "driver_active_clients", 1)
 	loss := readDriverJSON[DriverLossReportFile](t, layout.LossReportFile)
 	if len(loss.Reports) != 0 {
 		t.Fatalf("unexpected loss reports: %#v", loss.Reports)
