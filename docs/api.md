@@ -11,7 +11,7 @@ The API contract test covers the main exported constructors and config types:
 - IPC ring and driver IPC constructors;
 - archive, archive control, replay merge, and replication entry points;
 - cluster node, learner, replication, election, and backup entry points;
-- idle strategy, flow-control, and channel URI helpers.
+- idle strategy, flow-control, driver threading, and channel URI helpers.
 
 The test also references the exported sentinel errors so accidental renames or removals fail at compile time.
 

@@ -337,6 +337,36 @@ func TestMediaDriverDutyCycleAndStallCounters(t *testing.T) {
 	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverStalls, CounterScopeDriver, "driver_stalls", snapshot.Counters.Stalls)
 }
 
+func TestMediaDriverDedicatedAgentLoops(t *testing.T) {
+	driver, err := StartMediaDriver(DriverConfig{
+		ThreadingMode:        DriverThreadingDedicated,
+		SenderIdleStrategy:   SleepingIdleStrategy{Duration: time.Millisecond},
+		ReceiverIdleStrategy: SleepingIdleStrategy{Duration: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := driver.NewClient(ctx, "agent-client"); err != nil {
+		t.Fatal(err)
+	}
+	waitForDriverSnapshot(t, driver, ctx, func(snapshot DriverSnapshot) bool {
+		return snapshot.Counters.ConductorDutyCycles > 0 &&
+			snapshot.Counters.SenderDutyCycles > 0 &&
+			snapshot.Counters.ReceiverDutyCycles > 0
+	})
+	snapshot, err := driver.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverConductorDutyCycles, CounterScopeDriver, "driver_conductor_duty_cycles", snapshot.Counters.ConductorDutyCycles)
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverSenderDutyCycles, CounterScopeDriver, "driver_sender_duty_cycles", snapshot.Counters.SenderDutyCycles)
+	assertCounterSnapshot(t, snapshot.CounterSnapshots, CounterDriverReceiverDutyCycles, CounterScopeDriver, "driver_receiver_duty_cycles", snapshot.Counters.ReceiverDutyCycles)
+}
+
 func TestMediaDriverRejectsCommandsAfterClose(t *testing.T) {
 	driver, err := StartMediaDriver(DriverConfig{})
 	if err != nil {
@@ -347,6 +377,12 @@ func TestMediaDriverRejectsCommandsAfterClose(t *testing.T) {
 	}
 	if _, err := driver.NewClient(context.Background(), "closed"); !errors.Is(err, ErrDriverClosed) {
 		t.Fatalf("NewClient() err = %v, want %v", err, ErrDriverClosed)
+	}
+}
+
+func TestMediaDriverRejectsInvalidThreadingMode(t *testing.T) {
+	if _, err := StartMediaDriver(DriverConfig{ThreadingMode: DriverThreadingMode("invalid")}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("StartMediaDriver() err = %v, want %v", err, ErrInvalidConfig)
 	}
 }
 

@@ -84,7 +84,7 @@ The embeddable media driver includes the same image state in `MediaDriver.Snapsh
 
 `MediaDriver.Snapshot().StatusCounters` reports current active clients, channel endpoints, publication endpoints, subscription endpoints, publications, subscriptions, images, unavailable images, and lagging images. `MediaDriver.Snapshot().CounterSnapshots` combines those status counters, driver lifecycle counters, and the configured transport/application `Metrics` counters into one client-readable list. The driver directory writes the same list to `reports/counters.json` under `counter_snapshots`.
 
-Driver counters also include duty-cycle count, cumulative duty-cycle nanoseconds, max duty-cycle nanoseconds, stall count, cumulative stall nanoseconds, and max stall nanoseconds. `DriverConfig.StallThreshold` controls stall classification.
+Driver counters also include conductor/sender/receiver duty-cycle counts, aggregate duty-cycle count, cumulative duty-cycle nanoseconds, max duty-cycle nanoseconds, stall count, cumulative stall nanoseconds, and max stall nanoseconds. `DriverConfig.StallThreshold` controls stall classification.
 
 ## Structured Logging
 

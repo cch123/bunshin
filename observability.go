@@ -59,6 +59,9 @@ const (
 	CounterDriverStalls                  CounterTypeID = 1014
 	CounterDriverStallNanos              CounterTypeID = 1015
 	CounterDriverStallMaxNanos           CounterTypeID = 1016
+	CounterDriverConductorDutyCycles     CounterTypeID = 1017
+	CounterDriverSenderDutyCycles        CounterTypeID = 1018
+	CounterDriverReceiverDutyCycles      CounterTypeID = 1019
 
 	CounterDriverActiveClients         CounterTypeID = 1101
 	CounterDriverChannelEndpoints      CounterTypeID = 1102
@@ -148,6 +151,9 @@ var driverCounterDefinitions = []counterDefinition[DriverCounters]{
 	{TypeID: CounterDriverCleanupRuns, Scope: CounterScopeDriver, Name: "driver_cleanup_runs", Label: "Driver cleanup runs", Value: func(c DriverCounters) uint64 { return c.CleanupRuns }},
 	{TypeID: CounterDriverStaleClientsClosed, Scope: CounterScopeDriver, Name: "driver_stale_clients_closed", Label: "Driver stale clients closed", Value: func(c DriverCounters) uint64 { return c.StaleClientsClosed }},
 	{TypeID: CounterDriverDutyCycles, Scope: CounterScopeDriver, Name: "driver_duty_cycles", Label: "Driver duty cycles", Value: func(c DriverCounters) uint64 { return c.DutyCycles }},
+	{TypeID: CounterDriverConductorDutyCycles, Scope: CounterScopeDriver, Name: "driver_conductor_duty_cycles", Label: "Driver conductor duty cycles", Value: func(c DriverCounters) uint64 { return c.ConductorDutyCycles }},
+	{TypeID: CounterDriverSenderDutyCycles, Scope: CounterScopeDriver, Name: "driver_sender_duty_cycles", Label: "Driver sender duty cycles", Value: func(c DriverCounters) uint64 { return c.SenderDutyCycles }},
+	{TypeID: CounterDriverReceiverDutyCycles, Scope: CounterScopeDriver, Name: "driver_receiver_duty_cycles", Label: "Driver receiver duty cycles", Value: func(c DriverCounters) uint64 { return c.ReceiverDutyCycles }},
 	{TypeID: CounterDriverDutyCycleNanos, Scope: CounterScopeDriver, Name: "driver_duty_cycle_nanos", Label: "Driver duty cycle nanoseconds", Value: func(c DriverCounters) uint64 { return c.DutyCycleNanos }},
 	{TypeID: CounterDriverDutyCycleMaxNanos, Scope: CounterScopeDriver, Name: "driver_duty_cycle_max_nanos", Label: "Driver maximum duty cycle nanoseconds", Value: func(c DriverCounters) uint64 { return c.DutyCycleMaxNanos }},
 	{TypeID: CounterDriverStalls, Scope: CounterScopeDriver, Name: "driver_stalls", Label: "Driver stalls", Value: func(c DriverCounters) uint64 { return c.Stalls }},

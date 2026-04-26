@@ -18,6 +18,8 @@ client, err := driver.NewClient(ctx, "example")
 
 `DriverConfig.Metrics` and `DriverConfig.Logger` are inherited by driver-managed publications and subscriptions when their own config does not provide values.
 
+`DriverConfig.ThreadingMode` defaults to `DriverThreadingShared`, where the conductor handles commands, cleanup, and lifecycle duties on one event-driven loop. Set `DriverThreadingDedicated` to start separate sender and receiver agent loops. Dedicated loops schedule their work back through conductor-owned state and can use `SenderIdleStrategy` and `ReceiverIdleStrategy` to tune polling behavior without introducing concurrent writes to driver state.
+
 Set `DriverConfig.Directory` when the driver should expose Aeron-style local files for tooling:
 
 ```go
@@ -74,7 +76,7 @@ snapshot, err := driver.Snapshot(ctx)
 fmt.Println(snapshot.Counters.ClientsRegistered, len(snapshot.Publications))
 ```
 
-Counters include processed/failed commands, registered/closed clients, registered/closed publications, registered/closed subscriptions, cleanup runs, stale client cleanup count, duty-cycle time, and stall time. `DriverConfig.StallThreshold` controls when a duty cycle is counted as a stall and defaults to 50 ms. `snapshot.StatusCounters` reports the current active client, channel endpoint, publication, subscription, and image counts. `snapshot.CounterSnapshots` exposes driver counters, status counters, and configured `Metrics` counters as stable type IDs, labels, names, scopes, and numeric values for tools.
+Counters include processed/failed commands, registered/closed clients, registered/closed publications, registered/closed subscriptions, cleanup runs, stale client cleanup count, conductor/sender/receiver duty cycles, aggregate duty-cycle time, and stall time. `DriverConfig.StallThreshold` controls when a duty cycle is counted as a stall and defaults to 50 ms. `snapshot.StatusCounters` reports the current active client, channel endpoint, publication, subscription, and image counts. `snapshot.CounterSnapshots` exposes driver counters, status counters, and configured `Metrics` counters as stable type IDs, labels, names, scopes, and numeric values for tools.
 
 ## Driver Directory
 

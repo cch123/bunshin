@@ -35,6 +35,9 @@ type DriverConfig struct {
 	StallThreshold        time.Duration
 	DirectoryStaleTimeout time.Duration
 	TermBufferDirectory   string
+	ThreadingMode         DriverThreadingMode
+	SenderIdleStrategy    IdleStrategy
+	ReceiverIdleStrategy  IdleStrategy
 	Metrics               *Metrics
 	Logger                Logger
 }
@@ -46,6 +49,7 @@ type MediaDriver struct {
 	closeOnce sync.Once
 	closing   atomic.Bool
 	directory *driverDirectory
+	agentWG   sync.WaitGroup
 }
 
 type DriverClient struct {
@@ -98,6 +102,9 @@ type DriverCounters struct {
 	CleanupRuns             uint64
 	StaleClientsClosed      uint64
 	DutyCycles              uint64
+	ConductorDutyCycles     uint64
+	SenderDutyCycles        uint64
+	ReceiverDutyCycles      uint64
 	DutyCycleNanos          uint64
 	DutyCycleMaxNanos       uint64
 	Stalls                  uint64
@@ -188,8 +195,10 @@ type DriverLossReportSnapshot struct {
 }
 
 type driverCommand struct {
-	apply func(*driverState) (any, error)
-	reply chan driverResult
+	apply    func(*driverState) (any, error)
+	reply    chan driverResult
+	agent    driverAgentRole
+	internal bool
 }
 
 type driverResult struct {
@@ -214,6 +223,21 @@ type driverState struct {
 	counters       DriverCounters
 	errorReports   []DriverErrorReport
 }
+
+type DriverThreadingMode string
+
+const (
+	DriverThreadingShared    DriverThreadingMode = "shared"
+	DriverThreadingDedicated DriverThreadingMode = "dedicated"
+)
+
+type driverAgentRole string
+
+const (
+	driverAgentConductor driverAgentRole = "conductor"
+	driverAgentSender    driverAgentRole = "sender"
+	driverAgentReceiver  driverAgentRole = "receiver"
+)
 
 type driverClientState struct {
 	id            DriverClientID
@@ -261,6 +285,14 @@ func StartMediaDriver(cfg DriverConfig) (*MediaDriver, error) {
 	if cfg.DirectoryStaleTimeout < 0 {
 		return nil, invalidConfigf("invalid driver directory stale timeout: %s", cfg.DirectoryStaleTimeout)
 	}
+	if cfg.ThreadingMode == "" {
+		cfg.ThreadingMode = DriverThreadingShared
+	}
+	switch cfg.ThreadingMode {
+	case DriverThreadingShared, DriverThreadingDedicated:
+	default:
+		return nil, invalidConfigf("invalid driver threading mode: %s", cfg.ThreadingMode)
+	}
 	if cfg.CommandBuffer == 0 {
 		cfg.CommandBuffer = defaultDriverCommandBuffer
 	}
@@ -291,6 +323,7 @@ func StartMediaDriver(cfg DriverConfig) (*MediaDriver, error) {
 		directory: directory,
 	}
 	go driver.run(cfg, directory)
+	driver.startAgentLoops(cfg)
 
 	logEvent(context.Background(), cfg.Logger, LogEvent{
 		Level:     LogLevelInfo,
@@ -303,6 +336,7 @@ func StartMediaDriver(cfg DriverConfig) (*MediaDriver, error) {
 			"cleanup_interval": cfg.CleanupInterval,
 			"directory":        cfg.Directory,
 			"term_buffers":     cfg.TermBufferDirectory,
+			"threading_mode":   cfg.ThreadingMode,
 		},
 	})
 	return driver, nil
@@ -408,6 +442,7 @@ func (d *MediaDriver) Close() error {
 		d.closing.Store(true)
 		close(d.done)
 		<-d.closed
+		d.agentWG.Wait()
 	})
 	return nil
 }
@@ -422,6 +457,7 @@ func (d *MediaDriver) dispatch(ctx context.Context, apply func(*driverState) (an
 	cmd := driverCommand{
 		apply: apply,
 		reply: make(chan driverResult, 1),
+		agent: driverAgentConductor,
 	}
 	select {
 	case d.commands <- cmd:
@@ -470,23 +506,28 @@ func (d *MediaDriver) run(cfg DriverConfig, directory *driverDirectory) {
 		select {
 		case command := <-d.commands:
 			start := time.Now()
-			state.counters.CommandsProcessed++
+			if command.agent == "" {
+				command.agent = driverAgentConductor
+			}
+			if !command.internal {
+				state.counters.CommandsProcessed++
+			}
 			value, err := command.apply(state)
-			if err != nil {
+			if err != nil && !command.internal {
 				state.counters.CommandsFailed++
 				state.recordDriverError(LogLevelError, "command", "driver command failed", nil, err)
 			}
-			state.recordDutyCycle(time.Since(start))
+			state.recordDutyCycle(command.agent, time.Since(start))
 			command.reply <- driverResult{value: value, err: err}
 		case now := <-ticker.C:
 			start := time.Now()
 			state.cleanup(now)
-			state.recordDutyCycle(time.Since(start))
+			state.recordDutyCycle(driverAgentConductor, time.Since(start))
 		case <-d.done:
 			start := time.Now()
 			state.closeAll()
 			state.log(LogLevelInfo, "close", "media driver closed", nil, nil)
-			state.recordDutyCycle(time.Since(start))
+			state.recordDutyCycle(driverAgentConductor, time.Since(start))
 			if directory != nil {
 				if _, err := state.flushDriverDirectory(time.Now(), DriverDirectoryStatusClosed); err != nil {
 					state.recordDriverError(LogLevelError, "directory", "final driver report flush failed", nil, err)
@@ -494,6 +535,81 @@ func (d *MediaDriver) run(cfg DriverConfig, directory *driverDirectory) {
 			}
 			return
 		}
+	}
+}
+
+func (d *MediaDriver) startAgentLoops(cfg DriverConfig) {
+	if cfg.ThreadingMode != DriverThreadingDedicated {
+		return
+	}
+	d.startAgentLoop(driverAgentSender, cfg.SenderIdleStrategy)
+	d.startAgentLoop(driverAgentReceiver, cfg.ReceiverIdleStrategy)
+}
+
+func (d *MediaDriver) startAgentLoop(role driverAgentRole, idle IdleStrategy) {
+	if idle == nil {
+		idle = NewDefaultBackoffIdleStrategy()
+	}
+	d.agentWG.Add(1)
+	go func() {
+		defer d.agentWG.Done()
+		for {
+			select {
+			case <-d.done:
+				return
+			default:
+			}
+
+			workCount, err := d.dispatchAgentDuty(role)
+			if err != nil {
+				if errors.Is(err, ErrDriverClosed) {
+					return
+				}
+				workCount = 0
+			}
+			idle.Idle(workCount)
+		}
+	}()
+}
+
+func (d *MediaDriver) dispatchAgentDuty(role driverAgentRole) (int, error) {
+	if d.closing.Load() {
+		return 0, ErrDriverClosed
+	}
+	reply := make(chan driverResult, 1)
+	command := driverCommand{
+		agent:    role,
+		internal: true,
+		reply:    reply,
+		apply: func(state *driverState) (any, error) {
+			switch role {
+			case driverAgentSender:
+				return state.senderAgentDuty(), nil
+			case driverAgentReceiver:
+				return state.receiverAgentDuty(), nil
+			default:
+				return 0, invalidConfigf("invalid driver agent role: %s", role)
+			}
+		},
+	}
+	select {
+	case d.commands <- command:
+	case <-d.done:
+		return 0, ErrDriverClosed
+	case <-d.closed:
+		return 0, ErrDriverClosed
+	}
+	select {
+	case result := <-reply:
+		if result.err != nil {
+			return 0, result.err
+		}
+		workCount, _ := result.value.(int)
+		return workCount, nil
+	case <-d.done:
+		return 0, ErrDriverClosed
+	case <-d.closed:
+		return 0, ErrDriverClosed
 	}
 }
 
@@ -1214,12 +1330,34 @@ func driverSubscriptionEndpoint(subscription *driverSubscriptionState) string {
 	return subscription.localAddr
 }
 
-func (state *driverState) recordDutyCycle(duration time.Duration) {
+func (state *driverState) senderAgentDuty() int {
+	if state == nil {
+		return 0
+	}
+	return 0
+}
+
+func (state *driverState) receiverAgentDuty() int {
+	if state == nil {
+		return 0
+	}
+	return 0
+}
+
+func (state *driverState) recordDutyCycle(role driverAgentRole, duration time.Duration) {
 	if state == nil || duration <= 0 {
 		return
 	}
 	nanos := uint64(duration)
 	state.counters.DutyCycles++
+	switch role {
+	case driverAgentSender:
+		state.counters.SenderDutyCycles++
+	case driverAgentReceiver:
+		state.counters.ReceiverDutyCycles++
+	default:
+		state.counters.ConductorDutyCycles++
+	}
 	state.counters.DutyCycleNanos += nanos
 	if nanos > state.counters.DutyCycleMaxNanos {
 		state.counters.DutyCycleMaxNanos = nanos

@@ -40,6 +40,10 @@ func TestPublicAPIContract(t *testing.T) {
 		ClusterElectionConfig{},
 		ClusterBackupConfig{},
 	}
+	constants := []any{
+		DriverThreadingShared,
+		DriverThreadingDedicated,
+	}
 	errors := []error{
 		ErrClosed,
 		ErrInvalidConfig,
@@ -88,7 +92,7 @@ func TestPublicAPIContract(t *testing.T) {
 		ErrClusterBackupClosed,
 		ErrClusterBackupUnsupported,
 	}
-	if len(constructors) == 0 || len(configs) == 0 || len(errors) == 0 {
+	if len(constructors) == 0 || len(configs) == 0 || len(constants) == 0 || len(errors) == 0 {
 		t.Fatal("public API contract is empty")
 	}
 }

@@ -51,7 +51,7 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 - [x] Add an out-of-process media driver binary with heartbeat, termination, and stale-driver detection.
 - [x] Move publication/subscription resource ownership behind the external driver boundary while preserving embeddable mode.
 - [x] Back driver-managed term buffers with mmap files shared between clients and driver.
-- [ ] Add driver conductor/sender/receiver agent loops with configurable threading and idle strategies.
+- [x] Add driver conductor/sender/receiver agent loops with configurable threading and idle strategies.
 - [x] Add active-directory detection and stale mark-file recovery.
 
 ## API
