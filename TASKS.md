@@ -195,17 +195,17 @@ These tasks are beyond the current Bunshin-native roadmap. They are required onl
 - [x] Persist external subscription data-ring diagnostics to driver directory reports.
 - [x] Include server-side external subscription fallback pending counts in live and persisted rings diagnostics.
 - [ ] Promote the external-driver subscription data path from IPC message batches to shared or mmap-backed images.
-- [ ] Add Aeron-style driver CnC, counter, error, and loss-report semantics, or document an explicit adapter boundary for each format that remains Bunshin-native.
+- [x] Add Aeron-style driver CnC, counter, error, and loss-report semantics, or document an explicit adapter boundary for each format that remains Bunshin-native.
 - [ ] Deepen the UDP transport with setup, status, NAK, RTT, loss, and receiver image rebuilding semantics comparable to Aeron's media-driver protocol.
 - [ ] Add full multi-destination-cast semantics, including manual and dynamic control modes, receiver liveness, and tagged or preferred receiver flow-control behavior.
 - [x] Add bounded archive replay by recording ID, position, and length while keeping zero length open-ended.
 - [x] Record raw stream/image frames in archive segments so replay can operate on recorded fragments rather than only delivered Bunshin messages.
 - [x] Promote archive control and recording-event streams from an in-process API to an external protocol with correlation IDs and control-session semantics.
 - [x] Implement archive live replication and follow-on replay merge against live stream state rather than only Bunshin message metadata.
-- [ ] Add remote cluster member transport for replication, consensus messages, ingress, egress, and snapshot transfer.
+- [x] Add remote cluster member transport for replication, consensus messages, ingress, egress, and snapshot transfer.
 - [x] Add quorum commit semantics so services consume entries only after a majority has durably recorded the log.
-- [ ] Add quorum-aware leader failover and member catch-up tests over remote cluster member transport.
+- [x] Add quorum-aware leader failover and member catch-up tests over remote cluster member transport.
 - [x] Integrate cluster log and snapshot storage with archive-style durable recordings.
-- [ ] Turn membership-change and rolling-upgrade planners into applied runtime membership transitions.
-- [ ] Add Aeron parity benchmarks comparing QUIC, Bunshin UDP/IPC, and any Aeron-backed adapter under the same workloads.
+- [x] Turn membership-change and rolling-upgrade planners into applied runtime membership transitions.
+- [x] Add Aeron parity benchmarks comparing QUIC, Bunshin UDP/IPC, and any Aeron-backed adapter under the same workloads.
 - [ ] Decide which Aeron wire, API, and tool compatibility items remain explicit non-goals versus adapter projects.

@@ -1,7 +1,9 @@
 package bunshin
 
 import (
+	"context"
 	"sort"
+	"sync"
 )
 
 type ClusterMember struct {
@@ -67,6 +69,32 @@ type ClusterRollingUpgradePlan struct {
 	Steps         []ClusterMembershipStep `json:"steps"`
 	Warnings      []string                `json:"warnings,omitempty"`
 	Safe          bool                    `json:"safe"`
+}
+
+type ClusterMembershipRuntimeConfig struct {
+	Membership ClusterMembership
+	Hooks      ClusterMembershipRuntimeHooks
+}
+
+type ClusterMembershipRuntimeHooks struct {
+	CatchUp        func(context.Context, ClusterMembership, ClusterMember) (ClusterMember, error)
+	TransferLeader func(context.Context, ClusterMembership, ClusterNodeID) error
+	UpgradeMember  func(context.Context, ClusterMembership, ClusterMember, string) (ClusterMember, error)
+	Validate       func(context.Context, ClusterMembership) error
+}
+
+type ClusterMembershipRuntime struct {
+	mu         sync.Mutex
+	membership ClusterMembership
+	hooks      ClusterMembershipRuntimeHooks
+}
+
+type ClusterMembershipApplyResult struct {
+	Previous   ClusterMembership       `json:"previous"`
+	Membership ClusterMembership       `json:"membership"`
+	Steps      []ClusterMembershipStep `json:"steps"`
+	Applied    []ClusterMembershipStep `json:"applied"`
+	Safe       bool                    `json:"safe"`
 }
 
 func PlanClusterMembershipChange(current ClusterMembership, change ClusterMembershipChange) (ClusterMembershipPlan, error) {
@@ -296,6 +324,91 @@ func PlanClusterRollingUpgrade(cfg ClusterRollingUpgradeConfig) (ClusterRollingU
 	}, nil
 }
 
+func NewClusterMembershipRuntime(cfg ClusterMembershipRuntimeConfig) (*ClusterMembershipRuntime, error) {
+	membership, err := normalizeClusterMembership(cfg.Membership)
+	if err != nil {
+		return nil, err
+	}
+	return &ClusterMembershipRuntime{
+		membership: membership,
+		hooks:      cfg.Hooks,
+	}, nil
+}
+
+func (r *ClusterMembershipRuntime) Snapshot() ClusterMembership {
+	if r == nil {
+		return ClusterMembership{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return cloneClusterMembership(r.membership)
+}
+
+func (r *ClusterMembershipRuntime) ApplyChange(ctx context.Context, change ClusterMembershipChange) (ClusterMembershipApplyResult, error) {
+	if r == nil {
+		return ClusterMembershipApplyResult{}, invalidConfigf("cluster membership runtime is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	previous := cloneClusterMembership(r.membership)
+	plan, err := PlanClusterMembershipChange(previous, change)
+	if err != nil {
+		return ClusterMembershipApplyResult{}, err
+	}
+	addedMembers := clusterMembershipAddedStandbyMembers(change, previous.LeaderID)
+	membership, applied, err := r.applyMembershipSteps(ctx, previous, plan.Result, plan.Steps, addedMembers)
+	if err != nil {
+		return ClusterMembershipApplyResult{}, err
+	}
+	r.membership = membership
+	return ClusterMembershipApplyResult{
+		Previous:   previous,
+		Membership: cloneClusterMembership(membership),
+		Steps:      append([]ClusterMembershipStep(nil), plan.Steps...),
+		Applied:    applied,
+		Safe:       true,
+	}, nil
+}
+
+func (r *ClusterMembershipRuntime) ApplyRollingUpgrade(ctx context.Context, targetVersion string, allowLeaderFirst bool) (ClusterMembershipApplyResult, error) {
+	if r == nil {
+		return ClusterMembershipApplyResult{}, invalidConfigf("cluster membership runtime is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	previous := cloneClusterMembership(r.membership)
+	plan, err := PlanClusterRollingUpgrade(ClusterRollingUpgradeConfig{
+		Membership:       previous,
+		TargetVersion:    targetVersion,
+		AllowLeaderFirst: allowLeaderFirst,
+	})
+	if err != nil {
+		return ClusterMembershipApplyResult{}, err
+	}
+	membership, applied, err := r.applyMembershipSteps(ctx, previous, ClusterMembership{}, plan.Steps, nil)
+	if err != nil {
+		return ClusterMembershipApplyResult{}, err
+	}
+	r.membership = membership
+	return ClusterMembershipApplyResult{
+		Previous:   previous,
+		Membership: cloneClusterMembership(membership),
+		Steps:      append([]ClusterMembershipStep(nil), plan.Steps...),
+		Applied:    applied,
+		Safe:       true,
+	}, nil
+}
+
 func normalizeClusterMembership(membership ClusterMembership) (ClusterMembership, error) {
 	if len(membership.Members) == 0 {
 		return ClusterMembership{}, invalidConfigf("cluster membership members are required")
@@ -330,6 +443,183 @@ func normalizeClusterMembership(membership ClusterMembership) (ClusterMembership
 		return ClusterMembership{}, invalidConfigf("cluster membership does not have active quorum")
 	}
 	return membership, nil
+}
+
+func (r *ClusterMembershipRuntime) applyMembershipSteps(ctx context.Context, current, planned ClusterMembership, steps []ClusterMembershipStep, addedMembers map[ClusterNodeID]ClusterMember) (ClusterMembership, []ClusterMembershipStep, error) {
+	working := cloneClusterMembership(current)
+	members := clusterMemberMap(working.Members)
+	plannedMembers := clusterMemberMap(planned.Members)
+	applied := make([]ClusterMembershipStep, 0, len(steps))
+
+	for _, step := range steps {
+		select {
+		case <-ctx.Done():
+			return current, applied, ctx.Err()
+		default:
+		}
+		switch step.Action {
+		case ClusterMembershipActionAddStandby:
+			member, ok := addedMembers[step.NodeID]
+			if !ok {
+				member, ok = plannedMembers[step.NodeID]
+			}
+			if !ok {
+				return current, applied, invalidConfigf("planned member is missing: %d", step.NodeID)
+			}
+			member.Voting = false
+			member.Role = ClusterRoleStandby
+			members[step.NodeID] = member
+		case ClusterMembershipActionCatchUp:
+			member, ok := members[step.NodeID]
+			if !ok {
+				return current, applied, invalidConfigf("catch-up member is not present: %d", step.NodeID)
+			}
+			caughtUp, err := r.catchUpMember(ctx, workingWithMembers(working, members), member)
+			if err != nil {
+				return current, applied, err
+			}
+			if caughtUp.SyncedPosition < working.LogPosition {
+				return current, applied, invalidConfigf("member did not catch up: %d synced=%d required=%d", step.NodeID, caughtUp.SyncedPosition, working.LogPosition)
+			}
+			members[step.NodeID] = normalizeClusterMember(caughtUp, working.LeaderID)
+		case ClusterMembershipActionPromoteVoter:
+			member, ok := members[step.NodeID]
+			if !ok {
+				return current, applied, invalidConfigf("promoted member is not present: %d", step.NodeID)
+			}
+			if member.SyncedPosition < working.LogPosition {
+				return current, applied, invalidConfigf("promoted member is behind log: %d synced=%d required=%d", step.NodeID, member.SyncedPosition, working.LogPosition)
+			}
+			member.Active = true
+			member.Voting = true
+			member.Role = roleForMembershipMember(step.NodeID, working.LeaderID, true)
+			members[step.NodeID] = member
+		case ClusterMembershipActionDemoteVoter:
+			member, ok := members[step.NodeID]
+			if !ok {
+				return current, applied, invalidConfigf("demoted member is not present: %d", step.NodeID)
+			}
+			member.Voting = false
+			member.Role = ClusterRoleStandby
+			members[step.NodeID] = member
+		case ClusterMembershipActionTransferLeader:
+			member, ok := members[step.NodeID]
+			if !ok {
+				return current, applied, invalidConfigf("leader transfer target is not present: %d", step.NodeID)
+			}
+			if !member.Active || !member.Voting {
+				return current, applied, invalidConfigf("leader transfer target is not an active voter: %d", step.NodeID)
+			}
+			if r.hooks.TransferLeader != nil {
+				if err := r.hooks.TransferLeader(ctx, workingWithMembers(working, members), step.NodeID); err != nil {
+					return current, applied, err
+				}
+			}
+			working.LeaderID = step.NodeID
+			for id, member := range members {
+				member.Role = roleForMembershipMember(id, working.LeaderID, member.Voting)
+				if id == working.LeaderID {
+					member.Active = true
+					member.Voting = true
+				}
+				members[id] = member
+			}
+		case ClusterMembershipActionRemoveMember:
+			if _, ok := members[step.NodeID]; !ok {
+				return current, applied, invalidConfigf("removed member is not present: %d", step.NodeID)
+			}
+			delete(members, step.NodeID)
+		case ClusterMembershipActionUpgradeMember:
+			member, ok := members[step.NodeID]
+			if !ok {
+				return current, applied, invalidConfigf("upgraded member is not present: %d", step.NodeID)
+			}
+			upgraded := member
+			var err error
+			if r.hooks.UpgradeMember != nil {
+				upgraded, err = r.hooks.UpgradeMember(ctx, workingWithMembers(working, members), cloneClusterMember(member), step.ToVersion)
+				if err != nil {
+					return current, applied, err
+				}
+			} else {
+				upgraded.Version = step.ToVersion
+			}
+			upgraded.NodeID = member.NodeID
+			if upgraded.Version != step.ToVersion {
+				return current, applied, invalidConfigf("member did not upgrade: %d version=%s required=%s", step.NodeID, upgraded.Version, step.ToVersion)
+			}
+			upgraded.Role = roleForMembershipMember(upgraded.NodeID, working.LeaderID, upgraded.Voting)
+			members[step.NodeID] = upgraded
+		case ClusterMembershipActionValidate:
+			candidate := workingWithMembers(working, members)
+			normalized, err := normalizeClusterMembership(candidate)
+			if err != nil {
+				return current, applied, err
+			}
+			if r.hooks.Validate != nil {
+				if err := r.hooks.Validate(ctx, normalized); err != nil {
+					return current, applied, err
+				}
+			}
+			working = normalized
+			members = clusterMemberMap(working.Members)
+		default:
+			return current, applied, invalidConfigf("unsupported cluster membership step: %s", step.Action)
+		}
+		working.Members = sortedClusterMembers(members)
+		applied = append(applied, step)
+	}
+	normalized, err := normalizeClusterMembership(workingWithMembers(working, members))
+	if err != nil {
+		return current, applied, err
+	}
+	return normalized, applied, nil
+}
+
+func clusterMembershipAddedStandbyMembers(change ClusterMembershipChange, leaderID ClusterNodeID) map[ClusterNodeID]ClusterMember {
+	if len(change.Add) == 0 {
+		return nil
+	}
+	members := make(map[ClusterNodeID]ClusterMember, len(change.Add))
+	for _, member := range change.Add {
+		member = normalizeClusterMember(member, leaderID)
+		member.Voting = false
+		if member.Role == "" || member.Role == ClusterRoleLeader || member.Role == ClusterRoleFollower {
+			member.Role = ClusterRoleStandby
+		}
+		members[member.NodeID] = member
+	}
+	return members
+}
+
+func (r *ClusterMembershipRuntime) catchUpMember(ctx context.Context, membership ClusterMembership, member ClusterMember) (ClusterMember, error) {
+	if r.hooks.CatchUp == nil {
+		if member.SyncedPosition < membership.LogPosition {
+			return ClusterMember{}, invalidConfigf("cluster membership catch-up hook is required for member: %d", member.NodeID)
+		}
+		return member, nil
+	}
+	caughtUp, err := r.hooks.CatchUp(ctx, membership, cloneClusterMember(member))
+	if err != nil {
+		return ClusterMember{}, err
+	}
+	caughtUp.NodeID = member.NodeID
+	if caughtUp.Version == "" {
+		caughtUp.Version = member.Version
+	}
+	if caughtUp.Role == "" {
+		caughtUp.Role = member.Role
+	}
+	return caughtUp, nil
+}
+
+func workingWithMembers(membership ClusterMembership, members map[ClusterNodeID]ClusterMember) ClusterMembership {
+	membership.Members = sortedClusterMembers(members)
+	return membership
+}
+
+func cloneClusterMember(member ClusterMember) ClusterMember {
+	return member
 }
 
 func normalizeClusterMember(member ClusterMember, leaderID ClusterNodeID) ClusterMember {

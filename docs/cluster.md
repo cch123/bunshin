@@ -8,7 +8,7 @@ The first supported modes are:
 - `appointed-leader`: a configured node ID is leader; non-leader nodes reject local ingress.
 - `learner`: the node does not participate in consensus or accept ingress; it follows a configured master log and snapshots local service state.
 
-Network transport for member replication and rolling upgrades are future layers above this core. Quorum commit gating can already be enabled over `ClusterLog` implementations, including local, archive-backed, or future remote-log adapters.
+Cluster member transport and runtime membership transitions are Bunshin-native layers above this core. Quorum commit gating can be enabled over `ClusterLog` implementations, including local, archive-backed, or remote member clients.
 
 ## Node
 
@@ -108,7 +108,51 @@ leader, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
 
 If the leader cannot reach quorum, append returns `ErrClusterQuorumUnavailable`, the local leader log is not advanced, and the service callback is not invoked. `ClusterSnapshot.Quorum`, `ClusterDescription.Quorum`, and validation reports expose the latest commit position, ack count, and failure string.
 
-Existing matching entries in a member log count as acknowledgements. This makes repeated commit attempts idempotent after a member accepted the entry but the leader did not complete the previous commit. Remote member transport and quorum-aware failover/catch-up are still future layers above this `ClusterLog` boundary.
+Existing matching entries in a member log count as acknowledgements. This makes repeated commit attempts idempotent after a member accepted the entry but the leader did not complete the previous commit. Quorum-aware failover/catch-up orchestration is still a future layer above this `ClusterLog` boundary.
+
+## Remote Member Transport
+
+`ListenClusterMemberTransport` exposes a running node over a Bunshin-native JSON/TCP request-response protocol. `DialClusterMember` returns a `ClusterMemberClient` that implements `ClusterLog` and `ClusterSnapshotStore`, and also supports remote ingress/egress through `Submit`.
+
+```go
+server, err := bunshin.ListenClusterMemberTransport(ctx, leader, bunshin.ClusterMemberTransportConfig{
+    Addr: "10.0.0.10:7901",
+})
+defer server.Close()
+
+remoteLeader, err := bunshin.DialClusterMember(ctx, bunshin.ClusterMemberClientConfig{
+    Addr: "10.0.0.10:7901",
+})
+defer remoteLeader.Close()
+```
+
+Because the remote client implements `ClusterLog`, it can be used by existing replication, learner, and quorum paths:
+
+```go
+follower, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    NodeID:            2,
+    Mode:              bunshin.ClusterModeAppointedLeader,
+    AppointedLeaderID: 1,
+    Log:               followerLog,
+    Service:           followerService,
+    Replication: &bunshin.ClusterReplicationConfig{
+        SourceLog: remoteLeader,
+    },
+})
+
+leader, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    NodeID:            1,
+    Mode:              bunshin.ClusterModeAppointedLeader,
+    AppointedLeaderID: 1,
+    Log:               leaderLog,
+    Service:           service,
+    Quorum: &bunshin.ClusterQuorumConfig{
+        MemberLogs: []bunshin.ClusterLog{remoteFollower},
+    },
+})
+```
+
+The protocol currently supports log append/snapshot/last-position, snapshot save/load/take, remote ingress submit, and describe. Common cluster sentinel errors are mapped back on the client side so callers can still use `errors.Is` for values such as `ErrClusterNotLeader`, `ErrClusterLogPosition`, and `ErrClusterSnapshotStoreUnavailable`.
 
 ## Heartbeats And Election
 
@@ -216,7 +260,7 @@ Cold backup is useful when the process should only keep a durable log copy. Stan
 
 ## Membership And Rolling Upgrade
 
-Bunshin exposes membership-change and rolling-upgrade planning helpers for control planes. These helpers do not mutate running nodes; they validate quorum, leader, and catch-up constraints and return ordered steps that an external orchestrator can execute.
+Bunshin exposes membership-change and rolling-upgrade planning helpers for control planes. These helpers validate quorum, leader, and catch-up constraints and return ordered steps. `ClusterMembershipRuntime` can then apply those steps to a live membership view through application-provided hooks.
 
 ```go
 plan, err := bunshin.PlanClusterMembershipChange(current, bunshin.ClusterMembershipChange{
@@ -240,6 +284,39 @@ upgrade, err := bunshin.PlanClusterRollingUpgrade(bunshin.ClusterRollingUpgradeC
     TargetVersion: "2.0.0",
 })
 ```
+
+Runtime application keeps the same safety checks but lets the embedding control plane perform the environment-specific work:
+
+```go
+runtime, err := bunshin.NewClusterMembershipRuntime(bunshin.ClusterMembershipRuntimeConfig{
+    Membership: current,
+    Hooks: bunshin.ClusterMembershipRuntimeHooks{
+        CatchUp: func(ctx context.Context, membership bunshin.ClusterMembership, member bunshin.ClusterMember) (bunshin.ClusterMember, error) {
+            // Replicate from the current leader, then return the member's observed position.
+            member.SyncedPosition = membership.LogPosition
+            return member, nil
+        },
+        TransferLeader: func(ctx context.Context, membership bunshin.ClusterMembership, target bunshin.ClusterNodeID) error {
+            // Drive the local election/control path for the deployment.
+            return nil
+        },
+        UpgradeMember: func(ctx context.Context, membership bunshin.ClusterMembership, member bunshin.ClusterMember, targetVersion string) (bunshin.ClusterMember, error) {
+            // Restart or replace the process, then return the observed member state.
+            member.Version = targetVersion
+            member.Active = true
+            return member, nil
+        },
+        Validate: func(ctx context.Context, membership bunshin.ClusterMembership) error {
+            return nil
+        },
+    },
+})
+
+result, err := runtime.ApplyChange(ctx, change)
+upgradeResult, err := runtime.ApplyRollingUpgrade(ctx, "2.0.0", false)
+```
+
+`ApplyChange` and `ApplyRollingUpgrade` mutate the runtime membership only after every required step succeeds. If a planned promotion requires catch-up and no `CatchUp` hook is configured, the transition is rejected instead of silently marking the member current.
 
 ## Snapshots
 
@@ -323,4 +400,4 @@ type ClusterService interface {
 
 ## Scope
 
-The current cluster layer provides the local service container, in-process ingress/egress protocol, authentication and authorization hooks, appointed-leader gating, quorum commit gating over `ClusterLog`, heartbeat-based local election, replayable replicated-log abstraction, archive-backed log and snapshot storage, log-backed timers and service messages, follower log catch-up, backup and standby replication, membership-change and rolling-upgrade planning, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide remote member communication, quorum-aware failover/catch-up orchestration, or automated backup promotion.
+The current cluster layer provides the local service container, in-process and remote Bunshin-native ingress/egress protocol, authentication and authorization hooks, appointed-leader gating, quorum commit gating over `ClusterLog`, heartbeat-based local election, replayable replicated-log abstraction, remote member log/snapshot transport, archive-backed log and snapshot storage, log-backed timers and service messages, follower log catch-up, backup and standby replication, membership-change and rolling-upgrade planning plus runtime application hooks, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide automated backup promotion.

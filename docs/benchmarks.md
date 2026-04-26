@@ -46,6 +46,14 @@ go test -run '^$' -bench 'Benchmark(TransportLatencyQUIC|TransportLatencyUDP|IPC
 
 These report `p50-ns`, `p95-ns`, `p99-ns`, `p999-ns`, and `max-ns`. The QUIC and UDP benchmarks also report `msg/s`.
 
+Run the Aeron semantic-parity transport baseline:
+
+```sh
+go test -run '^$' -bench BenchmarkAeronParityTransportBaseline -benchmem ./...
+```
+
+This runs the same 256-byte and 1024-byte payload workloads over Bunshin QUIC, Bunshin UDP, and the mmap-backed IPC ring path. It reports Go's standard benchmark metrics plus `msg/s`. Bunshin does not currently ship an Aeron-backed adapter; if one is added later, it should be added as another sub-benchmark under the same workload names.
+
 Run mmap IPC ring and mapped term-buffer throughput:
 
 ```sh
@@ -76,6 +84,7 @@ These report `gc-cycles`, `heap-delta-bytes`, and `total-alloc-bytes` in additio
 - `BenchmarkPublicationSubscriptionSendUDP` measures the Bunshin-native UDP send/receive path over loopback.
 - `BenchmarkSubscriptionHandlerDispatch` measures the subscription-side message dispatch path without transport I/O.
 - `BenchmarkTransportLatencyQUIC`, `BenchmarkTransportLatencyUDP`, and `BenchmarkIPCRingLatency` report p99/p999 latency under benchmark load.
+- `BenchmarkAeronParityTransportBaseline` compares QUIC, UDP, and IPC ring throughput/allocation behavior under the same payload-size workloads.
 - `BenchmarkIPCRingThroughput` measures mmap-backed IPC ring offer/poll throughput and reports `msg/s`.
 - `BenchmarkMappedTermBufferAppend` measures mmap-backed term-buffer append throughput and reports `appends/s`.
 - `BenchmarkUDPFanout` measures loopback UDP fanout to multiple subscribers and reports delivered message rate.

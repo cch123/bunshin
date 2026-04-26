@@ -1,6 +1,7 @@
 package bunshin
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -125,6 +126,117 @@ func TestPlanClusterRollingUpgradeRejectsQuorumLoss(t *testing.T) {
 		TargetVersion: "2.0.0",
 	}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("rolling quorum loss err = %v, want %v", err, ErrInvalidConfig)
+	}
+}
+
+func TestClusterMembershipRuntimeAppliesChangeWithCatchUp(t *testing.T) {
+	var caughtUp []ClusterNodeID
+	var validated []ClusterMembership
+	runtime, err := NewClusterMembershipRuntime(ClusterMembershipRuntimeConfig{
+		Membership: testMembership(),
+		Hooks: ClusterMembershipRuntimeHooks{
+			CatchUp: func(_ context.Context, membership ClusterMembership, member ClusterMember) (ClusterMember, error) {
+				caughtUp = append(caughtUp, member.NodeID)
+				member.SyncedPosition = membership.LogPosition
+				return member, nil
+			},
+			Validate: func(_ context.Context, membership ClusterMembership) error {
+				validated = append(validated, membership)
+				return nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runtime.ApplyChange(context.Background(), ClusterMembershipChange{
+		Add: []ClusterMember{{
+			NodeID:         4,
+			Version:        "1.0.0",
+			Voting:         true,
+			Active:         true,
+			SyncedPosition: 5,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Safe || len(result.Applied) != len(result.Steps) || len(caughtUp) != 1 || caughtUp[0] != 4 ||
+		len(validated) != 1 {
+		t.Fatalf("unexpected apply result=%#v caughtUp=%#v validated=%#v", result, caughtUp, validated)
+	}
+	member := clusterMemberMap(result.Membership.Members)[4]
+	if !member.Active || !member.Voting || member.Role != ClusterRoleFollower || member.SyncedPosition != 10 {
+		t.Fatalf("unexpected applied member: %#v", member)
+	}
+	snapshot := runtime.Snapshot()
+	if snapshot.LeaderID != 1 || len(snapshot.Members) != 4 {
+		t.Fatalf("unexpected runtime snapshot: %#v", snapshot)
+	}
+}
+
+func TestClusterMembershipRuntimeRequiresCatchUpBeforePromotion(t *testing.T) {
+	runtime, err := NewClusterMembershipRuntime(ClusterMembershipRuntimeConfig{
+		Membership: testMembership(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := runtime.Snapshot()
+	_, err = runtime.ApplyChange(context.Background(), ClusterMembershipChange{
+		Add: []ClusterMember{{
+			NodeID:         4,
+			Version:        "1.0.0",
+			Voting:         true,
+			Active:         true,
+			SyncedPosition: 5,
+		}},
+	})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("ApplyChange() err = %v, want %v", err, ErrInvalidConfig)
+	}
+	if snapshot := runtime.Snapshot(); len(snapshot.Members) != len(previous.Members) {
+		t.Fatalf("runtime changed after failed catch-up: before=%#v after=%#v", previous, snapshot)
+	}
+}
+
+func TestClusterMembershipRuntimeAppliesRollingUpgrade(t *testing.T) {
+	var transfers []ClusterNodeID
+	var upgrades []ClusterNodeID
+	runtime, err := NewClusterMembershipRuntime(ClusterMembershipRuntimeConfig{
+		Membership: testMembership(),
+		Hooks: ClusterMembershipRuntimeHooks{
+			TransferLeader: func(_ context.Context, _ ClusterMembership, nodeID ClusterNodeID) error {
+				transfers = append(transfers, nodeID)
+				return nil
+			},
+			UpgradeMember: func(_ context.Context, _ ClusterMembership, member ClusterMember, targetVersion string) (ClusterMember, error) {
+				upgrades = append(upgrades, member.NodeID)
+				member.Version = targetVersion
+				member.Active = true
+				return member, nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runtime.ApplyRollingUpgrade(context.Background(), "2.0.0", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Safe || len(upgrades) != 3 || len(transfers) != 1 || transfers[0] == 1 {
+		t.Fatalf("unexpected rolling result=%#v upgrades=%#v transfers=%#v", result, upgrades, transfers)
+	}
+	if result.Membership.LeaderID != transfers[0] {
+		t.Fatalf("leader id = %d, want transferred target %d", result.Membership.LeaderID, transfers[0])
+	}
+	for _, member := range result.Membership.Members {
+		if member.Version != "2.0.0" {
+			t.Fatalf("member was not upgraded: %#v", result.Membership.Members)
+		}
 	}
 }
 

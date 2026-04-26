@@ -121,6 +121,18 @@ bunshin-driver terminate -dir /tmp/bunshin-driver
 
 `bunshin-driver rings` queries the live driver by default. Add `-report` to read the last persisted `reports/rings.json` file without requiring a live IPC round trip.
 
+## Aeron Tooling Boundary
+
+Bunshin's driver directory is intentionally Bunshin-native. It mirrors the operational intent of Aeron's CnC, counters, error log, and loss report, but it does not use Aeron's binary file layouts:
+
+- CnC/mark state: `driver.mark` is JSON with process identity, status, timestamps, and timeout settings. It is not an Aeron CnC file and cannot be consumed by AeronStat.
+- Counters: `reports/counters.json` contains Bunshin driver counters, status counters, inherited transport metrics, and stable `counter_snapshots` with Bunshin type IDs. These IDs are stable within Bunshin, not Aeron counter IDs.
+- Error log: `reports/error-report.json` stores Bunshin command and lifecycle errors as structured JSON records. It is not Aeron's distinct error log format.
+- Loss report: `reports/loss-report.json` stores Bunshin stream/session gap observations. It is diagnostic-equivalent to LossStat's purpose, but not LossStat-compatible.
+- Ring diagnostics: `reports/rings.json` is specific to Bunshin external subscription data rings and fallback queues.
+
+An Aeron tooling adapter should treat these files as source data and explicitly map fields into Aeron-shaped output. The core driver should not silently write Aeron-compatible binary files unless that compatibility mode becomes an explicit project.
+
 ## Cleanup
 
 Clients should call `Heartbeat` when they are long-lived but idle:
