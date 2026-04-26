@@ -18,6 +18,7 @@ const (
 	driverCountersReportName = "counters.json"
 	driverLossReportName     = "loss-report.json"
 	driverErrorReportName    = "error-report.json"
+	driverRingsReportName    = "rings.json"
 )
 
 var ErrDriverDirectoryUnavailable = errors.New("bunshin driver directory: unavailable")
@@ -38,6 +39,7 @@ type DriverDirectoryLayout struct {
 	CountersFile           string `json:"counters_file"`
 	LossReportFile         string `json:"loss_report_file"`
 	ErrorReportFile        string `json:"error_report_file"`
+	RingsReportFile        string `json:"rings_report_file"`
 	ClientsDirectory       string `json:"clients_directory"`
 	PublicationsDirectory  string `json:"publications_directory"`
 	SubscriptionsDirectory string `json:"subscriptions_directory"`
@@ -88,12 +90,33 @@ type DriverErrorReportFile struct {
 	Reports   []DriverErrorReport `json:"reports"`
 }
 
+type DriverRingsReportFile struct {
+	UpdatedAt     time.Time                        `json:"updated_at"`
+	Subscriptions []DriverSubscriptionRingSnapshot `json:"subscriptions"`
+}
+
+type DriverSubscriptionRingSnapshot struct {
+	ResourceID      DriverResourceID `json:"resource_id"`
+	ClientID        DriverClientID   `json:"client_id"`
+	StreamID        uint32           `json:"stream_id"`
+	LocalAddr       string           `json:"local_addr"`
+	Path            string           `json:"path"`
+	Capacity        int              `json:"capacity"`
+	Used            int              `json:"used"`
+	Free            int              `json:"free"`
+	ReadPosition    uint64           `json:"read_position"`
+	WritePosition   uint64           `json:"write_position"`
+	UsedRatio       float64          `json:"used_ratio"`
+	PendingMessages int              `json:"pending_messages"`
+}
+
 type DriverDirectoryReport struct {
 	Layout   DriverDirectoryLayout `json:"layout"`
 	Mark     DriverMarkFile        `json:"mark"`
 	Counters DriverCountersFile    `json:"counters"`
 	Loss     DriverLossReportFile  `json:"loss"`
 	Errors   DriverErrorReportFile `json:"errors"`
+	Rings    DriverRingsReportFile `json:"rings"`
 }
 
 type driverDirectory struct {
@@ -119,6 +142,7 @@ func ResolveDriverDirectoryLayout(directory string) (DriverDirectoryLayout, erro
 		CountersFile:           filepath.Join(reportsDir, driverCountersReportName),
 		LossReportFile:         filepath.Join(reportsDir, driverLossReportName),
 		ErrorReportFile:        filepath.Join(reportsDir, driverErrorReportName),
+		RingsReportFile:        filepath.Join(reportsDir, driverRingsReportName),
 		ClientsDirectory:       filepath.Join(root, "clients"),
 		PublicationsDirectory:  filepath.Join(root, "publications"),
 		SubscriptionsDirectory: filepath.Join(root, "subscriptions"),
@@ -177,6 +201,9 @@ func openDriverDirectory(cfg DriverConfig) (*driverDirectory, error) {
 			UpdatedAt: now,
 		},
 		Errors: DriverErrorReportFile{
+			UpdatedAt: now,
+		},
+		Rings: DriverRingsReportFile{
 			UpdatedAt: now,
 		},
 	}
@@ -247,6 +274,7 @@ func (state *driverState) flushDriverDirectory(now time.Time, status DriverDirec
 			UpdatedAt: now,
 			Reports:   cloneDriverErrorReports(state.errorReports),
 		},
+		Rings: BuildDriverRingsReport(snapshot, now),
 	}
 	if err := state.directory.writeReport(report); err != nil {
 		return DriverDirectoryReport{}, err
@@ -270,7 +298,43 @@ func (d *driverDirectory) writeReport(report DriverDirectoryReport) error {
 	if err := writeDriverJSONFile(d.layout.ErrorReportFile, report.Errors); err != nil {
 		return fmt.Errorf("write driver error report file: %w", err)
 	}
+	if err := writeDriverJSONFile(d.layout.RingsReportFile, report.Rings); err != nil {
+		return fmt.Errorf("write driver rings report file: %w", err)
+	}
 	return nil
+}
+
+func BuildDriverRingsReport(snapshot DriverSnapshot, now time.Time) DriverRingsReportFile {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	report := DriverRingsReportFile{
+		UpdatedAt: now.UTC(),
+	}
+	for _, subscription := range snapshot.Subscriptions {
+		if !subscription.DataRingMapped && subscription.DataRingPath == "" {
+			continue
+		}
+		usedRatio := 0.0
+		if subscription.DataRingCapacity > 0 {
+			usedRatio = float64(subscription.DataRingUsed) / float64(subscription.DataRingCapacity)
+		}
+		report.Subscriptions = append(report.Subscriptions, DriverSubscriptionRingSnapshot{
+			ResourceID:      subscription.ID,
+			ClientID:        subscription.ClientID,
+			StreamID:        subscription.StreamID,
+			LocalAddr:       subscription.LocalAddr,
+			Path:            subscription.DataRingPath,
+			Capacity:        subscription.DataRingCapacity,
+			Used:            subscription.DataRingUsed,
+			Free:            subscription.DataRingFree,
+			ReadPosition:    subscription.DataRingReadPosition,
+			WritePosition:   subscription.DataRingWritePosition,
+			UsedRatio:       usedRatio,
+			PendingMessages: subscription.DataRingPendingMessages,
+		})
+	}
+	return report
 }
 
 func writeDriverJSONFile(path string, value any) error {

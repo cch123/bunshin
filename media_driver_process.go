@@ -13,20 +13,23 @@ const (
 	defaultDriverProcessHeartbeatInterval = time.Second
 	defaultDriverProcessStaleTimeout      = 5 * time.Second
 	defaultDriverProcessPollLimit         = 64
+	defaultDriverProcessPumpLimit         = 64
 )
 
 var ErrDriverProcessUnavailable = errors.New("bunshin driver process: unavailable")
 
 type DriverProcessConfig struct {
-	Directory           string
-	Driver              DriverConfig
-	CommandRingCapacity int
-	EventRingCapacity   int
-	ResetIPC            bool
-	HeartbeatInterval   time.Duration
-	StaleTimeout        time.Duration
-	PollLimit           int
-	IdleStrategy        IdleStrategy
+	Directory               string
+	Driver                  DriverConfig
+	CommandRingCapacity     int
+	EventRingCapacity       int
+	ResetIPC                bool
+	HeartbeatInterval       time.Duration
+	StaleTimeout            time.Duration
+	PollLimit               int
+	SubscriptionPumpLimit   int
+	DisableSubscriptionPump bool
+	IdleStrategy            IdleStrategy
 }
 
 type DriverProcessStatus struct {
@@ -68,12 +71,13 @@ func RunMediaDriverProcess(ctx context.Context, cfg DriverProcessConfig) error {
 	if err != nil {
 		return err
 	}
+	defer server.Close()
 
 	idle := normalized.IdleStrategy
 	if idle == nil {
 		idle = NewDefaultBackoffIdleStrategy()
 	}
-	if _, err := driver.FlushReports(ctx); err != nil {
+	if _, err := server.FlushReports(ctx); err != nil {
 		return err
 	}
 	nextHeartbeat := time.Now().Add(normalized.HeartbeatInterval)
@@ -89,19 +93,28 @@ func RunMediaDriverProcess(ctx context.Context, cfg DriverProcessConfig) error {
 		if err != nil && !errors.Is(err, ErrIPCRingEmpty) {
 			return err
 		}
+		pumpWork := 0
+		if !normalized.DisableSubscriptionPump {
+			var pumpErr error
+			pumpWork, pumpErr = server.PumpSubscriptions(ctx, normalized.SubscriptionPumpLimit)
+			if pumpErr != nil {
+				return pumpErr
+			}
+		}
+		work += pumpWork
 		if server.Terminated() {
 			return nil
 		}
 
 		now := time.Now()
 		if !now.Before(nextHeartbeat) {
-			if _, err := driver.FlushReports(ctx); err != nil {
+			if _, err := server.FlushReports(ctx); err != nil {
 				return err
 			}
 			nextHeartbeat = now.Add(normalized.HeartbeatInterval)
 			idle.Reset()
 		}
-		if errors.Is(err, ErrIPCRingEmpty) {
+		if errors.Is(err, ErrIPCRingEmpty) && pumpWork == 0 {
 			idle.Idle(0)
 			continue
 		}
@@ -179,10 +192,15 @@ func waitDriverIPCEvent(ctx context.Context, ipc *DriverIPC, correlationID uint6
 			return DriverIPCEvent{}, ctx.Err()
 		default:
 		}
+		if matched, ok := ipc.takePendingEvent(correlationID); ok {
+			return matched, nil
+		}
 		var matched DriverIPCEvent
 		_, err := ipc.PollEvents(1, func(event DriverIPCEvent) error {
 			if event.CorrelationID == correlationID {
 				matched = event
+			} else {
+				ipc.storePendingEvent(event)
 			}
 			return nil
 		})
@@ -231,6 +249,12 @@ func normalizeDriverProcessConfig(cfg DriverProcessConfig) (DriverProcessConfig,
 	}
 	if cfg.PollLimit == 0 {
 		cfg.PollLimit = defaultDriverProcessPollLimit
+	}
+	if cfg.SubscriptionPumpLimit < 0 {
+		return DriverProcessConfig{}, invalidConfigf("invalid driver process subscription pump limit: %d", cfg.SubscriptionPumpLimit)
+	}
+	if cfg.SubscriptionPumpLimit == 0 && !cfg.DisableSubscriptionPump {
+		cfg.SubscriptionPumpLimit = defaultDriverProcessPumpLimit
 	}
 	if cfg.CommandRingCapacity < 0 {
 		return DriverProcessConfig{}, invalidConfigf("invalid driver process command ring capacity: %d", cfg.CommandRingCapacity)

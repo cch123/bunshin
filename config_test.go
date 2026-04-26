@@ -229,6 +229,9 @@ func TestSubscriptionConfigValidateRejectsInvalidValues(t *testing.T) {
 		{name: "negative receiver window", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", ReceiverWindowBytes: -1}},
 		{name: "negative term buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", TermBufferLength: -1}},
 		{name: "invalid term buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", TermBufferLength: minTermLength + 1}},
+		{name: "negative driver data ring capacity", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", DriverDataRingCapacity: -1}},
+		{name: "invalid driver data ring capacity", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", DriverDataRingCapacity: minIPCRingCapacity - 1}},
+		{name: "driver data ring too small for ipc message", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", DriverDataRingCapacity: minDriverIPCMessageRecordBytes - 1}},
 		{name: "negative local spy buffer", cfg: SubscriptionConfig{LocalAddr: "127.0.0.1:0", LocalSpy: true, LocalSpyBuffer: -1}},
 		{name: "local spy missing local address", cfg: SubscriptionConfig{LocalSpy: true}},
 	}

@@ -617,6 +617,60 @@ func TestLocalSpyPollReceivesPublication(t *testing.T) {
 	}
 }
 
+func TestLocalSpyPollBackPressureIsNotReceiveError(t *testing.T) {
+	server, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  232,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		_ = server.Serve(ctx, func(context.Context, Message) error {
+			return nil
+		})
+	}()
+
+	spyMetrics := &Metrics{}
+	spy, err := ListenSubscription(SubscriptionConfig{
+		StreamID:  232,
+		LocalAddr: server.LocalAddr().String(),
+		LocalSpy:  true,
+		Metrics:   spyMetrics,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spy.Close()
+
+	pub, err := DialPublication(PublicationConfig{
+		StreamID:   232,
+		SessionID:  330,
+		RemoteAddr: server.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.Send(ctx, []byte("spy-back-pressure")); err != nil {
+		t.Fatal(err)
+	}
+	n, err := spy.Poll(ctx, func(context.Context, Message) error {
+		return ErrBackPressure
+	})
+	if n != 0 || !errors.Is(err, ErrBackPressure) {
+		t.Fatalf("spy Poll() = %d, %v; want 0, %v", n, err, ErrBackPressure)
+	}
+	if snapshot := spyMetrics.Snapshot(); snapshot.BackPressureEvents != 1 || snapshot.ReceiveErrors != 0 {
+		t.Fatalf("unexpected spy metrics after back pressure: %#v", snapshot)
+	}
+}
+
 func TestSubscriptionImageLifecycle(t *testing.T) {
 	available := make(chan *Image, 1)
 	unavailable := make(chan *Image, 1)

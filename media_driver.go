@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +20,8 @@ const (
 	defaultDriverCleanupPeriod  = time.Second
 	defaultDriverStallThreshold = 50 * time.Millisecond
 )
+
+var driverResponseRingSequence atomic.Uint64
 
 var (
 	ErrDriverClosed              = errors.New("bunshin driver: closed")
@@ -53,13 +57,18 @@ type MediaDriver struct {
 }
 
 type DriverClient struct {
-	driver  *MediaDriver
-	ipc     *DriverIPC
-	id      DriverClientID
-	name    string
-	timeout time.Duration
-	mu      sync.Mutex
-	closed  atomic.Bool
+	driver              *MediaDriver
+	ipc                 *DriverIPC
+	id                  DriverClientID
+	name                string
+	timeout             time.Duration
+	responseRingPath    string
+	cleanupResponseRing bool
+	heartbeatCancel     context.CancelFunc
+	heartbeatDone       chan struct{}
+	heartbeatMu         sync.Mutex
+	mu                  sync.Mutex
+	closed              atomic.Bool
 }
 
 type DriverPublication struct {
@@ -70,10 +79,14 @@ type DriverPublication struct {
 }
 
 type DriverSubscription struct {
-	id           DriverResourceID
-	client       *DriverClient
-	subscription *Subscription
-	localAddr    string
+	id              DriverResourceID
+	client          *DriverClient
+	subscription    *Subscription
+	localAddr       string
+	dataRing        *IPCRing
+	dataRingPath    string
+	pendingMu       sync.Mutex
+	pendingMessages []Message
 }
 
 type DriverClientID uint64
@@ -81,13 +94,15 @@ type DriverClientID uint64
 type DriverResourceID uint64
 
 type DriverConnectionConfig struct {
-	Directory           string
-	CommandRingPath     string
-	EventRingPath       string
-	ClientName          string
-	CommandRingCapacity int
-	EventRingCapacity   int
-	Timeout             time.Duration
+	Directory            string
+	CommandRingPath      string
+	EventRingPath        string
+	ClientName           string
+	CommandRingCapacity  int
+	EventRingCapacity    int
+	Timeout              time.Duration
+	HeartbeatInterval    time.Duration
+	DisableAutoHeartbeat bool
 }
 
 type DriverCounters struct {
@@ -157,11 +172,31 @@ type DriverPublicationSnapshot struct {
 }
 
 type DriverSubscriptionSnapshot struct {
-	ID        DriverResourceID
-	ClientID  DriverClientID
-	StreamID  uint32
-	LocalAddr string
-	CreatedAt time.Time
+	ID                      DriverResourceID
+	ClientID                DriverClientID
+	StreamID                uint32
+	LocalAddr               string
+	CreatedAt               time.Time
+	DataRingPath            string
+	DataRingCapacity        int
+	DataRingUsed            int
+	DataRingFree            int
+	DataRingReadPosition    uint64
+	DataRingWritePosition   uint64
+	DataRingMapped          bool
+	DataRingPendingMessages int
+}
+
+type DriverSubscriptionDataRingStatus struct {
+	Path                  string
+	Capacity              int
+	Used                  int
+	Free                  int
+	ReadPosition          uint64
+	WritePosition         uint64
+	Mapped                bool
+	LocalPendingMessages  int
+	ServerPendingMessages int
 }
 
 type DriverImageSnapshot struct {
@@ -379,6 +414,27 @@ func ConnectMediaDriver(ctx context.Context, cfg DriverConnectionConfig) (*Drive
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if cfg.Timeout < 0 {
+		return nil, invalidConfigf("invalid driver connection timeout: %s", cfg.Timeout)
+	}
+	if cfg.HeartbeatInterval < 0 {
+		return nil, invalidConfigf("invalid driver connection heartbeat interval: %s", cfg.HeartbeatInterval)
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = defaultDriverClientTimeout
+	}
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = defaultDriverClientTimeout / 3
+	}
+	cleanupResponseRing := false
+	if cfg.Directory != "" && cfg.EventRingPath == "" {
+		layout, err := ResolveDriverDirectoryLayout(cfg.Directory)
+		if err != nil {
+			return nil, err
+		}
+		cfg.EventRingPath = nextDriverResponseRingPath(layout.ClientsDirectory)
+		cleanupResponseRing = true
+	}
 	ipc, err := OpenDriverIPC(DriverIPCConfig{
 		Directory:           cfg.Directory,
 		CommandRingPath:     cfg.CommandRingPath,
@@ -390,9 +446,11 @@ func ConnectMediaDriver(ctx context.Context, cfg DriverConnectionConfig) (*Drive
 		return nil, err
 	}
 	client := &DriverClient{
-		ipc:     ipc,
-		name:    cfg.ClientName,
-		timeout: cfg.Timeout,
+		ipc:                 ipc,
+		name:                cfg.ClientName,
+		timeout:             cfg.Timeout,
+		responseRingPath:    cfg.EventRingPath,
+		cleanupResponseRing: cleanupResponseRing,
 	}
 	event, err := client.sendIPCCommand(ctx, DriverIPCCommand{
 		Type:       DriverIPCCommandOpenClient,
@@ -400,11 +458,21 @@ func ConnectMediaDriver(ctx context.Context, cfg DriverConnectionConfig) (*Drive
 	})
 	if err != nil {
 		_ = ipc.Close()
+		client.cleanupOwnedResponseRing()
 		return nil, err
 	}
 	client.id = event.ClientID
 	client.name = event.Message
+	if !cfg.DisableAutoHeartbeat {
+		client.startAutoHeartbeat(cfg.HeartbeatInterval)
+	}
 	return client, nil
+}
+
+func nextDriverResponseRingPath(directory string) string {
+	sequence := driverResponseRingSequence.Add(1)
+	name := fmt.Sprintf("client-events-%d-%d-%d.ring", os.Getpid(), time.Now().UnixNano(), sequence)
+	return filepath.Join(directory, name)
 }
 
 func (d *MediaDriver) Snapshot(ctx context.Context) (DriverSnapshot, error) {
@@ -643,6 +711,61 @@ func (c *DriverClient) Heartbeat(ctx context.Context) error {
 	return err
 }
 
+func (c *DriverClient) startAutoHeartbeat(interval time.Duration) {
+	if c == nil || c.ipc == nil || interval <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.heartbeatMu.Lock()
+	if c.heartbeatCancel != nil {
+		c.heartbeatMu.Unlock()
+		cancel()
+		return
+	}
+	c.heartbeatCancel = cancel
+	c.heartbeatDone = make(chan struct{})
+	done := c.heartbeatDone
+	c.heartbeatMu.Unlock()
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		if err := c.Heartbeat(ctx); errors.Is(err, ErrDriverClientClosed) || errors.Is(err, ErrDriverIPCClosed) {
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				err := c.Heartbeat(ctx)
+				if errors.Is(err, ErrDriverClientClosed) || errors.Is(err, ErrDriverIPCClosed) {
+					return
+				}
+			}
+		}
+	}()
+}
+
+func (c *DriverClient) stopAutoHeartbeat() {
+	if c == nil {
+		return
+	}
+	c.heartbeatMu.Lock()
+	cancel := c.heartbeatCancel
+	done := c.heartbeatDone
+	c.heartbeatCancel = nil
+	c.heartbeatDone = nil
+	c.heartbeatMu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	if done != nil {
+		<-done
+	}
+}
+
 func (c *DriverClient) AddPublication(ctx context.Context, cfg PublicationConfig) (*DriverPublication, error) {
 	if c.closed.Load() {
 		return nil, ErrDriverClientClosed
@@ -737,17 +860,28 @@ func (c *DriverClient) AddSubscription(ctx context.Context, cfg SubscriptionConf
 			Type:     DriverIPCCommandAddSubscription,
 			ClientID: c.id,
 			Subscription: DriverIPCSubscriptionConfig{
-				StreamID:  cfg.StreamID,
-				LocalAddr: cfg.LocalAddr,
+				StreamID:         cfg.StreamID,
+				LocalAddr:        cfg.LocalAddr,
+				DataRingCapacity: cfg.DriverDataRingCapacity,
 			},
 		})
 		if err != nil {
 			return nil, err
 		}
+		var dataRing *IPCRing
+		if event.DataRingPath != "" {
+			dataRing, err = OpenIPCRing(IPCRingConfig{Path: event.DataRingPath})
+			if err != nil {
+				_ = c.CloseSubscription(ctx, event.ResourceID)
+				return nil, err
+			}
+		}
 		return &DriverSubscription{
-			id:        event.ResourceID,
-			client:    c,
-			localAddr: event.Message,
+			id:           event.ResourceID,
+			client:       c,
+			localAddr:    event.Message,
+			dataRing:     dataRing,
+			dataRingPath: event.DataRingPath,
 		}, nil
 	}
 	value, err := c.driver.dispatch(ctx, func(state *driverState) (any, error) {
@@ -865,6 +999,7 @@ func (c *DriverClient) Close(ctx context.Context) error {
 		return nil
 	}
 	if c.ipc != nil {
+		c.stopAutoHeartbeat()
 		_, err := c.sendIPCCommand(ctx, DriverIPCCommand{
 			Type:     DriverIPCCommandCloseClient,
 			ClientID: c.id,
@@ -872,6 +1007,7 @@ func (c *DriverClient) Close(ctx context.Context) error {
 		if err == nil || errors.Is(err, ErrDriverClientClosed) {
 			c.closed.Store(true)
 			closeErr := c.ipc.Close()
+			c.cleanupOwnedResponseRing()
 			if err == nil {
 				return closeErr
 			}
@@ -885,6 +1021,14 @@ func (c *DriverClient) Close(ctx context.Context) error {
 		c.closed.Store(true)
 	}
 	return err
+}
+
+func (c *DriverClient) cleanupOwnedResponseRing() {
+	if c == nil || !c.cleanupResponseRing || c.responseRingPath == "" {
+		return
+	}
+	_ = os.Remove(c.responseRingPath)
+	c.cleanupResponseRing = false
 }
 
 func (p *DriverPublication) ID() DriverResourceID {
@@ -940,7 +1084,7 @@ func (s *DriverSubscription) Poll(ctx context.Context, handler Handler) (int, er
 		return 0, ErrDriverClientClosed
 	}
 	if s.subscription == nil {
-		return 0, ErrDriverExternalUnsupported
+		return s.pollExternal(ctx, 1, maxFrameFragments, handler, nil)
 	}
 	return s.subscription.Poll(ctx, handler)
 }
@@ -950,7 +1094,7 @@ func (s *DriverSubscription) PollN(ctx context.Context, fragmentLimit int, handl
 		return 0, ErrDriverClientClosed
 	}
 	if s.subscription == nil {
-		return 0, ErrDriverExternalUnsupported
+		return s.pollExternal(ctx, fragmentLimit, fragmentLimit, handler, nil)
 	}
 	return s.subscription.PollN(ctx, fragmentLimit, handler)
 }
@@ -960,7 +1104,7 @@ func (s *DriverSubscription) ControlledPoll(ctx context.Context, handler Control
 		return 0, ErrDriverClientClosed
 	}
 	if s.subscription == nil {
-		return 0, ErrDriverExternalUnsupported
+		return s.controlledPollExternal(ctx, 1, handler)
 	}
 	return s.subscription.ControlledPoll(ctx, handler)
 }
@@ -970,7 +1114,7 @@ func (s *DriverSubscription) ControlledPollN(ctx context.Context, fragmentLimit 
 		return 0, ErrDriverClientClosed
 	}
 	if s.subscription == nil {
-		return 0, ErrDriverExternalUnsupported
+		return s.controlledPollExternal(ctx, fragmentLimit, handler)
 	}
 	return s.subscription.ControlledPollN(ctx, fragmentLimit, handler)
 }
@@ -986,28 +1130,629 @@ func (s *DriverSubscription) LocalAddr() net.Addr {
 }
 
 func (s *DriverSubscription) LossReports() []LossReport {
-	if s == nil || s.subscription == nil {
+	if s == nil {
 		return nil
+	}
+	if s.subscription == nil {
+		return s.externalLossReports()
 	}
 	return s.subscription.LossReports()
 }
 
 func (s *DriverSubscription) LagReports() []SubscriptionLagReport {
-	if s == nil || s.subscription == nil {
+	if s == nil {
 		return nil
+	}
+	if s.subscription == nil {
+		return s.externalLagReports()
 	}
 	return s.subscription.LagReports()
 }
 
 func (s *DriverSubscription) Images() []ImageSnapshot {
-	if s == nil || s.subscription == nil {
+	if s == nil {
 		return nil
+	}
+	if s.subscription == nil {
+		return s.externalImages()
 	}
 	return s.subscription.Images()
 }
 
+func (s *DriverSubscription) DataRingSnapshot() (IPCRingSnapshot, bool, error) {
+	if s == nil {
+		return IPCRingSnapshot{}, false, ErrDriverClientClosed
+	}
+	if s.dataRing == nil {
+		return IPCRingSnapshot{}, false, nil
+	}
+	snapshot, err := s.dataRing.Snapshot()
+	return snapshot, true, err
+}
+
+func (s *DriverSubscription) DataRingStatus(ctx context.Context) (DriverSubscriptionDataRingStatus, bool, error) {
+	if s == nil {
+		return DriverSubscriptionDataRingStatus{}, false, ErrDriverClientClosed
+	}
+	status := DriverSubscriptionDataRingStatus{
+		LocalPendingMessages: s.PendingMessages(),
+	}
+	ok := false
+	if s.dataRing != nil {
+		snapshot, err := s.dataRing.Snapshot()
+		if err != nil {
+			return DriverSubscriptionDataRingStatus{}, false, err
+		}
+		status.Path = snapshot.Path
+		status.Capacity = snapshot.Capacity
+		status.Used = snapshot.Used
+		status.Free = snapshot.Free
+		status.ReadPosition = snapshot.ReadPosition
+		status.WritePosition = snapshot.WritePosition
+		status.Mapped = true
+		ok = true
+	}
+	if s.subscription != nil {
+		return status, ok, nil
+	}
+	if s.client == nil {
+		return status, ok, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	snapshot, err := s.client.Snapshot(ctx)
+	if err != nil {
+		return status, ok, err
+	}
+	for _, subscription := range snapshot.Subscriptions {
+		if subscription.ID != s.id {
+			continue
+		}
+		if !ok {
+			status.Path = subscription.DataRingPath
+			status.Capacity = subscription.DataRingCapacity
+			status.Used = subscription.DataRingUsed
+			status.Free = subscription.DataRingFree
+			status.ReadPosition = subscription.DataRingReadPosition
+			status.WritePosition = subscription.DataRingWritePosition
+			status.Mapped = subscription.DataRingMapped
+			ok = subscription.DataRingMapped || subscription.DataRingPath != ""
+		}
+		status.ServerPendingMessages = subscription.DataRingPendingMessages
+		return status, ok, nil
+	}
+	return status, ok, nil
+}
+
+// PendingMessages reports the number of locally buffered external fallback messages.
+func (s *DriverSubscription) PendingMessages() int {
+	if s == nil {
+		return 0
+	}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return len(s.pendingMessages)
+}
+
 func (s *DriverSubscription) Close(ctx context.Context) error {
-	return s.client.CloseSubscription(ctx, s.id)
+	if s == nil || s.client == nil {
+		return ErrDriverClientClosed
+	}
+	err := s.client.CloseSubscription(ctx, s.id)
+	if s.subscription == nil && (err == nil || errors.Is(err, ErrDriverResourceNotFound)) {
+		err = errors.Join(err, s.closeExternalDataRing())
+	}
+	return err
+}
+
+func (s *DriverSubscription) pollDriverOwned(ctx context.Context, messageLimit, fragmentLimit int, handler Handler) (int, error) {
+	if s == nil || s.subscription == nil {
+		return 0, ErrDriverResourceNotFound
+	}
+	return s.subscription.poll(ctx, messageLimit, fragmentLimit, handler, nil)
+}
+
+func (s *DriverSubscription) externalImages() []ImageSnapshot {
+	snapshot, ok := s.externalSnapshot()
+	if !ok {
+		return nil
+	}
+	images := make([]ImageSnapshot, 0)
+	for _, image := range snapshot.Images {
+		if image.ResourceID != s.id {
+			continue
+		}
+		images = append(images, ImageSnapshot{
+			StreamID:             image.StreamID,
+			SessionID:            image.SessionID,
+			Source:               image.Source,
+			InitialTermID:        image.InitialTermID,
+			TermBufferLength:     image.TermBufferLength,
+			JoinPosition:         image.JoinPosition,
+			CurrentPosition:      image.CurrentPosition,
+			ObservedPosition:     image.ObservedPosition,
+			LagBytes:             image.LagBytes,
+			LastSequence:         image.LastSequence,
+			LastObservedSequence: image.LastObservedSequence,
+			AvailableAt:          image.AvailableAt,
+			UnavailableAt:        image.UnavailableAt,
+		})
+	}
+	return images
+}
+
+func (s *DriverSubscription) externalLagReports() []SubscriptionLagReport {
+	snapshot, ok := s.externalSnapshot()
+	if !ok {
+		return nil
+	}
+	reports := make([]SubscriptionLagReport, 0)
+	for _, image := range snapshot.Images {
+		if image.ResourceID != s.id {
+			continue
+		}
+		reports = append(reports, SubscriptionLagReport{
+			StreamID:             image.StreamID,
+			SessionID:            image.SessionID,
+			Source:               image.Source,
+			CurrentPosition:      image.CurrentPosition,
+			ObservedPosition:     image.ObservedPosition,
+			LagBytes:             image.LagBytes,
+			LastSequence:         image.LastSequence,
+			LastObservedSequence: image.LastObservedSequence,
+			AvailableAt:          image.AvailableAt,
+			UnavailableAt:        image.UnavailableAt,
+		})
+	}
+	return reports
+}
+
+func (s *DriverSubscription) externalLossReports() []LossReport {
+	snapshot, ok := s.externalSnapshot()
+	if !ok {
+		return nil
+	}
+	reports := make([]LossReport, 0)
+	for _, report := range snapshot.LossReports {
+		if report.ResourceID != s.id {
+			continue
+		}
+		reports = append(reports, LossReport{
+			StreamID:         report.StreamID,
+			SessionID:        report.SessionID,
+			Source:           report.Source,
+			ObservationCount: report.ObservationCount,
+			MissingMessages:  report.MissingMessages,
+			FirstObservation: report.FirstObservation,
+			LastObservation:  report.LastObservation,
+		})
+	}
+	return reports
+}
+
+func (s *DriverSubscription) externalSnapshot() (DriverSnapshot, bool) {
+	if s == nil || s.client == nil {
+		return DriverSnapshot{}, false
+	}
+	snapshot, err := s.client.Snapshot(context.Background())
+	if err != nil {
+		return DriverSnapshot{}, false
+	}
+	return snapshot, true
+}
+
+func (s *DriverSubscription) closeExternalDataRing() error {
+	if s == nil || s.dataRing == nil {
+		return nil
+	}
+	err := s.dataRing.Close()
+	s.dataRing = nil
+	return err
+}
+
+func (s *DriverSubscription) controlledPollExternal(ctx context.Context, fragmentLimit int, handler ControlledHandler) (int, error) {
+	if s == nil || s.client == nil {
+		return 0, ErrDriverClientClosed
+	}
+	if handler == nil {
+		return 0, errors.New("controlled handler is required")
+	}
+	if fragmentLimit <= 0 {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	idle := NewDefaultBackoffIdleStrategy()
+	delivered := 0
+	for delivered < fragmentLimit {
+		select {
+		case <-ctx.Done():
+			if delivered > 0 {
+				return delivered, nil
+			}
+			return 0, ctx.Err()
+		default:
+		}
+		n, ok, stop, err := s.controlledPollExternalPending(ctx, handler)
+		if err != nil {
+			return delivered + n, err
+		}
+		if ok {
+			delivered += n
+			if stop {
+				return delivered, nil
+			}
+			continue
+		}
+		if s.dataRing != nil {
+			n, ok, stop, err := s.controlledPollExternalDataRing(ctx, handler)
+			if err != nil {
+				return delivered + n, err
+			}
+			if ok {
+				delivered += n
+				if stop {
+					return delivered, nil
+				}
+				continue
+			}
+		}
+		event, err := s.client.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:          DriverIPCCommandPollSubscription,
+			ClientID:      s.client.id,
+			ResourceID:    s.id,
+			MessageLimit:  1,
+			FragmentLimit: fragmentLimit - delivered,
+		})
+		if err != nil {
+			if delivered > 0 && isContextDoneError(err) {
+				return delivered, nil
+			}
+			return delivered, err
+		}
+		if event.Type != DriverIPCEventSubscriptionPolled {
+			return delivered, ErrDriverIPCProtocol
+		}
+		if event.BackPressured && event.MessageCount == 0 && len(event.Messages) == 0 {
+			idle.Idle(0)
+			continue
+		}
+		if event.MessageCount == 0 && len(event.Messages) == 0 {
+			idle.Idle(0)
+			continue
+		}
+		if s.dataRing != nil && event.MessageCount > 0 {
+			n, ok, stop, err := s.controlledPollExternalDataRing(ctx, handler)
+			if err != nil {
+				return delivered + n, err
+			}
+			if !ok {
+				return delivered, ErrDriverIPCProtocol
+			}
+			delivered += n
+			if stop {
+				return delivered, nil
+			}
+			continue
+		}
+		if len(event.Messages) > 0 {
+			s.enqueueExternalPendingIPCMessages(event.Messages)
+			n, ok, stop, err := s.controlledPollExternalPending(ctx, handler)
+			if err != nil {
+				return delivered + n, err
+			}
+			if !ok {
+				return delivered, ErrDriverIPCProtocol
+			}
+			delivered += n
+			if stop {
+				return delivered, nil
+			}
+			continue
+		}
+		msg, err := s.readExternalMessage(event)
+		if err != nil {
+			return delivered, err
+		}
+		switch action := handler(ctx, msg); action {
+		case ControlledPollContinue, ControlledPollCommit:
+			delivered++
+		case ControlledPollBreak:
+			return delivered + 1, nil
+		case ControlledPollAbort:
+			return delivered, ErrControlledPollAbort
+		default:
+			return delivered, invalidConfigf("invalid controlled poll action: %d", action)
+		}
+	}
+	return delivered, nil
+}
+
+func (s *DriverSubscription) pollExternal(ctx context.Context, messageLimit, fragmentLimit int, handler Handler, shouldStop func() bool) (int, error) {
+	if s == nil || s.client == nil {
+		return 0, ErrDriverClientClosed
+	}
+	if handler == nil {
+		return 0, errors.New("handler is required")
+	}
+	if messageLimit <= 0 || fragmentLimit <= 0 {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	idle := NewDefaultBackoffIdleStrategy()
+	deliveredTotal := 0
+	for deliveredTotal < messageLimit && deliveredTotal < fragmentLimit && !pollShouldStop(shouldStop) {
+		select {
+		case <-ctx.Done():
+			if deliveredTotal > 0 {
+				return deliveredTotal, nil
+			}
+			return 0, ctx.Err()
+		default:
+		}
+		remainingMessages := messageLimit - deliveredTotal
+		remainingFragments := fragmentLimit - deliveredTotal
+		delivered, err := s.drainExternalPending(ctx, min(remainingMessages, remainingFragments), handler, shouldStop)
+		if err != nil {
+			return deliveredTotal + delivered, err
+		}
+		deliveredTotal += delivered
+		if deliveredTotal >= messageLimit || deliveredTotal >= fragmentLimit || pollShouldStop(shouldStop) {
+			return deliveredTotal, nil
+		}
+		remainingMessages = messageLimit - deliveredTotal
+		remainingFragments = fragmentLimit - deliveredTotal
+		if s.dataRing != nil {
+			delivered, err = s.drainExternalDataRing(ctx, min(remainingMessages, remainingFragments), handler, shouldStop)
+			if err != nil && !errors.Is(err, ErrIPCRingEmpty) {
+				return deliveredTotal + delivered, err
+			}
+			deliveredTotal += delivered
+			if deliveredTotal >= messageLimit || deliveredTotal >= fragmentLimit || pollShouldStop(shouldStop) {
+				return deliveredTotal, nil
+			}
+		}
+		event, err := s.client.sendIPCCommand(ctx, DriverIPCCommand{
+			Type:          DriverIPCCommandPollSubscription,
+			ClientID:      s.client.id,
+			ResourceID:    s.id,
+			MessageLimit:  messageLimit - deliveredTotal,
+			FragmentLimit: fragmentLimit - deliveredTotal,
+		})
+		if err != nil {
+			if deliveredTotal > 0 && isContextDoneError(err) {
+				return deliveredTotal, nil
+			}
+			return deliveredTotal, err
+		}
+		if event.Type != DriverIPCEventSubscriptionPolled {
+			return deliveredTotal, ErrDriverIPCProtocol
+		}
+		if event.BackPressured && event.MessageCount == 0 && len(event.Messages) == 0 {
+			if deliveredTotal > 0 {
+				return deliveredTotal, nil
+			}
+			idle.Idle(0)
+			continue
+		}
+		if event.MessageCount == 0 && len(event.Messages) == 0 {
+			if deliveredTotal > 0 {
+				return deliveredTotal, nil
+			}
+			idle.Idle(0)
+			continue
+		}
+		delivered, err = s.drainExternalMessages(ctx, event, handler, shouldStop)
+		deliveredTotal += delivered
+		if err != nil {
+			return deliveredTotal, err
+		}
+	}
+	return deliveredTotal, nil
+}
+
+func (s *DriverSubscription) enqueueExternalPendingIPCMessages(messages []DriverIPCMessage) {
+	if s == nil || len(messages) == 0 {
+		return
+	}
+	pending := make([]Message, 0, len(messages))
+	for _, ipcMessage := range messages {
+		pending = append(pending, ipcMessage.message())
+	}
+	s.pendingMu.Lock()
+	s.pendingMessages = append(s.pendingMessages, pending...)
+	s.pendingMu.Unlock()
+}
+
+func (s *DriverSubscription) peekExternalPending() (Message, bool) {
+	if s == nil {
+		return Message{}, false
+	}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if len(s.pendingMessages) == 0 {
+		return Message{}, false
+	}
+	return cloneMessage(s.pendingMessages[0]), true
+}
+
+func (s *DriverSubscription) commitExternalPending() {
+	if s == nil {
+		return
+	}
+	s.pendingMu.Lock()
+	if len(s.pendingMessages) > 0 {
+		copy(s.pendingMessages, s.pendingMessages[1:])
+		s.pendingMessages[len(s.pendingMessages)-1] = Message{}
+		s.pendingMessages = s.pendingMessages[:len(s.pendingMessages)-1]
+	}
+	s.pendingMu.Unlock()
+}
+
+func (s *DriverSubscription) drainExternalPending(ctx context.Context, limit int, handler Handler, shouldStop func() bool) (int, error) {
+	if limit <= 0 || pollShouldStop(shouldStop) {
+		return 0, nil
+	}
+	delivered := 0
+	for delivered < limit && !pollShouldStop(shouldStop) {
+		msg, ok := s.peekExternalPending()
+		if !ok {
+			return delivered, nil
+		}
+		if err := handler(ctx, msg); err != nil {
+			return delivered, err
+		}
+		s.commitExternalPending()
+		delivered++
+	}
+	return delivered, nil
+}
+
+func (s *DriverSubscription) controlledPollExternalPending(ctx context.Context, handler ControlledHandler) (int, bool, bool, error) {
+	msg, ok := s.peekExternalPending()
+	if !ok {
+		return 0, false, false, nil
+	}
+	switch action := handler(ctx, msg); action {
+	case ControlledPollContinue, ControlledPollCommit:
+		s.commitExternalPending()
+		return 1, true, false, nil
+	case ControlledPollBreak:
+		s.commitExternalPending()
+		return 1, true, true, nil
+	case ControlledPollAbort:
+		return 0, true, true, ErrControlledPollAbort
+	default:
+		return 0, true, true, invalidConfigf("invalid controlled poll action: %d", action)
+	}
+}
+
+func (s *DriverSubscription) controlledPollExternalDataRing(ctx context.Context, handler ControlledHandler) (int, bool, bool, error) {
+	if s == nil || s.dataRing == nil {
+		return 0, false, false, ErrDriverIPCClosed
+	}
+	delivered := 0
+	handled := false
+	stop := false
+	_, err := pollDriverIPCMessages(s.dataRing, 1, func(ipcMessage DriverIPCMessage) error {
+		handled = true
+		switch action := handler(ctx, ipcMessage.message()); action {
+		case ControlledPollContinue, ControlledPollCommit:
+			delivered = 1
+			return nil
+		case ControlledPollBreak:
+			delivered = 1
+			stop = true
+			return nil
+		case ControlledPollAbort:
+			stop = true
+			return ErrControlledPollAbort
+		default:
+			stop = true
+			return invalidConfigf("invalid controlled poll action: %d", action)
+		}
+	})
+	if err != nil {
+		if errors.Is(err, ErrIPCRingEmpty) {
+			return 0, false, false, nil
+		}
+		return delivered, handled, stop, err
+	}
+	return delivered, handled, stop, nil
+}
+
+func isContextDoneError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func (s *DriverSubscription) readExternalMessage(event DriverIPCEvent) (Message, error) {
+	if s != nil && s.dataRing != nil && event.MessageCount > 0 {
+		out, ok, err := s.readExternalDataRingMessage()
+		if err != nil {
+			return Message{}, err
+		}
+		if !ok {
+			return Message{}, ErrDriverIPCProtocol
+		}
+		return out, nil
+	}
+	if len(event.Messages) == 0 {
+		return Message{}, ErrDriverIPCProtocol
+	}
+	return event.Messages[0].message(), nil
+}
+
+func (s *DriverSubscription) drainExternalMessages(ctx context.Context, event DriverIPCEvent, handler Handler, shouldStop func() bool) (int, error) {
+	if pollShouldStop(shouldStop) {
+		return 0, nil
+	}
+	if s != nil && s.dataRing != nil && event.MessageCount > 0 {
+		if len(event.Messages) > 0 {
+			return 0, ErrDriverIPCProtocol
+		}
+		delivered, err := s.drainExternalDataRing(ctx, event.MessageCount, handler, shouldStop)
+		if err != nil {
+			return delivered, err
+		}
+		if delivered != event.MessageCount && !pollShouldStop(shouldStop) {
+			return delivered, ErrDriverIPCProtocol
+		}
+		return delivered, nil
+	}
+	if len(event.Messages) == 0 {
+		return 0, nil
+	}
+	s.enqueueExternalPendingIPCMessages(event.Messages)
+	return s.drainExternalPending(ctx, len(event.Messages), handler, shouldStop)
+}
+
+func (s *DriverSubscription) readExternalDataRingMessage() (Message, bool, error) {
+	if s == nil || s.dataRing == nil {
+		return Message{}, false, ErrDriverIPCClosed
+	}
+	var out Message
+	n, err := pollDriverIPCMessages(s.dataRing, 1, func(ipcMessage DriverIPCMessage) error {
+		out = ipcMessage.message()
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrIPCRingEmpty) {
+			return Message{}, false, nil
+		}
+		return Message{}, false, err
+	}
+	return out, n == 1, nil
+}
+
+func (s *DriverSubscription) drainExternalDataRing(ctx context.Context, limit int, handler Handler, shouldStop func() bool) (int, error) {
+	if s == nil || s.dataRing == nil {
+		return 0, ErrDriverIPCClosed
+	}
+	if limit <= 0 || pollShouldStop(shouldStop) {
+		return 0, nil
+	}
+	delivered := 0
+	n, err := pollDriverIPCMessages(s.dataRing, limit, func(ipcMessage DriverIPCMessage) error {
+		if err := handler(ctx, ipcMessage.message()); err != nil {
+			return err
+		}
+		delivered++
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrIPCRingEmpty) && delivered > 0 {
+			return delivered, nil
+		}
+		return delivered, err
+	}
+	if n == 0 && delivered == 0 {
+		return 0, ErrIPCRingEmpty
+	}
+	return delivered, nil
 }
 
 func (c *DriverClient) sendIPCCommand(ctx context.Context, command DriverIPCCommand) (DriverIPCEvent, error) {
@@ -1036,9 +1781,30 @@ func (c *DriverClient) sendIPCCommand(ctx context.Context, command DriverIPCComm
 		return DriverIPCEvent{}, err
 	}
 	if event.Type == DriverIPCEventCommandError {
-		return DriverIPCEvent{}, errors.New(event.Error)
+		return DriverIPCEvent{}, driverIPCCommandError(event.Error)
 	}
 	return event, nil
+}
+
+func driverIPCCommandError(message string) error {
+	switch {
+	case strings.Contains(message, ErrDriverClientClosed.Error()):
+		return fmt.Errorf("%w: %s", ErrDriverClientClosed, message)
+	case strings.Contains(message, ErrDriverResourceNotFound.Error()):
+		return fmt.Errorf("%w: %s", ErrDriverResourceNotFound, message)
+	case strings.Contains(message, ErrDriverClosed.Error()):
+		return fmt.Errorf("%w: %s", ErrDriverClosed, message)
+	case strings.Contains(message, ErrDriverExternalUnsupported.Error()):
+		return fmt.Errorf("%w: %s", ErrDriverExternalUnsupported, message)
+	case strings.Contains(message, ErrBackPressure.Error()):
+		return fmt.Errorf("%w: %s", ErrBackPressure, message)
+	case strings.Contains(message, ErrDriverIPCProtocol.Error()):
+		return fmt.Errorf("%w: %s", ErrDriverIPCProtocol, message)
+	case strings.Contains(message, ErrInvalidConfig.Error()):
+		return fmt.Errorf("%w: %s", ErrInvalidConfig, message)
+	default:
+		return errors.New(message)
+	}
 }
 
 type driverNetAddr string

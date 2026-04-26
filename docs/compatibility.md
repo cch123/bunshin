@@ -35,7 +35,7 @@ Implemented Bunshin-native areas:
 - Publication/subscription API with QUIC and explicit UDP transports.
 - Term-buffer position model and back pressure.
 - UDP status, NAK repair, multicast, multi-destination, and local spy support.
-- Embeddable and out-of-process media driver boundary with IPC command rings, mmap-backed publication term buffers, and configurable driver agent loops.
+- Embeddable and out-of-process media driver boundary with IPC command rings, per-client response rings, mmap-backed publication term buffers, per-subscription mmap data rings, and configurable driver agent loops.
 - Archive recording, replay, catalog, segment operations, replay merge, and replication.
 - Cluster replicated-log, snapshot, backup, learner, and control primitives.
 - Driver counters, loss reports, error reports, and CLI inspection.
@@ -44,7 +44,7 @@ Known gaps versus a mature Aeron-style stack:
 
 - Bunshin does not implement Aeron wire protocol, Aeron CnC files, Aeron Archive protocol, or Aeron Cluster protocol.
 - Bunshin does not expose Aeron client APIs or guarantee behavior parity with Aeron tools.
-- External driver subscriptions are owned by the driver process, but out-of-process clients do not yet poll shared images like Aeron clients.
+- External driver subscriptions can be polled by out-of-process clients over Bunshin IPC and per-subscription mmap data rings, including explicit data-ring back-pressure status, but clients do not yet poll full shared images like Aeron clients.
 - QUIC is the default reliable transport. The UDP backend has Bunshin-native status and NAK repair, but it is not a full Aeron setup/status/NAK/RTT/congestion-control implementation.
 - Bunshin Archive records delivered Bunshin messages and metadata. It does not yet record raw Aeron-style image fragments or expose SBE control and recording-event streams.
 - Bunshin Cluster is a local replicated-log service container. It does not yet provide remote member communication, quorum durable commit, or automatic backup promotion.

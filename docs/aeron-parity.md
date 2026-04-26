@@ -12,7 +12,7 @@ The remaining gaps are mostly semantic depth, not just missing names. Aeron beha
 
 | Area | Aeron reference behavior | Bunshin status | Gap if pursuing parity |
 | --- | --- | --- | --- |
-| Client and driver API | Clients communicate with an out-of-process media driver over IPC and consume publications/images through shared log buffers. | External clients can register resources and send through driver IPC. External subscriptions are owned by the driver, but remote `Serve`/`Poll` is not supported. | Add shared-image polling for out-of-process clients, including image lifecycle, position tracking, and back-pressure semantics across the driver boundary. |
+| Client and driver API | Clients communicate with an out-of-process media driver over IPC and consume publications/images through shared log buffers. | External clients can register resources, send through driver IPC, receive command responses on per-client response rings, poll driver-owned subscriptions through per-subscription mmap data rings, inspect data-ring capacity and occupancy in driver snapshots, and receive explicit back-pressured poll events when a data ring cannot accept more payloads. | Promote the data rings into shared-image polling, including image lifecycle and position tracking across the driver boundary. |
 | Driver directory and CnC | Aeron tools read a CnC file, counters, error log, loss report, and driver mark files with stable binary layouts. | Bunshin writes JSON mark, counter, loss, and error reports plus typed IPC rings. | Decide whether to implement Aeron-compatible formats, build adapters, or keep Bunshin-native formats as an explicit non-goal. |
 | Transport protocol | Aeron UDP uses data, setup, status, NAK, RTT, loss detection, retransmit, image rebuild, flow control, and congestion control inside the media-driver protocol. | QUIC is default. UDP has Bunshin DATA/STATUS/NAK, multicast, multi-destination, and local spy behavior. | Deepen UDP into a full media-driver data path with setup/status/NAK/RTT lifecycle, receiver-side term rebuilding, endpoint state, loss recovery, and congestion-control semantics. |
 | Flow control and MDC | Aeron has unicast, min/max multicast, tagged/preferred multicast flow control, dynamic/manual multi-destination-cast, receiver liveness, and endpoint status counters. | Bunshin has unicast and multicast-oriented flow-control strategies, dynamic destinations, multicast support, and re-resolution. | Add full MDC control modes, receiver liveness semantics, tagged/preferred receiver behavior, and status counters that match the runtime decisions. |
@@ -43,7 +43,30 @@ Use this list for incremental Aeron-semantic alignment work. Checked items can s
 - [ ] Add raw stream/image recording so archive segments can replay recorded fragments instead of only delivered Bunshin messages.
 - [ ] Add an external archive control protocol with correlation IDs, control sessions, and recording event/signal streams.
 - [ ] Add live archive replication and follow-on replay merge tied to live stream state.
-- [ ] Add external-driver subscription polling over shared or mmap-backed image state.
+- [x] Add external-driver subscription polling over driver IPC message batches.
+- [x] Add external-driver controlled polling over driver IPC without swallowing messages after `break`.
+- [x] Expose external-driver subscription image, lag, and loss diagnostics from driver snapshots.
+- [x] Route external-driver command responses to per-client response rings so concurrent external clients cannot consume each other's events.
+- [x] Move external-driver subscription payload delivery from command response events onto per-subscription mmap data rings.
+- [x] Expose external-driver subscription data ring path, capacity, and occupancy in driver snapshots.
+- [x] Add configurable external-driver subscription data ring capacity.
+- [x] Reconcile IPC-server subscription data rings after driver-side stale-client cleanup.
+- [x] Preserve common driver sentinel errors across IPC command-error responses.
+- [x] Return explicit back-pressured poll events when external subscription data rings cannot accept more payloads.
+- [x] Preflight external subscription data-ring capacity so back-pressured polls do not consume transport messages.
+- [x] Fallback oversized external subscription payloads to correlated response events when the data ring cannot hold them.
+- [x] Expose local external subscription data-ring snapshots on `DriverSubscription`.
+- [x] Expose local external subscription fallback pending-message counts on `DriverSubscription`.
+- [x] Pump external-driver subscriptions into mmap data rings from the driver process duty loop.
+- [x] Queue background-pumped oversized external subscription payloads as ordered fallback poll messages.
+- [x] Expose combined external subscription data-ring and fallback pending status on `DriverSubscription`.
+- [x] Preserve external-driver `PollN` accumulation while keeping data-ring writes single-message safe.
+- [x] Preserve external-driver controlled-poll abort semantics for mmap data-ring records.
+- [x] Preserve oversized response-event fallback messages after handler errors or controlled-poll aborts.
+- [x] Add a `bunshin-driver rings` command for external subscription data-ring diagnostics.
+- [x] Persist external subscription data-ring diagnostics to driver directory reports.
+- [x] Include server-side external subscription fallback pending counts in live and persisted rings diagnostics.
+- [ ] Promote external-driver subscription polling to shared or mmap-backed image state.
 - [ ] Add receiver-side term/image rebuilding for UDP loss recovery.
 - [ ] Add Aeron-like UDP setup, status, NAK, RTT, and endpoint lifecycle semantics.
 - [ ] Add full multi-destination-cast control modes, receiver liveness, and tagged or preferred receiver flow control.

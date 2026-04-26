@@ -793,7 +793,9 @@ func (s *Subscription) serveUDP(ctx context.Context, handler Handler) error {
 		case frameData:
 			go func(remote net.Addr, f frame) {
 				if err := s.dataUDP(ctx, remote, f, handler); err != nil {
-					s.metrics.incReceiveErrors()
+					if !errors.Is(err, ErrBackPressure) {
+						s.metrics.incReceiveErrors()
+					}
 				}
 			}(remote, f)
 		default:

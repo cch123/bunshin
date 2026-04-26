@@ -38,22 +38,23 @@ type Message struct {
 type Handler func(context.Context, Message) error
 
 type SubscriptionConfig struct {
-	Transport             TransportMode
-	StreamID              uint32
-	LocalAddr             string
-	TLSConfig             *tls.Config
-	QUICConfig            *quic.Config
-	Metrics               *Metrics
-	Logger                Logger
-	LossHandler           LossHandler
-	AvailableImage        ImageHandler
-	UnavailableImage      ImageHandler
-	UDPMulticastInterface string
-	LocalSpy              bool
-	LocalSpyBuffer        int
-	Archive               *Archive
-	ReceiverWindowBytes   int
-	TermBufferLength      int
+	Transport              TransportMode
+	StreamID               uint32
+	LocalAddr              string
+	TLSConfig              *tls.Config
+	QUICConfig             *quic.Config
+	Metrics                *Metrics
+	Logger                 Logger
+	LossHandler            LossHandler
+	AvailableImage         ImageHandler
+	UnavailableImage       ImageHandler
+	UDPMulticastInterface  string
+	LocalSpy               bool
+	LocalSpyBuffer         int
+	Archive                *Archive
+	ReceiverWindowBytes    int
+	TermBufferLength       int
+	DriverDataRingCapacity int
 
 	// PacketConn is an advanced hook for tests and custom transports. When set, LocalAddr is ignored and the caller owns closing it.
 	PacketConn net.PacketConn
@@ -447,7 +448,9 @@ func (s *Subscription) deliverQUICData(ctx context.Context, remote net.Addr, str
 			return s.writeError(stream, msg.StreamID, msg.SessionID, msg.Sequence, protocolErrorMalformedFrame, err.Error())
 		},
 	}, handler); err != nil {
-		s.metrics.incReceiveErrors()
+		if !errors.Is(err, ErrBackPressure) {
+			s.metrics.incReceiveErrors()
+		}
 		return false, err
 	}
 	return true, nil
@@ -482,6 +485,17 @@ func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, h
 		}, nil)
 	}
 	if err := handler(ctx, msg); err != nil {
+		if errors.Is(err, ErrBackPressure) {
+			s.metrics.incBackPressureEvents()
+			s.log(ctx, LogLevelWarn, "handler", "receiver back pressured", map[string]any{
+				"stream_id":   msg.StreamID,
+				"session_id":  msg.SessionID,
+				"sequence":    msg.Sequence,
+				"bytes":       len(msg.Payload),
+				"remote_addr": remoteAddrString(msg.Remote),
+			}, err)
+			return err
+		}
 		s.metrics.incReceiveErrors()
 		s.log(ctx, LogLevelWarn, "handler", "handler failed", map[string]any{
 			"stream_id":   msg.StreamID,

@@ -36,6 +36,8 @@ func main() {
 		value, err = lossDriver(os.Args[2:])
 	case "streams":
 		value, err = streamsDriver(os.Args[2:])
+	case "rings":
+		value, err = ringsDriver(os.Args[2:])
 	case "flush":
 		value, err = flushDriver(os.Args[2:])
 	case "terminate":
@@ -73,6 +75,8 @@ func runDriver(args []string) error {
 	commandRingCapacity := flags.Int("command-ring-capacity", 64*1024, "driver IPC command ring capacity")
 	eventRingCapacity := flags.Int("event-ring-capacity", 64*1024, "driver IPC event ring capacity")
 	pollLimit := flags.Int("poll-limit", 64, "max IPC commands to poll per driver loop")
+	subscriptionPumpLimit := flags.Int("subscription-pump-limit", 64, "max external subscription messages to pump per driver loop")
+	disableSubscriptionPump := flags.Bool("disable-subscription-pump", false, "disable background pumping of external subscriptions into data rings")
 	preserveIPC := flags.Bool("preserve-ipc", false, "preserve existing IPC ring contents")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -91,12 +95,14 @@ func runDriver(args []string) error {
 			CleanupInterval:       *cleanupInterval,
 			DirectoryStaleTimeout: *staleTimeout,
 		},
-		CommandRingCapacity: *commandRingCapacity,
-		EventRingCapacity:   *eventRingCapacity,
-		ResetIPC:            !*preserveIPC,
-		HeartbeatInterval:   *heartbeat,
-		StaleTimeout:        *staleTimeout,
-		PollLimit:           *pollLimit,
+		CommandRingCapacity:     *commandRingCapacity,
+		EventRingCapacity:       *eventRingCapacity,
+		ResetIPC:                !*preserveIPC,
+		HeartbeatInterval:       *heartbeat,
+		StaleTimeout:            *staleTimeout,
+		PollLimit:               *pollLimit,
+		SubscriptionPumpLimit:   *subscriptionPumpLimit,
+		DisableSubscriptionPump: *disableSubscriptionPump,
 	})
 }
 
@@ -165,9 +171,13 @@ func streamsDriver(args []string) (bunshin.DriverSnapshot, error) {
 	if *dir == "" {
 		return bunshin.DriverSnapshot{}, errors.New("driver directory is required")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	return driverSnapshot(*dir, *timeout)
+}
+
+func driverSnapshot(dir string, timeout time.Duration) (bunshin.DriverSnapshot, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	event, err := sendDriverIPCCommand(ctx, *dir, bunshin.DriverIPCCommand{
+	event, err := sendDriverIPCCommand(ctx, dir, bunshin.DriverIPCCommand{
 		Type: bunshin.DriverIPCCommandSnapshot,
 	})
 	if err != nil {
@@ -177,6 +187,29 @@ func streamsDriver(args []string) (bunshin.DriverSnapshot, error) {
 		return bunshin.DriverSnapshot{}, errors.New("driver returned no snapshot")
 	}
 	return *event.Snapshot, nil
+}
+
+func ringsDriver(args []string) (bunshin.DriverRingsReportFile, error) {
+	flags := flag.NewFlagSet("rings", flag.ExitOnError)
+	dir := flags.String("dir", "", "driver directory")
+	timeout := flags.Duration("timeout", 5*time.Second, "snapshot timeout")
+	report := flags.Bool("report", false, "read the persisted rings report instead of querying the live driver")
+	if err := flags.Parse(args); err != nil {
+		return bunshin.DriverRingsReportFile{}, err
+	}
+	if *dir == "" {
+		return bunshin.DriverRingsReportFile{}, errors.New("driver directory is required")
+	}
+	if *report {
+		return readDriverReport[bunshin.DriverRingsReportFile](*dir, func(layout bunshin.DriverDirectoryLayout) string {
+			return layout.RingsReportFile
+		})
+	}
+	snapshot, err := driverSnapshot(*dir, *timeout)
+	if err != nil {
+		return bunshin.DriverRingsReportFile{}, err
+	}
+	return bunshin.BuildDriverRingsReport(snapshot, time.Now()), nil
 }
 
 func flushDriver(args []string) (bunshin.DriverDirectoryReport, error) {
@@ -236,13 +269,20 @@ func readDriverReport[T any](dir string, path func(bunshin.DriverDirectoryLayout
 }
 
 func sendDriverIPCCommand(ctx context.Context, dir string, command bunshin.DriverIPCCommand) (bunshin.DriverIPCEvent, error) {
+	layout, err := bunshin.ResolveDriverDirectoryLayout(dir)
+	if err != nil {
+		return bunshin.DriverIPCEvent{}, err
+	}
+	responseRingPath := fmt.Sprintf("%s/tool-events-%d-%d.ring", layout.ClientsDirectory, os.Getpid(), time.Now().UnixNano())
 	ipc, err := bunshin.OpenDriverIPC(bunshin.DriverIPCConfig{
-		Directory: dir,
+		Directory:     dir,
+		EventRingPath: responseRingPath,
 	})
 	if err != nil {
 		return bunshin.DriverIPCEvent{}, err
 	}
 	defer ipc.Close()
+	defer os.Remove(responseRingPath)
 
 	correlationID, err := ipc.SendCommand(ctx, command, nil)
 	if err != nil {
@@ -290,6 +330,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       bunshin-driver errors -dir PATH")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver loss -dir PATH")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver streams -dir PATH [options]")
+	fmt.Fprintln(os.Stderr, "       bunshin-driver rings -dir PATH [-report] [options]")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver flush -dir PATH [options]")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver terminate -dir PATH [options]")
 }

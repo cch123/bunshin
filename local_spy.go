@@ -129,7 +129,9 @@ func (s *Subscription) serveLocalSpy(ctx context.Context, handler Handler) error
 				msg:      msg,
 				position: msg.Position,
 			}, handler); err != nil {
-				s.metrics.incReceiveErrors()
+				if !errors.Is(err, ErrBackPressure) {
+					s.metrics.incReceiveErrors()
+				}
 			}
 		}
 	}

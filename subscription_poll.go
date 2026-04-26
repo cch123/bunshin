@@ -73,7 +73,9 @@ func (s *Subscription) pollLocalSpy(ctx context.Context, messageLimit, fragmentL
 				msg:      msg,
 				position: msg.Position,
 			}, handler); err != nil {
-				s.metrics.incReceiveErrors()
+				if !errors.Is(err, ErrBackPressure) {
+					s.metrics.incReceiveErrors()
+				}
 				return delivered, err
 			}
 			delivered++
@@ -137,7 +139,9 @@ func (s *Subscription) pollUDP(ctx context.Context, messageLimit, fragmentLimit 
 			fragments++
 			ready, err := s.deliverUDPData(ctx, remote, f, handler)
 			if err != nil {
-				s.metrics.incReceiveErrors()
+				if !errors.Is(err, ErrBackPressure) {
+					s.metrics.incReceiveErrors()
+				}
 				return delivered, err
 			}
 			if ready {
@@ -170,9 +174,9 @@ func (s *Subscription) pollQUIC(ctx context.Context, messageLimit, fragmentLimit
 		}
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
-			s.clearPollQUICConn(conn)
 			select {
 			case <-s.closed:
+				s.clearPollQUICConn(conn)
 				if delivered > 0 || fragments > 0 {
 					return delivered, nil
 				}
@@ -188,6 +192,7 @@ func (s *Subscription) pollQUIC(ctx context.Context, messageLimit, fragmentLimit
 				}
 				return 0, ctx.Err()
 			}
+			s.clearPollQUICConn(conn)
 			return delivered, err
 		}
 		dataFrames, ready, err := s.pollQUICStream(ctx, conn.RemoteAddr(), stream, handler)

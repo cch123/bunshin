@@ -147,6 +147,17 @@ func normalizeSubscriptionConfig(cfg SubscriptionConfig) (SubscriptionConfig, er
 	if cfg.TermBufferLength < 0 {
 		return SubscriptionConfig{}, invalidConfigf("invalid subscription term buffer length: %d", cfg.TermBufferLength)
 	}
+	if cfg.DriverDataRingCapacity < 0 {
+		return SubscriptionConfig{}, invalidConfigf("invalid subscription driver data ring capacity: %d", cfg.DriverDataRingCapacity)
+	}
+	if cfg.DriverDataRingCapacity > 0 {
+		if err := validateIPCRingCapacity(cfg.DriverDataRingCapacity); err != nil {
+			return SubscriptionConfig{}, invalidConfigWrap(err)
+		}
+		if cfg.DriverDataRingCapacity < minDriverIPCMessageRecordBytes {
+			return SubscriptionConfig{}, invalidConfigf("invalid subscription driver data ring capacity: %d", cfg.DriverDataRingCapacity)
+		}
+	}
 	if cfg.LocalSpyBuffer < 0 {
 		return SubscriptionConfig{}, invalidConfigf("invalid local spy buffer: %d", cfg.LocalSpyBuffer)
 	}

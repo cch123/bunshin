@@ -170,7 +170,30 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 These tasks are beyond the current Bunshin-native roadmap. They are required only if Bunshin should move closer to Aeron runtime semantics. They do not imply Aeron wire, API, file, or tool compatibility unless a task explicitly calls for an adapter.
 
 - [ ] Keep `docs/aeron-parity.md` current as the source of truth for Aeron semantic parity gaps.
-- [ ] Define an external-driver subscription data path where out-of-process clients can poll shared or mmap-backed images instead of relying on embeddable callbacks.
+- [x] Add IPC-backed external-driver subscription polling so out-of-process clients can consume driver-owned subscriptions without embeddable callbacks.
+- [x] Add IPC-backed external-driver controlled polling with break and abort semantics.
+- [x] Expose external-driver subscription images, lag reports, and loss reports from driver snapshots.
+- [x] Route external-driver command responses to per-client response rings so concurrent external clients cannot consume each other's events.
+- [x] Move external-driver subscription payload delivery from command response events onto per-subscription mmap data rings.
+- [x] Expose external-driver subscription data ring path, capacity, and occupancy in driver snapshots.
+- [x] Add configurable external-driver subscription data ring capacity.
+- [x] Reconcile IPC-server subscription data rings after driver-side stale-client cleanup.
+- [x] Preserve common driver sentinel errors across IPC command-error responses.
+- [x] Return explicit back-pressured poll events when external subscription data rings cannot accept more payloads.
+- [x] Preflight external subscription data-ring capacity so back-pressured polls do not consume transport messages.
+- [x] Fallback oversized external subscription payloads to correlated response events when the data ring cannot hold them.
+- [x] Expose local external subscription data-ring snapshots on `DriverSubscription`.
+- [x] Expose local external subscription fallback pending-message counts on `DriverSubscription`.
+- [x] Pump external-driver subscriptions into mmap data rings from the driver process duty loop.
+- [x] Queue background-pumped oversized external subscription payloads as ordered fallback poll messages.
+- [x] Expose combined external subscription data-ring and fallback pending status on `DriverSubscription`.
+- [x] Preserve external-driver `PollN` accumulation while keeping data-ring writes single-message safe.
+- [x] Preserve external-driver controlled-poll abort semantics for mmap data-ring records.
+- [x] Preserve oversized response-event fallback messages after handler errors or controlled-poll aborts.
+- [x] Add a `bunshin-driver rings` command for external subscription data-ring diagnostics.
+- [x] Persist external subscription data-ring diagnostics to driver directory reports.
+- [x] Include server-side external subscription fallback pending counts in live and persisted rings diagnostics.
+- [ ] Promote the external-driver subscription data path from IPC message batches to shared or mmap-backed images.
 - [ ] Add Aeron-style driver CnC, counter, error, and loss-report semantics, or document an explicit adapter boundary for each format that remains Bunshin-native.
 - [ ] Deepen the UDP transport with setup, status, NAK, RTT, loss, and receiver image rebuilding semantics comparable to Aeron's media-driver protocol.
 - [ ] Add full multi-destination-cast semantics, including manual and dynamic control modes, receiver liveness, and tagged or preferred receiver flow-control behavior.
