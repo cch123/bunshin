@@ -35,19 +35,23 @@ Implemented Bunshin-native areas:
 - Publication/subscription API with QUIC and explicit UDP transports.
 - Term-buffer position model and back pressure.
 - UDP status, NAK repair, multicast, multi-destination, and local spy support.
-- Embeddable and out-of-process media driver boundary with IPC command rings.
+- Embeddable and out-of-process media driver boundary with IPC command rings, mmap-backed publication term buffers, and configurable driver agent loops.
 - Archive recording, replay, catalog, segment operations, replay merge, and replication.
 - Cluster replicated-log, snapshot, backup, learner, and control primitives.
 - Driver counters, loss reports, error reports, and CLI inspection.
 
 Known gaps versus a mature Aeron-style stack:
 
-- Driver-managed term buffers are not yet backed by shared mmap files.
-- Driver conductor, sender, and receiver agent loops are not yet split into independently configurable loops.
 - Bunshin does not implement Aeron wire protocol, Aeron CnC files, Aeron Archive protocol, or Aeron Cluster protocol.
 - Bunshin does not expose Aeron client APIs or guarantee behavior parity with Aeron tools.
-- Performance tuning, runtime pinning, socket tuning, and long-running soak coverage are still incomplete.
-- Benchmark coverage exists, but it is not yet a full low-latency capacity plan.
+- External driver subscriptions are owned by the driver process, but out-of-process clients do not yet poll shared images like Aeron clients.
+- QUIC is the default reliable transport. The UDP backend has Bunshin-native status and NAK repair, but it is not a full Aeron setup/status/NAK/RTT/congestion-control implementation.
+- Bunshin Archive records delivered Bunshin messages and metadata. It does not yet record raw Aeron-style image fragments or expose SBE control and recording-event streams.
+- Bunshin Cluster is a local replicated-log service container. It does not yet provide remote member communication, quorum durable commit, or automatic backup promotion.
+- Tooling reads Bunshin JSON reports and native catalogs, not Aeron CnC, catalog, SBE, AeronStat, LossStat, ArchiveTool, or ClusterTool formats.
+- Performance tuning, runtime pinning, socket tuning, and capacity benchmarks still need an Aeron comparison baseline.
+
+The deeper gap list is tracked in `docs/aeron-parity.md` and the "Aeron Semantic Parity Backlog" section of `TASKS.md`.
 
 ## Migration Boundary
 

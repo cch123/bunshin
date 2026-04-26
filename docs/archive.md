@@ -96,12 +96,13 @@ control, err := bunshin.StartArchiveControlServer(archive, bunshin.ArchiveContro
 
 ## Replay
 
-Replay starts from a recording position. A zero `RecordingID` replays all recordings in catalog order. A zero `StreamID` or `SessionID` in the replay config means "all".
+Replay starts from a recording position. A zero `RecordingID` replays all recordings in catalog order. A zero `StreamID` or `SessionID` in the replay config means "all". A zero `Length` is open-ended and replays to the recording stop position. A positive `Length` bounds replay to the archive-position byte range `[FromPosition, FromPosition+Length)`. If the range ends inside a record, replay stops before delivering that partial record.
 
 ```go
 err := archive.Replay(ctx, bunshin.ArchiveReplayConfig{
     RecordingID:  1,
     FromPosition: 0,
+    Length:       1024 * 1024,
     StreamID:      1,
 }, func(ctx context.Context, msg bunshin.Message) error {
     fmt.Printf("%d %s\n", msg.Sequence, msg.Payload)

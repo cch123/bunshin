@@ -75,6 +75,44 @@ func TestArchiveRecordReplayAndFilter(t *testing.T) {
 
 	replayed = nil
 	err = archive.Replay(context.Background(), ArchiveReplayConfig{
+		RecordingID:  first.RecordingID,
+		FromPosition: first.Position,
+		Length:       first.NextPosition - first.Position,
+	}, func(_ context.Context, msg Message) error {
+		replayed = append(replayed, msg)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 1 || replayed[0].Sequence != 1 || string(replayed[0].Payload) != "one" {
+		t.Fatalf("unexpected bounded replay: %#v", replayed)
+	}
+
+	replayed = nil
+	err = archive.Replay(context.Background(), ArchiveReplayConfig{
+		RecordingID:  first.RecordingID,
+		FromPosition: first.Position,
+		Length:       first.NextPosition - first.Position - 1,
+	}, func(_ context.Context, msg Message) error {
+		replayed = append(replayed, msg)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 0 {
+		t.Fatalf("short bounded replay crossed a record boundary: %#v", replayed)
+	}
+
+	if err := archive.Replay(context.Background(), ArchiveReplayConfig{Length: -1}, func(context.Context, Message) error {
+		return nil
+	}); !errors.Is(err, ErrArchivePosition) {
+		t.Fatalf("Replay() err = %v, want %v", err, ErrArchivePosition)
+	}
+
+	replayed = nil
+	err = archive.Replay(context.Background(), ArchiveReplayConfig{
 		FromPosition: first.Position,
 		StreamID:     11,
 	}, func(_ context.Context, msg Message) error {

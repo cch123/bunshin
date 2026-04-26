@@ -39,6 +39,8 @@ API stability notes are documented in [docs/api.md](docs/api.md).
 
 Compatibility, licensing, trademark, and feature-gap notes are documented in [docs/compatibility.md](docs/compatibility.md).
 
+Aeron semantic parity gaps are tracked in [docs/aeron-parity.md](docs/aeron-parity.md).
+
 Transport direction is documented in [docs/transport-decision.md](docs/transport-decision.md). The current default transport is `quic-go`; `TransportUDP` is available explicitly for Bunshin-native UDP experiments. The built-in self-signed TLS configuration is intended for development and tests on the QUIC path.
 
 Benchmark commands are documented in [docs/benchmarks.md](docs/benchmarks.md).

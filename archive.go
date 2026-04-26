@@ -107,6 +107,7 @@ type ArchiveRecord struct {
 type ArchiveReplayConfig struct {
 	RecordingID  int64
 	FromPosition int64
+	Length       int64
 	StreamID     uint32
 	SessionID    uint32
 }
@@ -356,6 +357,12 @@ func (a *Archive) Replay(ctx context.Context, cfg ArchiveReplayConfig, handler H
 	if cfg.FromPosition < 0 {
 		return fmt.Errorf("%w: %d", ErrArchivePosition, cfg.FromPosition)
 	}
+	if cfg.Length < 0 {
+		return fmt.Errorf("%w: %d", ErrArchivePosition, cfg.Length)
+	}
+	if cfg.Length > 0 && cfg.FromPosition > int64(^uint64(0)>>1)-cfg.Length {
+		return fmt.Errorf("%w: replay length overflows position: from=%d length=%d", ErrArchivePosition, cfg.FromPosition, cfg.Length)
+	}
 
 	recordings, err := a.recordingSnapshot(cfg.RecordingID)
 	if err != nil {
@@ -366,7 +373,8 @@ func (a *Archive) Replay(ctx context.Context, cfg ArchiveReplayConfig, handler H
 			return fmt.Errorf("%w: %d", ErrArchivePosition, cfg.FromPosition)
 		}
 		position := max(cfg.FromPosition, desc.StartPosition)
-		for position < desc.StopPosition {
+		replayLimit := archiveReplayLimit(cfg, desc)
+		for position < replayLimit {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -378,6 +386,9 @@ func (a *Archive) Replay(ctx context.Context, cfg ArchiveReplayConfig, handler H
 				return err
 			}
 			position = entry.record.NextPosition
+			if entry.record.NextPosition > replayLimit {
+				break
+			}
 			if entry.padding || !archiveReplayMatch(cfg, entry.record.Message) {
 				continue
 			}
@@ -387,6 +398,13 @@ func (a *Archive) Replay(ctx context.Context, cfg ArchiveReplayConfig, handler H
 		}
 	}
 	return nil
+}
+
+func archiveReplayLimit(cfg ArchiveReplayConfig, desc ArchiveRecordingDescriptor) int64 {
+	if cfg.Length <= 0 {
+		return desc.StopPosition
+	}
+	return min(desc.StopPosition, cfg.FromPosition+cfg.Length)
 }
 
 func (a *Archive) IntegrityScan() (ArchiveIntegrityReport, error) {

@@ -164,3 +164,23 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 - [x] Add architecture diagrams for client, driver, transport, archive, and cluster layers.
 - [x] Add Bunshin protocol evolution and recording migration notes.
 - [x] Document Aeron feature parity gaps without implying interoperability.
+
+## Aeron Semantic Parity Backlog
+
+These tasks are beyond the current Bunshin-native roadmap. They are required only if Bunshin should move closer to Aeron runtime semantics. They do not imply Aeron wire, API, file, or tool compatibility unless a task explicitly calls for an adapter.
+
+- [ ] Keep `docs/aeron-parity.md` current as the source of truth for Aeron semantic parity gaps.
+- [ ] Define an external-driver subscription data path where out-of-process clients can poll shared or mmap-backed images instead of relying on embeddable callbacks.
+- [ ] Add Aeron-style driver CnC, counter, error, and loss-report semantics, or document an explicit adapter boundary for each format that remains Bunshin-native.
+- [ ] Deepen the UDP transport with setup, status, NAK, RTT, loss, and receiver image rebuilding semantics comparable to Aeron's media-driver protocol.
+- [ ] Add full multi-destination-cast semantics, including manual and dynamic control modes, receiver liveness, and tagged or preferred receiver flow-control behavior.
+- [x] Add bounded archive replay by recording ID, position, and length while keeping zero length open-ended.
+- [ ] Record raw stream/image frames in archive segments so replay can operate on recorded fragments rather than only delivered Bunshin messages.
+- [ ] Promote archive control and recording-event streams from an in-process API to an external protocol with correlation IDs and control-session semantics.
+- [ ] Implement archive live replication and follow-on replay merge against live stream state rather than only Bunshin message metadata.
+- [ ] Add remote cluster member transport for replication, consensus messages, ingress, egress, and snapshot transfer.
+- [ ] Add quorum commit semantics so services consume entries only after a majority has durably recorded the log, with leader failover and catch-up tests.
+- [ ] Integrate cluster log and snapshot storage with archive-style durable recordings.
+- [ ] Turn membership-change and rolling-upgrade planners into applied runtime membership transitions.
+- [ ] Add Aeron parity benchmarks comparing QUIC, Bunshin UDP/IPC, and any Aeron-backed adapter under the same workloads.
+- [ ] Decide which Aeron wire, API, and tool compatibility items remain explicit non-goals versus adapter projects.
