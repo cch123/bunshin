@@ -35,6 +35,7 @@ func TestMediaDriverDirectoryWritesMarkCountersAndReports(t *testing.T) {
 	assertDriverFileExists(t, layout.LossReportFile)
 	assertDriverFileExists(t, layout.ErrorReportFile)
 	assertDriverFileExists(t, layout.RingsReportFile)
+	assertDriverFileExists(t, layout.StreamsReportFile)
 	assertDriverDirectoryExists(t, layout.ClientsDirectory)
 	assertDriverDirectoryExists(t, layout.PublicationsDirectory)
 	assertDriverDirectoryExists(t, layout.SubscriptionsDirectory)
@@ -79,6 +80,9 @@ func TestMediaDriverDirectoryWritesMarkCountersAndReports(t *testing.T) {
 	if len(report.Rings.Subscriptions) != 0 {
 		t.Fatalf("unexpected rings report: %#v", report.Rings)
 	}
+	if len(report.Streams.Snapshot.Clients) != 1 || report.Streams.Snapshot.Clients[0].Name != "directory-client" {
+		t.Fatalf("unexpected streams report: %#v", report.Streams)
+	}
 
 	counters := readDriverJSON[DriverCountersFile](t, layout.CountersFile)
 	if counters.Counters.ClientsRegistered != 1 || counters.Counters.CommandsFailed != 1 ||
@@ -102,6 +106,10 @@ func TestMediaDriverDirectoryWritesMarkCountersAndReports(t *testing.T) {
 	rings := readDriverJSON[DriverRingsReportFile](t, layout.RingsReportFile)
 	if len(rings.Subscriptions) != 0 {
 		t.Fatalf("unexpected rings report file: %#v", rings)
+	}
+	streams := readDriverJSON[DriverStreamsReportFile](t, layout.StreamsReportFile)
+	if len(streams.Snapshot.Clients) != 1 || streams.Snapshot.Clients[0].Name != "directory-client" {
+		t.Fatalf("unexpected streams report file: %#v", streams)
 	}
 
 	if err := driver.Close(); err != nil {

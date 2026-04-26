@@ -175,28 +175,29 @@ These tasks are beyond the current Bunshin-native roadmap. They are required onl
 - [x] Add IPC-backed external-driver controlled polling with break and abort semantics.
 - [x] Expose external-driver subscription images, lag reports, and loss reports from driver snapshots.
 - [x] Route external-driver command responses to per-client response rings so concurrent external clients cannot consume each other's events.
-- [x] Move external-driver subscription payload delivery from command response events onto per-subscription mmap data rings.
-- [x] Expose external-driver subscription data ring path, capacity, and occupancy in driver snapshots.
-- [x] Add configurable external-driver subscription data ring capacity.
-- [x] Reconcile IPC-server subscription data rings after driver-side stale-client cleanup.
+- [x] Move external-driver subscription payload delivery from command response events onto per-subscription mmap shared images.
+- [x] Expose external-driver subscription shared-image path, capacity, and occupancy in driver snapshots.
+- [x] Add configurable external-driver subscription shared-image capacity through the compatibility `DriverDataRingCapacity` option.
+- [x] Reconcile IPC-server subscription shared images after driver-side stale-client cleanup.
 - [x] Preserve common driver sentinel errors across IPC command-error responses.
-- [x] Return explicit back-pressured poll events when external subscription data rings cannot accept more payloads.
-- [x] Preflight external subscription data-ring capacity so back-pressured polls do not consume transport messages.
-- [x] Fallback oversized external subscription payloads to correlated response events when the data ring cannot hold them.
-- [x] Expose local external subscription data-ring snapshots on `DriverSubscription`.
+- [x] Return explicit back-pressured poll events when external subscription shared images cannot accept more payloads.
+- [x] Preflight external subscription shared-image capacity so back-pressured polls do not consume transport messages.
+- [x] Fallback oversized external subscription payloads to correlated response events when the shared image cannot hold them.
+- [x] Expose local external subscription shared-image snapshots on `DriverSubscription`.
 - [x] Expose local external subscription fallback pending-message counts on `DriverSubscription`.
-- [x] Pump external-driver subscriptions into mmap data rings from the driver process duty loop.
+- [x] Pump external-driver subscriptions into mmap shared images from the driver process duty loop.
 - [x] Queue background-pumped oversized external subscription payloads as ordered fallback poll messages.
-- [x] Expose combined external subscription data-ring and fallback pending status on `DriverSubscription`.
-- [x] Preserve external-driver `PollN` accumulation while keeping data-ring writes single-message safe.
-- [x] Preserve external-driver controlled-poll abort semantics for mmap data-ring records.
+- [x] Expose combined external subscription shared-image and fallback pending status on `DriverSubscription`.
+- [x] Preserve external-driver `PollN` accumulation while keeping shared-image writes single-message safe.
+- [x] Preserve external-driver controlled-poll abort semantics for mmap shared-image records.
 - [x] Preserve oversized response-event fallback messages after handler errors or controlled-poll aborts.
-- [x] Add a `bunshin-driver rings` command for external subscription data-ring diagnostics.
-- [x] Persist external subscription data-ring diagnostics to driver directory reports.
+- [x] Add a `bunshin-driver rings` command for external subscription shared-image diagnostics.
+- [x] Persist external subscription shared-image diagnostics to driver directory reports.
 - [x] Include server-side external subscription fallback pending counts in live and persisted rings diagnostics.
-- [ ] Promote the external-driver subscription data path from IPC message batches to shared or mmap-backed images.
+- [x] Persist full driver stream snapshots for offline publication/subscription transport diagnostics.
+- [x] Promote the external-driver subscription data path from IPC message batches to shared or mmap-backed images.
 - [x] Add Aeron-style driver CnC, counter, error, and loss-report semantics, or document an explicit adapter boundary for each format that remains Bunshin-native.
-- [ ] Deepen the UDP transport with richer loss recovery and congestion-control semantics comparable to Aeron's media-driver protocol. Receiver-side image rebuild buffers now report out-of-order rebuild lag before delivery.
+- [x] Deepen the UDP transport with richer loss recovery and congestion-control semantics comparable to Aeron's media-driver protocol. Receiver-side image rebuild buffers, optional NAK retry, optional AIMD congestion-window policy, per-destination STATUS/ACK/NAK/retransmit/cache-miss/timeout diagnostics, and receiver-side UDP peer diagnostics are in place.
 - [x] Add full multi-destination-cast semantics, including manual and dynamic control modes, receiver liveness, and tagged or preferred receiver flow-control behavior.
 - [x] Add bounded archive replay by recording ID, position, and length while keeping zero length open-ended.
 - [x] Record raw stream/image frames in archive segments so replay can operate on recorded fragments rather than only delivered Bunshin messages.

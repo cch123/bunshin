@@ -23,8 +23,6 @@ const (
 var (
 	ErrDriverIPCClosed   = errors.New("bunshin driver ipc: closed")
 	ErrDriverIPCProtocol = errors.New("bunshin driver ipc: protocol error")
-
-	minDriverIPCMessageRecordBytes = driverIPCMessageRecordBytes(DriverIPCMessage{StreamID: defaultStreamID})
 )
 
 type DriverIPCCommandType string
@@ -97,43 +95,60 @@ type DriverIPCCommand struct {
 }
 
 type DriverIPCPublicationConfig struct {
-	StreamID               uint32 `json:"stream_id,omitempty"`
-	SessionID              uint32 `json:"session_id,omitempty"`
-	RemoteAddr             string `json:"remote_addr,omitempty"`
-	MaxPayloadBytes        int    `json:"max_payload_bytes,omitempty"`
-	MTUBytes               int    `json:"mtu_bytes,omitempty"`
-	TermBufferLength       int    `json:"term_buffer_length,omitempty"`
-	InitialTermID          int32  `json:"initial_term_id,omitempty"`
-	PublicationWindowBytes int    `json:"publication_window_bytes,omitempty"`
+	Transport                 TransportMode `json:"transport,omitempty"`
+	StreamID                  uint32        `json:"stream_id,omitempty"`
+	SessionID                 uint32        `json:"session_id,omitempty"`
+	RemoteAddr                string        `json:"remote_addr,omitempty"`
+	UDPDestinations           []string      `json:"udp_destinations,omitempty"`
+	UDPMulticastInterface     string        `json:"udp_multicast_interface,omitempty"`
+	UDPNameResolutionInterval time.Duration `json:"udp_name_resolution_interval,omitempty"`
+	UDPReceiverTimeout        time.Duration `json:"udp_receiver_timeout,omitempty"`
+	MaxPayloadBytes           int           `json:"max_payload_bytes,omitempty"`
+	MTUBytes                  int           `json:"mtu_bytes,omitempty"`
+	UDPRetransmitBufferBytes  int           `json:"udp_retransmit_buffer_bytes,omitempty"`
+	TermBufferLength          int           `json:"term_buffer_length,omitempty"`
+	InitialTermID             int32         `json:"initial_term_id,omitempty"`
+	PublicationWindowBytes    int           `json:"publication_window_bytes,omitempty"`
 }
 
 type DriverIPCSubscriptionConfig struct {
-	StreamID         uint32 `json:"stream_id,omitempty"`
-	LocalAddr        string `json:"local_addr,omitempty"`
-	DataRingCapacity int    `json:"data_ring_capacity,omitempty"`
+	Transport             TransportMode `json:"transport,omitempty"`
+	StreamID              uint32        `json:"stream_id,omitempty"`
+	LocalAddr             string        `json:"local_addr,omitempty"`
+	UDPMulticastInterface string        `json:"udp_multicast_interface,omitempty"`
+	UDPNakRetryInterval   time.Duration `json:"udp_nak_retry_interval,omitempty"`
+	ReceiverWindowBytes   int           `json:"receiver_window_bytes,omitempty"`
+	TermBufferLength      int           `json:"term_buffer_length,omitempty"`
+	DataRingCapacity      int           `json:"data_ring_capacity,omitempty"`
 }
 
 type DriverIPCEvent struct {
-	Version               int                    `json:"version"`
-	CorrelationID         uint64                 `json:"correlation_id,omitempty"`
-	Type                  DriverIPCEventType     `json:"type"`
-	CommandType           DriverIPCCommandType   `json:"command_type,omitempty"`
-	ClientID              DriverClientID         `json:"client_id,omitempty"`
-	ResourceID            DriverResourceID       `json:"resource_id,omitempty"`
-	DataRingPath          string                 `json:"data_ring_path,omitempty"`
-	DataRingCapacity      int                    `json:"data_ring_capacity,omitempty"`
-	DataRingUsed          int                    `json:"data_ring_used,omitempty"`
-	DataRingFree          int                    `json:"data_ring_free,omitempty"`
-	DataRingReadPosition  uint64                 `json:"data_ring_read_position,omitempty"`
-	DataRingWritePosition uint64                 `json:"data_ring_write_position,omitempty"`
-	BackPressured         bool                   `json:"back_pressured,omitempty"`
-	MessageCount          int                    `json:"message_count,omitempty"`
-	Message               string                 `json:"message,omitempty"`
-	Error                 string                 `json:"error,omitempty"`
-	Messages              []DriverIPCMessage     `json:"messages,omitempty"`
-	Snapshot              *DriverSnapshot        `json:"snapshot,omitempty"`
-	Directory             *DriverDirectoryReport `json:"directory,omitempty"`
-	At                    time.Time              `json:"at"`
+	Version                int                    `json:"version"`
+	CorrelationID          uint64                 `json:"correlation_id,omitempty"`
+	Type                   DriverIPCEventType     `json:"type"`
+	CommandType            DriverIPCCommandType   `json:"command_type,omitempty"`
+	ClientID               DriverClientID         `json:"client_id,omitempty"`
+	ResourceID             DriverResourceID       `json:"resource_id,omitempty"`
+	DataImagePath          string                 `json:"data_image_path,omitempty"`
+	DataImageCapacity      int                    `json:"data_image_capacity,omitempty"`
+	DataImageUsed          int                    `json:"data_image_used,omitempty"`
+	DataImageFree          int                    `json:"data_image_free,omitempty"`
+	DataImageReadPosition  uint64                 `json:"data_image_read_position,omitempty"`
+	DataImageWritePosition uint64                 `json:"data_image_write_position,omitempty"`
+	DataRingPath           string                 `json:"data_ring_path,omitempty"`
+	DataRingCapacity       int                    `json:"data_ring_capacity,omitempty"`
+	DataRingUsed           int                    `json:"data_ring_used,omitempty"`
+	DataRingFree           int                    `json:"data_ring_free,omitempty"`
+	DataRingReadPosition   uint64                 `json:"data_ring_read_position,omitempty"`
+	DataRingWritePosition  uint64                 `json:"data_ring_write_position,omitempty"`
+	BackPressured          bool                   `json:"back_pressured,omitempty"`
+	MessageCount           int                    `json:"message_count,omitempty"`
+	Message                string                 `json:"message,omitempty"`
+	Error                  string                 `json:"error,omitempty"`
+	Messages               []DriverIPCMessage     `json:"messages,omitempty"`
+	Snapshot               *DriverSnapshot        `json:"snapshot,omitempty"`
+	Directory              *DriverDirectoryReport `json:"directory,omitempty"`
+	At                     time.Time              `json:"at"`
 }
 
 type DriverIPCMessage struct {
@@ -162,8 +177,8 @@ type DriverIPCServer struct {
 	publicationOwners    map[DriverResourceID]DriverClientID
 	subscriptionOwners   map[DriverResourceID]DriverClientID
 	responseRings        map[string]*IPCRing
-	dataRings            map[DriverResourceID]*IPCRing
-	dataRingPaths        map[DriverResourceID]string
+	dataImages           map[DriverResourceID]*DriverSubscriptionImage
+	dataImagePaths       map[DriverResourceID]string
 	subscriptionFallback map[DriverResourceID][]DriverIPCMessage
 }
 
@@ -225,8 +240,8 @@ func NewDriverIPCServer(driver *MediaDriver, ipc *DriverIPC) (*DriverIPCServer, 
 		publicationOwners:    make(map[DriverResourceID]DriverClientID),
 		subscriptionOwners:   make(map[DriverResourceID]DriverClientID),
 		responseRings:        make(map[string]*IPCRing),
-		dataRings:            make(map[DriverResourceID]*IPCRing),
-		dataRingPaths:        make(map[DriverResourceID]string),
+		dataImages:           make(map[DriverResourceID]*DriverSubscriptionImage),
+		dataImagePaths:       make(map[DriverResourceID]string),
 		subscriptionFallback: make(map[DriverResourceID][]DriverIPCMessage),
 	}, nil
 }
@@ -388,7 +403,7 @@ func (s *DriverIPCServer) Close() error {
 		}
 		delete(s.responseRings, path)
 	}
-	for id := range s.dataRings {
+	for id := range s.dataImages {
 		err = errors.Join(err, s.closeSubscriptionDataRing(id, true))
 	}
 	return err
@@ -419,11 +434,11 @@ func (s *DriverIPCServer) PumpSubscriptions(ctx context.Context, limit int) (int
 			continue
 		}
 		subscription := s.subscriptions[id]
-		dataRing := s.dataRings[id]
-		if subscription == nil || dataRing == nil {
+		dataImage := s.dataImages[id]
+		if subscription == nil || dataImage == nil {
 			continue
 		}
-		n, err := s.pumpSubscription(ctx, id, subscription, dataRing, limit-work)
+		n, err := s.pumpSubscription(ctx, id, subscription, dataImage, limit-work)
 		work += n
 		if err != nil {
 			return work, err
@@ -432,15 +447,15 @@ func (s *DriverIPCServer) PumpSubscriptions(ctx context.Context, limit int) (int
 	return work, nil
 }
 
-func (s *DriverIPCServer) pumpSubscription(ctx context.Context, id DriverResourceID, subscription *DriverSubscription, dataRing *IPCRing, limit int) (int, error) {
+func (s *DriverIPCServer) pumpSubscription(ctx context.Context, id DriverResourceID, subscription *DriverSubscription, dataImage *DriverSubscriptionImage, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
-	snapshot, err := dataRing.Snapshot()
+	snapshot, err := dataImage.Snapshot()
 	if err != nil {
 		return 0, err
 	}
-	if snapshot.Free < minDriverIPCMessageRecordBytes {
+	if snapshot.Free < minDriverSubscriptionImageRecordBytes {
 		return 0, nil
 	}
 	pollCtx, cancel := context.WithTimeout(ctx, defaultDriverIPCSubscriptionPumpWindow)
@@ -452,7 +467,7 @@ func (s *DriverIPCServer) pumpSubscription(ctx context.Context, id DriverResourc
 	var writeErr error
 	_, err = subscription.pollDriverOwned(pollCtx, 1, limit, func(_ context.Context, msg Message) error {
 		ipcMessage := driverIPCMessageFromMessage(msg)
-		if err := writeDriverIPCMessage(pollCtx, dataRing, ipcMessage); err != nil {
+		if err := writeDriverSubscriptionImageMessage(dataImage, msg); err != nil {
 			if errors.Is(err, ErrBackPressure) {
 				if subscription.subscription != nil {
 					subscription.subscription.metrics.incBackPressureEvents()
@@ -509,10 +524,20 @@ func (s *DriverIPCServer) FlushReports(ctx context.Context) (DriverDirectoryRepo
 	if err != nil {
 		return DriverDirectoryReport{}, err
 	}
-	rings := BuildDriverRingsReport(snapshot, time.Now())
+	now := time.Now()
+	rings := BuildDriverRingsReport(snapshot, now)
 	report.Rings = rings
+	report.Streams = DriverStreamsReportFile{
+		UpdatedAt: now.UTC(),
+		Snapshot:  snapshot,
+	}
 	if report.Layout.RingsReportFile != "" {
 		if err := writeDriverJSONFile(report.Layout.RingsReportFile, rings); err != nil {
+			return DriverDirectoryReport{}, err
+		}
+	}
+	if report.Layout.StreamsReportFile != "" {
+		if err := writeDriverJSONFile(report.Layout.StreamsReportFile, report.Streams); err != nil {
 			return DriverDirectoryReport{}, err
 		}
 	}
@@ -579,12 +604,12 @@ func (s *DriverIPCServer) responseRing(path string) (*IPCRing, error) {
 	return ring, nil
 }
 
-func (s *DriverIPCServer) openSubscriptionDataRing(id DriverResourceID, capacity int) (*IPCRing, string, error) {
+func (s *DriverIPCServer) openSubscriptionDataRing(id DriverResourceID, capacity int) (*DriverSubscriptionImage, string, error) {
 	if capacity == 0 {
 		capacity = defaultDriverIPCSubscriptionDataRing
 	}
 	path := s.subscriptionDataRingPath(id)
-	ring, err := OpenIPCRing(IPCRingConfig{
+	image, err := OpenDriverSubscriptionImage(DriverSubscriptionImageConfig{
 		Path:     path,
 		Capacity: capacity,
 		Reset:    true,
@@ -592,21 +617,21 @@ func (s *DriverIPCServer) openSubscriptionDataRing(id DriverResourceID, capacity
 	if err != nil {
 		return nil, "", err
 	}
-	s.dataRings[id] = ring
-	s.dataRingPaths[id] = path
-	return ring, path, nil
+	s.dataImages[id] = image
+	s.dataImagePaths[id] = path
+	return image, path, nil
 }
 
 func (s *DriverIPCServer) subscriptionDataRingPath(id DriverResourceID) string {
 	if s != nil && s.driver != nil {
 		if layout, ok := s.driver.Directory(); ok {
-			return filepath.Join(layout.BuffersDirectory, "subscriptions", fmt.Sprintf("subscription-%d", id), "data.ring")
+			return filepath.Join(layout.BuffersDirectory, "subscriptions", fmt.Sprintf("subscription-%d", id), "image.dat")
 		}
 	}
 	if s != nil && s.ipc != nil && s.ipc.eventRing != nil && s.ipc.eventRing.path != "" {
-		return filepath.Join(filepath.Dir(s.ipc.eventRing.path), "subscriptions", fmt.Sprintf("subscription-%d", id), "data.ring")
+		return filepath.Join(filepath.Dir(s.ipc.eventRing.path), "subscriptions", fmt.Sprintf("subscription-%d", id), "image.dat")
 	}
-	return filepath.Join(os.TempDir(), "bunshin-driver", "subscriptions", fmt.Sprintf("subscription-%d", id), "data.ring")
+	return filepath.Join(os.TempDir(), "bunshin-driver", "subscriptions", fmt.Sprintf("subscription-%d", id), "image.dat")
 }
 
 func (s *DriverIPCServer) closeSubscriptionDataRing(id DriverResourceID, remove bool) error {
@@ -614,12 +639,12 @@ func (s *DriverIPCServer) closeSubscriptionDataRing(id DriverResourceID, remove 
 		return nil
 	}
 	var err error
-	if ring := s.dataRings[id]; ring != nil {
-		err = errors.Join(err, ring.Close())
+	if image := s.dataImages[id]; image != nil {
+		err = errors.Join(err, image.Close())
 	}
-	path := s.dataRingPaths[id]
-	delete(s.dataRings, id)
-	delete(s.dataRingPaths, id)
+	path := s.dataImagePaths[id]
+	delete(s.dataImages, id)
+	delete(s.dataImagePaths, id)
 	delete(s.subscriptionFallback, id)
 	if remove && path != "" {
 		err = errors.Join(err, os.Remove(path))
@@ -719,7 +744,7 @@ func (s *DriverIPCServer) handleCommand(ctx context.Context, command DriverIPCCo
 		if err != nil {
 			return driverIPCErrorEvent(command, err)
 		}
-		_, dataRingPath, err := s.openSubscriptionDataRing(subscription.ID(), command.Subscription.DataRingCapacity)
+		_, dataImagePath, err := s.openSubscriptionDataRing(subscription.ID(), command.Subscription.DataRingCapacity)
 		if err != nil {
 			_ = subscription.Close(ctx)
 			return driverIPCErrorEvent(command, err)
@@ -728,7 +753,8 @@ func (s *DriverIPCServer) handleCommand(ctx context.Context, command DriverIPCCo
 		s.subscriptionOwners[subscription.ID()] = command.ClientID
 		event.Type = DriverIPCEventSubscriptionAdded
 		event.ResourceID = subscription.ID()
-		event.DataRingPath = dataRingPath
+		event.DataImagePath = dataImagePath
+		event.DataRingPath = dataImagePath
 		event.Message = subscription.LocalAddr().String()
 		return event
 	case DriverIPCCommandPollSubscription:
@@ -744,28 +770,28 @@ func (s *DriverIPCServer) handleCommand(ctx context.Context, command DriverIPCCo
 		if fragmentLimit <= 0 {
 			fragmentLimit = messageLimit
 		}
-		dataRing := s.dataRings[command.ResourceID]
+		dataImage := s.dataImages[command.ResourceID]
 		event.Type = DriverIPCEventSubscriptionPolled
 		if fallback := s.takeSubscriptionFallback(command.ResourceID, messageLimit); len(fallback) > 0 {
 			event.Messages = fallback
 			event.BackPressured = true
 			event.Message = ErrBackPressure.Error()
-			if dataRing != nil {
-				if snapshotErr := addDriverIPCEventDataRingSnapshot(&event, dataRing); snapshotErr != nil {
+			if dataImage != nil {
+				if snapshotErr := addDriverIPCEventDataImageSnapshot(&event, dataImage); snapshotErr != nil {
 					return driverIPCErrorEvent(command, snapshotErr)
 				}
 			}
 			return event
 		}
 		messages := make([]DriverIPCMessage, 0, messageLimit)
-		dataRingMessageCount := 0
-		dataRingBackPressured := false
-		if dataRing != nil {
+		dataImageMessageCount := 0
+		dataImageBackPressured := false
+		if dataImage != nil {
 			messageLimit = 1
-			if snapshotErr := addDriverIPCEventDataRingSnapshot(&event, dataRing); snapshotErr != nil {
+			if snapshotErr := addDriverIPCEventDataImageSnapshot(&event, dataImage); snapshotErr != nil {
 				return driverIPCErrorEvent(command, snapshotErr)
 			}
-			if event.DataRingFree < minDriverIPCMessageRecordBytes {
+			if event.DataImageFree < minDriverSubscriptionImageRecordBytes {
 				if subscription.subscription != nil {
 					subscription.subscription.metrics.incBackPressureEvents()
 				}
@@ -777,19 +803,19 @@ func (s *DriverIPCServer) handleCommand(ctx context.Context, command DriverIPCCo
 		pollCtx, cancel := context.WithTimeout(ctx, defaultDriverIPCSubscriptionPollWindow)
 		n, err := subscription.pollDriverOwned(pollCtx, messageLimit, fragmentLimit, func(_ context.Context, msg Message) error {
 			ipcMessage := driverIPCMessageFromMessage(msg)
-			if dataRing != nil {
-				if err := writeDriverIPCMessage(pollCtx, dataRing, ipcMessage); err != nil {
+			if dataImage != nil {
+				if err := writeDriverSubscriptionImageMessage(dataImage, msg); err != nil {
 					if errors.Is(err, ErrBackPressure) {
 						if subscription.subscription != nil {
 							subscription.subscription.metrics.incBackPressureEvents()
 						}
-						dataRingBackPressured = true
+						dataImageBackPressured = true
 						messages = append(messages, ipcMessage)
 						return nil
 					}
 					return err
 				}
-				dataRingMessageCount++
+				dataImageMessageCount++
 				return nil
 			}
 			messages = append(messages, ipcMessage)
@@ -797,20 +823,20 @@ func (s *DriverIPCServer) handleCommand(ctx context.Context, command DriverIPCCo
 		})
 		cancel()
 		event.MessageCount = n
-		if dataRing != nil {
-			event.MessageCount = dataRingMessageCount
-			event.BackPressured = dataRingBackPressured
-			if dataRingBackPressured {
+		if dataImage != nil {
+			event.MessageCount = dataImageMessageCount
+			event.BackPressured = dataImageBackPressured
+			if dataImageBackPressured {
 				event.Message = ErrBackPressure.Error()
 			}
 		}
 		event.Messages = messages
-		if dataRing != nil {
-			if snapshotErr := addDriverIPCEventDataRingSnapshot(&event, dataRing); snapshotErr != nil {
+		if dataImage != nil {
+			if snapshotErr := addDriverIPCEventDataImageSnapshot(&event, dataImage); snapshotErr != nil {
 				return driverIPCErrorEvent(command, snapshotErr)
 			}
 		}
-		if dataRing != nil && errors.Is(err, ErrBackPressure) {
+		if dataImage != nil && errors.Is(err, ErrBackPressure) {
 			event.BackPressured = true
 			event.Message = ErrBackPressure.Error()
 			return event
@@ -861,7 +887,7 @@ func (s *DriverIPCServer) handleCommand(ctx context.Context, command DriverIPCCo
 		s.publicationOwners = make(map[DriverResourceID]DriverClientID)
 		s.subscriptionOwners = make(map[DriverResourceID]DriverClientID)
 		s.subscriptionFallback = make(map[DriverResourceID][]DriverIPCMessage)
-		for id := range s.dataRings {
+		for id := range s.dataImages {
 			_ = s.closeSubscriptionDataRing(id, true)
 		}
 		event.Type = DriverIPCEventTerminated
@@ -888,26 +914,35 @@ func (s *DriverIPCServer) addSubscriptionDataRingSnapshots(snapshot *DriverSnaps
 	}
 	for i := range snapshot.Subscriptions {
 		subscription := &snapshot.Subscriptions[i]
-		path := s.dataRingPaths[subscription.ID]
+		path := s.dataImagePaths[subscription.ID]
 		if path == "" {
 			continue
 		}
+		subscription.DataImagePath = path
+		subscription.DataImageMapped = true
 		subscription.DataRingPath = path
 		subscription.DataRingMapped = true
-		ring := s.dataRings[subscription.ID]
-		if ring == nil {
+		image := s.dataImages[subscription.ID]
+		if image == nil {
 			continue
 		}
-		ringSnapshot, err := ring.Snapshot()
+		imageSnapshot, err := image.Snapshot()
 		if err != nil {
 			return err
 		}
-		subscription.DataRingCapacity = ringSnapshot.Capacity
-		subscription.DataRingUsed = ringSnapshot.Used
-		subscription.DataRingFree = ringSnapshot.Free
-		subscription.DataRingReadPosition = ringSnapshot.ReadPosition
-		subscription.DataRingWritePosition = ringSnapshot.WritePosition
-		subscription.DataRingPendingMessages = s.subscriptionFallbackCount(subscription.ID)
+		pending := s.subscriptionFallbackCount(subscription.ID)
+		subscription.DataImageCapacity = imageSnapshot.Capacity
+		subscription.DataImageUsed = imageSnapshot.Used
+		subscription.DataImageFree = imageSnapshot.Free
+		subscription.DataImageReadPosition = imageSnapshot.ReadPosition
+		subscription.DataImageWritePosition = imageSnapshot.WritePosition
+		subscription.DataImagePendingMessages = pending
+		subscription.DataRingCapacity = imageSnapshot.Capacity
+		subscription.DataRingUsed = imageSnapshot.Used
+		subscription.DataRingFree = imageSnapshot.Free
+		subscription.DataRingReadPosition = imageSnapshot.ReadPosition
+		subscription.DataRingWritePosition = imageSnapshot.WritePosition
+		subscription.DataRingPendingMessages = pending
 	}
 	return nil
 }
@@ -948,20 +983,26 @@ func (s *DriverIPCServer) subscriptionFallbackCount(id DriverResourceID) int {
 	return len(s.subscriptionFallback[id])
 }
 
-func addDriverIPCEventDataRingSnapshot(event *DriverIPCEvent, ring *IPCRing) error {
-	if event == nil || ring == nil {
+func addDriverIPCEventDataImageSnapshot(event *DriverIPCEvent, image *DriverSubscriptionImage) error {
+	if event == nil || image == nil {
 		return nil
 	}
-	ringSnapshot, err := ring.Snapshot()
+	imageSnapshot, err := image.Snapshot()
 	if err != nil {
 		return err
 	}
-	event.DataRingPath = ringSnapshot.Path
-	event.DataRingCapacity = ringSnapshot.Capacity
-	event.DataRingUsed = ringSnapshot.Used
-	event.DataRingFree = ringSnapshot.Free
-	event.DataRingReadPosition = ringSnapshot.ReadPosition
-	event.DataRingWritePosition = ringSnapshot.WritePosition
+	event.DataImagePath = imageSnapshot.Path
+	event.DataImageCapacity = imageSnapshot.Capacity
+	event.DataImageUsed = imageSnapshot.Used
+	event.DataImageFree = imageSnapshot.Free
+	event.DataImageReadPosition = imageSnapshot.ReadPosition
+	event.DataImageWritePosition = imageSnapshot.WritePosition
+	event.DataRingPath = imageSnapshot.Path
+	event.DataRingCapacity = imageSnapshot.Capacity
+	event.DataRingUsed = imageSnapshot.Used
+	event.DataRingFree = imageSnapshot.Free
+	event.DataRingReadPosition = imageSnapshot.ReadPosition
+	event.DataRingWritePosition = imageSnapshot.WritePosition
 	return nil
 }
 
@@ -992,21 +1033,32 @@ func (s *DriverIPCServer) removeClient(id DriverClientID) {
 
 func (cfg DriverIPCPublicationConfig) publicationConfig() PublicationConfig {
 	return PublicationConfig{
-		StreamID:               cfg.StreamID,
-		SessionID:              cfg.SessionID,
-		RemoteAddr:             cfg.RemoteAddr,
-		MaxPayloadBytes:        cfg.MaxPayloadBytes,
-		MTUBytes:               cfg.MTUBytes,
-		TermBufferLength:       cfg.TermBufferLength,
-		InitialTermID:          cfg.InitialTermID,
-		PublicationWindowBytes: cfg.PublicationWindowBytes,
+		Transport:                 cfg.Transport,
+		StreamID:                  cfg.StreamID,
+		SessionID:                 cfg.SessionID,
+		RemoteAddr:                cfg.RemoteAddr,
+		UDPDestinations:           append([]string(nil), cfg.UDPDestinations...),
+		UDPMulticastInterface:     cfg.UDPMulticastInterface,
+		UDPNameResolutionInterval: cfg.UDPNameResolutionInterval,
+		UDPReceiverTimeout:        cfg.UDPReceiverTimeout,
+		MaxPayloadBytes:           cfg.MaxPayloadBytes,
+		MTUBytes:                  cfg.MTUBytes,
+		UDPRetransmitBufferBytes:  cfg.UDPRetransmitBufferBytes,
+		TermBufferLength:          cfg.TermBufferLength,
+		InitialTermID:             cfg.InitialTermID,
+		PublicationWindowBytes:    cfg.PublicationWindowBytes,
 	}
 }
 
 func (cfg DriverIPCSubscriptionConfig) subscriptionConfig() SubscriptionConfig {
 	return SubscriptionConfig{
+		Transport:              cfg.Transport,
 		StreamID:               cfg.StreamID,
 		LocalAddr:              cfg.LocalAddr,
+		UDPMulticastInterface:  cfg.UDPMulticastInterface,
+		UDPNakRetryInterval:    cfg.UDPNakRetryInterval,
+		ReceiverWindowBytes:    cfg.ReceiverWindowBytes,
+		TermBufferLength:       cfg.TermBufferLength,
 		DriverDataRingCapacity: cfg.DataRingCapacity,
 	}
 }
@@ -1057,42 +1109,17 @@ func (msg DriverIPCMessage) message() Message {
 	return out
 }
 
-func writeDriverIPCMessage(_ context.Context, ring *IPCRing, msg DriverIPCMessage) error {
-	payload, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("%w: encode message: %w", ErrDriverIPCProtocol, err)
+func writeDriverSubscriptionImageMessage(image *DriverSubscriptionImage, msg Message) error {
+	if image == nil {
+		return ErrDriverIPCClosed
 	}
-	if err := ring.Offer(payload); err != nil {
+	if err := image.OfferMessage(msg); err != nil {
 		if errors.Is(err, ErrIPCRingFull) || errors.Is(err, ErrIPCRingMessageTooLarge) {
-			return fmt.Errorf("%w: subscription data ring cannot accept message: %w", ErrBackPressure, err)
+			return fmt.Errorf("%w: subscription image cannot accept message: %w", ErrBackPressure, err)
 		}
 		return err
 	}
 	return nil
-}
-
-func driverIPCMessageRecordBytes(msg DriverIPCMessage) int {
-	payload, err := json.Marshal(msg)
-	if err != nil {
-		return minIPCRingCapacity
-	}
-	return align(ipcRecordHeaderLen+len(payload), ipcRecordAlignment)
-}
-
-func pollDriverIPCMessages(ring *IPCRing, limit int, handler func(DriverIPCMessage) error) (int, error) {
-	if ring == nil {
-		return 0, ErrDriverIPCClosed
-	}
-	if handler == nil {
-		return 0, invalidConfigf("driver ipc message handler is required")
-	}
-	return ring.PollN(limit, func(payload []byte) error {
-		var msg DriverIPCMessage
-		if err := json.Unmarshal(payload, &msg); err != nil {
-			return fmt.Errorf("%w: decode message: %w", ErrDriverIPCProtocol, err)
-		}
-		return handler(msg)
-	})
 }
 
 func decodeDriverIPCCommand(payload []byte) (DriverIPCCommand, error) {

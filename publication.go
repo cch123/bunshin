@@ -51,16 +51,32 @@ type TransportFeedback struct {
 type TransportFeedbackHandler func(TransportFeedback)
 
 type UDPDestinationStatus struct {
-	Endpoint            string        `json:"endpoint"`
-	Remote              string        `json:"remote"`
-	Active              bool          `json:"active"`
-	LastSetupAt         time.Time     `json:"last_setup_at,omitempty"`
-	LastStatusAt        time.Time     `json:"last_status_at,omitempty"`
-	LastAckAt           time.Time     `json:"last_ack_at,omitempty"`
-	LastFeedbackAt      time.Time     `json:"last_feedback_at,omitempty"`
-	LastSequence        uint64        `json:"last_sequence,omitempty"`
-	LastRTT             time.Duration `json:"last_rtt,omitempty"`
-	RetransmittedFrames int           `json:"retransmitted_frames,omitempty"`
+	Endpoint              string        `json:"endpoint"`
+	Remote                string        `json:"remote"`
+	Active                bool          `json:"active"`
+	SetupFramesReceived   int           `json:"setup_frames_received,omitempty"`
+	StatusFramesReceived  int           `json:"status_frames_received,omitempty"`
+	AckFramesReceived     int           `json:"ack_frames_received,omitempty"`
+	NAKFramesReceived     int           `json:"nak_frames_received,omitempty"`
+	NAKMessagesReceived   uint64        `json:"nak_messages_received,omitempty"`
+	NAKCacheMisses        uint64        `json:"nak_cache_misses,omitempty"`
+	ResponseTimeouts      int           `json:"response_timeouts,omitempty"`
+	LastSetupAt           time.Time     `json:"last_setup_at,omitempty"`
+	LastStatusAt          time.Time     `json:"last_status_at,omitempty"`
+	LastAckAt             time.Time     `json:"last_ack_at,omitempty"`
+	LastNAKAt             time.Time     `json:"last_nak_at,omitempty"`
+	LastNAKCacheMissAt    time.Time     `json:"last_nak_cache_miss_at,omitempty"`
+	LastResponseTimeoutAt time.Time     `json:"last_response_timeout_at,omitempty"`
+	LastRetransmitAt      time.Time     `json:"last_retransmit_at,omitempty"`
+	LastFeedbackAt        time.Time     `json:"last_feedback_at,omitempty"`
+	LastSequence          uint64        `json:"last_sequence,omitempty"`
+	LastNAKFromSequence   uint64        `json:"last_nak_from_sequence,omitempty"`
+	LastNAKToSequence     uint64        `json:"last_nak_to_sequence,omitempty"`
+	LastNAKMissSequence   uint64        `json:"last_nak_miss_sequence,omitempty"`
+	LastTimeoutSequence   uint64        `json:"last_timeout_sequence,omitempty"`
+	LastRTT               time.Duration `json:"last_rtt,omitempty"`
+	RetransmittedFrames   int           `json:"retransmitted_frames,omitempty"`
+	RetransmittedMessages uint64        `json:"retransmitted_messages,omitempty"`
 }
 
 type PublicationConfig struct {
@@ -72,6 +88,7 @@ type PublicationConfig struct {
 	UDPMulticastInterface     string
 	UDPNameResolutionInterval time.Duration
 	UDPReceiverTimeout        time.Duration
+	UDPCongestionControl      UDPCongestionControl
 	MaxPayloadBytes           int
 	MTUBytes                  int
 	UDPRetransmitBufferBytes  int
@@ -115,6 +132,8 @@ type Publication struct {
 	udpRetransmitOrder        []uint64
 	udpRetransmitBytes        int
 	udpRetransmitLimit        int
+	udpCongestion             UDPCongestionControl
+	udpCongestionWindow       int
 	transport                 *quic.Transport
 	metrics                   *Metrics
 	logger                    Logger
@@ -130,6 +149,7 @@ type Publication struct {
 	window                    *publicationWindow
 	flow                      FlowControlStrategy
 	flowWindow                int
+	flowWindowLimit           int
 	flowLimit                 int64
 	flowMu                    sync.Mutex
 	nextSeq                   atomic.Uint64
@@ -143,12 +163,16 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 		return nil, err
 	}
 	cfg = normalized.PublicationConfig
+	windowLimit := cfg.PublicationWindowBytes
+	if normalized.udpCongestionWindow > 0 && normalized.udpCongestionWindow < windowLimit {
+		windowLimit = normalized.udpCongestionWindow
+	}
 
 	terms, err := newMappedTermLog(cfg.TermBufferLength, cfg.InitialTermID, cfg.TermBufferDirectory)
 	if err != nil {
 		return nil, err
 	}
-	window, err := newPublicationWindow(cfg.PublicationWindowBytes)
+	window, err := newPublicationWindow(windowLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -191,6 +215,8 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 			udpReceiverTimeout:        cfg.UDPReceiverTimeout,
 			udpRetransmit:             make(map[uint64]udpRetransmitEntry),
 			udpRetransmitLimit:        cfg.UDPRetransmitBufferBytes,
+			udpCongestion:             cfg.UDPCongestionControl,
+			udpCongestionWindow:       normalized.udpCongestionWindow,
 			metrics:                   cfg.Metrics,
 			logger:                    cfg.Logger,
 			streamID:                  cfg.StreamID,
@@ -205,6 +231,7 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 			window:                    window,
 			flow:                      cfg.FlowControl,
 			flowWindow:                cfg.PublicationWindowBytes,
+			flowWindowLimit:           cfg.PublicationWindowBytes,
 			flowLimit:                 normalized.flowLimit,
 			closed:                    make(chan struct{}),
 		}
@@ -253,6 +280,7 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 		window:            window,
 		flow:              cfg.FlowControl,
 		flowWindow:        cfg.PublicationWindowBytes,
+		flowWindowLimit:   cfg.PublicationWindowBytes,
 		flowLimit:         normalized.flowLimit,
 		closed:            make(chan struct{}),
 	}
@@ -450,6 +478,21 @@ func (p *Publication) updateFlowControlStatus(status FlowControlStatus) error {
 	p.flowLimit = p.flow.OnStatus(status, p.flowLimit)
 
 	limit := int(p.flowLimit - status.Position)
+	if limit <= 0 {
+		limit = 1
+	}
+	p.flowWindowLimit = limit
+	return p.setEffectivePublicationWindowLocked()
+}
+
+func (p *Publication) setEffectivePublicationWindowLocked() error {
+	limit := p.flowWindowLimit
+	if limit <= 0 {
+		limit = p.flowWindow
+	}
+	if p.udpCongestion != nil && p.udpCongestionWindow > 0 && p.udpCongestionWindow < limit {
+		limit = p.udpCongestionWindow
+	}
 	if limit <= 0 {
 		limit = 1
 	}
@@ -701,12 +744,32 @@ func (p *Publication) observeTransportFeedback(feedback TransportFeedback) {
 	if feedback.ObservedAt.IsZero() {
 		feedback.ObservedAt = time.Now()
 	}
+	p.updateUDPCongestion(feedback)
 	if feedback.RTT > 0 {
 		p.metrics.observeRTT(feedback.RTT)
 	}
 	if p.transportFeedback != nil {
 		p.transportFeedback(feedback)
 	}
+}
+
+func (p *Publication) updateUDPCongestion(feedback TransportFeedback) {
+	if feedback.Transport != TransportUDP || p.udpCongestion == nil {
+		return
+	}
+	p.flowMu.Lock()
+	defer p.flowMu.Unlock()
+
+	current := p.udpCongestionWindow
+	if current <= 0 {
+		current = p.flowWindow
+	}
+	next := p.udpCongestion.OnFeedback(feedback, current, p.flowWindow)
+	if next <= 0 {
+		next = 1
+	}
+	p.udpCongestionWindow = next
+	_ = p.setEffectivePublicationWindowLocked()
 }
 
 func (p *Publication) negotiate(ctx context.Context) error {

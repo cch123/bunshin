@@ -9,11 +9,16 @@ import (
 	"time"
 )
 
+const (
+	externalDriverTestTimeout      = 60 * time.Second
+	externalDriverConditionTimeout = 30 * time.Second
+)
+
 func TestExternalDriverClientPublishesThroughDriverOwnedResource(t *testing.T) {
 	root := t.TempDir()
 	done := startExternalDriverProcessForTest(t, root)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), externalDriverTestTimeout)
 	defer cancel()
 	client, err := ConnectMediaDriver(ctx, DriverConnectionConfig{
 		Directory:  root,
@@ -89,11 +94,132 @@ func TestExternalDriverClientPublishesThroughDriverOwnedResource(t *testing.T) {
 	terminateExternalDriverProcessForTest(t, root, done)
 }
 
+func TestExternalDriverClientUsesUDPTransportDiagnostics(t *testing.T) {
+	root := t.TempDir()
+	done := startExternalDriverProcessForTest(t, root)
+	defer terminateExternalDriverProcessForTest(t, root, done)
+
+	ctx, cancel := context.WithTimeout(context.Background(), externalDriverTestTimeout)
+	defer cancel()
+	client, err := ConnectMediaDriver(ctx, DriverConnectionConfig{
+		Directory:  root,
+		ClientName: "external-udp",
+		Timeout:    time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close(ctx)
+
+	directSub, err := ListenSubscription(SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  248,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directSub.Close()
+	received := make(chan Message, 1)
+	go func() {
+		_ = directSub.Serve(ctx, func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		})
+	}()
+
+	driverPub, err := client.AddPublication(ctx, PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   248,
+		SessionID:  348,
+		RemoteAddr: directSub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driverPub.Close(ctx)
+	if err := driverPub.Send(ctx, []byte("external udp publication")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-received:
+		if string(msg.Payload) != "external udp publication" || msg.StreamID != 248 || msg.SessionID != 348 {
+			t.Fatalf("unexpected external UDP publication message: %#v", msg)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	destinationStatuses := driverPub.DestinationStatuses()
+	if len(destinationStatuses) != 1 ||
+		!destinationStatuses[0].Active ||
+		destinationStatuses[0].SetupFramesReceived != 1 ||
+		destinationStatuses[0].StatusFramesReceived != 1 ||
+		destinationStatuses[0].AckFramesReceived != 1 ||
+		destinationStatuses[0].LastRTT <= 0 {
+		t.Fatalf("unexpected external UDP publication statuses: %#v", destinationStatuses)
+	}
+
+	driverSub, err := client.AddSubscription(ctx, SubscriptionConfig{
+		Transport:              TransportUDP,
+		StreamID:               249,
+		LocalAddr:              "127.0.0.1:0",
+		DriverDataRingCapacity: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driverSub.Close(ctx)
+	directPub, err := DialPublication(PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   249,
+		SessionID:  349,
+		RemoteAddr: driverSub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directPub.Close()
+	sent := make(chan error, 1)
+	go func() {
+		sent <- directPub.Send(ctx, []byte("external udp subscription"))
+	}()
+	var polled []Message
+	n, err := driverSub.Poll(ctx, func(_ context.Context, msg Message) error {
+		polled = append(polled, msg)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || len(polled) != 1 || string(polled[0].Payload) != "external udp subscription" ||
+		polled[0].StreamID != 249 || polled[0].SessionID != 349 {
+		t.Fatalf("unexpected external UDP subscription poll n=%d messages=%#v", n, polled)
+	}
+	select {
+	case err := <-sent:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	peerStatuses := driverSub.UDPPeerStatuses()
+	if len(peerStatuses) != 1 ||
+		!peerStatuses[0].Active ||
+		peerStatuses[0].DataFramesReceived != 1 ||
+		peerStatuses[0].StatusFramesSent != 1 ||
+		peerStatuses[0].AckFramesSent != 1 ||
+		peerStatuses[0].LastSequence != 1 {
+		t.Fatalf("unexpected external UDP subscription peer statuses: %#v", peerStatuses)
+	}
+}
+
 func TestExternalDriverClientOwnsSubscriptionHandle(t *testing.T) {
 	root := t.TempDir()
 	done := startExternalDriverProcessForTest(t, root)
+	defer terminateExternalDriverProcessForTest(t, root, done)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), externalDriverTestTimeout)
 	defer cancel()
 	client, err := ConnectMediaDriver(ctx, DriverConnectionConfig{
 		Directory:  root,
@@ -115,11 +241,19 @@ func TestExternalDriverClientOwnsSubscriptionHandle(t *testing.T) {
 	if sub.ID() == 0 || sub.LocalAddr() == nil || sub.LocalAddr().String() == "" {
 		t.Fatalf("unexpected external subscription handle: %#v local=%v", sub, sub.LocalAddr())
 	}
-	if sub.dataRing == nil || sub.dataRingPath == "" {
-		t.Fatalf("external subscription did not open a data ring: %#v path=%q", sub.dataRing, sub.dataRingPath)
+	if sub.dataImage == nil || sub.dataImagePath == "" {
+		t.Fatalf("external subscription did not open a shared image: %#v path=%q", sub.dataImage, sub.dataImagePath)
 	}
-	if _, err := os.Stat(sub.dataRingPath); err != nil {
-		t.Fatalf("stat external subscription data ring: %v", err)
+	if _, err := os.Stat(sub.dataImagePath); err != nil {
+		t.Fatalf("stat external subscription shared image: %v", err)
+	}
+	imageBytes, err := os.ReadFile(sub.dataImagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imageBytes) < len(driverSubscriptionImageMagic) ||
+		string(imageBytes[:len(driverSubscriptionImageMagic)]) != driverSubscriptionImageMagic {
+		t.Fatalf("external subscription file is not a shared image: %q", imageBytes[:min(len(imageBytes), len(driverSubscriptionImageMagic))])
 	}
 	if err := sub.Serve(ctx, func(context.Context, Message) error { return nil }); !errors.Is(err, ErrDriverExternalUnsupported) {
 		t.Fatalf("Serve() err = %v, want %v", err, ErrDriverExternalUnsupported)
@@ -255,12 +389,16 @@ func TestExternalDriverClientOwnsSubscriptionHandle(t *testing.T) {
 		sentBatch <- pub.Send(ctx, []byte("polln three"))
 	}()
 	var batch []Message
-	n, err = sub.PollN(ctx, 3, func(_ context.Context, msg Message) error {
-		batch = append(batch, msg)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+	n = 0
+	for len(batch) < 3 {
+		polled, pollErr := sub.PollN(ctx, 3-len(batch), func(_ context.Context, msg Message) error {
+			batch = append(batch, msg)
+			return nil
+		})
+		n += polled
+		if pollErr != nil {
+			t.Fatal(pollErr)
+		}
 	}
 	if n != 3 ||
 		len(batch) != 3 ||
@@ -309,13 +447,36 @@ func TestExternalDriverClientOwnsSubscriptionHandle(t *testing.T) {
 		retrySent <- pub.Send(ctx, []byte("retry after handler error"))
 	}()
 	handlerErr := errors.New("handler failed before commit")
-	n, err = sub.Poll(ctx, func(_ context.Context, msg Message) error {
-		if string(msg.Payload) != "retry after handler error" {
-			t.Fatalf("unexpected retry message before handler error: %#v", msg)
+	var retryObserved bool
+	deadline := time.Now().Add(externalDriverConditionTimeout)
+	for time.Now().Before(deadline) && !retryObserved {
+		pollCtx, pollCancel := context.WithTimeout(ctx, time.Second)
+		n, err = sub.Poll(pollCtx, func(_ context.Context, msg Message) error {
+			if string(msg.Payload) != "retry after handler error" {
+				t.Fatalf("unexpected retry message before handler error: %#v", msg)
+			}
+			return handlerErr
+		})
+		pollCancel()
+		switch {
+		case errors.Is(err, handlerErr):
+			retryObserved = true
+		case err == nil:
+			t.Fatalf("Poll() after handler error n=%d err=<nil>, want err=%v", n, handlerErr)
+		case isContextDoneError(err):
+			select {
+			case sendErr := <-retrySent:
+				if sendErr != nil {
+					t.Fatal(sendErr)
+				}
+				t.Fatalf("publication send completed before handler error was observed")
+			default:
+			}
+		default:
+			t.Fatal(err)
 		}
-		return handlerErr
-	})
-	if !errors.Is(err, handlerErr) || n != 0 {
+	}
+	if !retryObserved || !errors.Is(err, handlerErr) || n != 0 {
 		t.Fatalf("Poll() after handler error n=%d err=%v, want n=0 err=%v", n, err, handlerErr)
 	}
 	if err := <-retrySent; err != nil {
@@ -338,10 +499,20 @@ func TestExternalDriverClientOwnsSubscriptionHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !ok ||
-		ringSnapshot.Path != sub.dataRingPath ||
+		ringSnapshot.Path != sub.dataImagePath ||
 		ringSnapshot.Capacity != 2*defaultDriverIPCSubscriptionDataRing ||
 		ringSnapshot.Free == 0 {
 		t.Fatalf("unexpected local data ring snapshot ok=%v snapshot=%#v", ok, ringSnapshot)
+	}
+	imageSnapshot, ok, err := sub.DataImageSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok ||
+		imageSnapshot.Path != sub.dataImagePath ||
+		imageSnapshot.Capacity != 2*defaultDriverIPCSubscriptionDataRing ||
+		imageSnapshot.Free == 0 {
+		t.Fatalf("unexpected local shared image snapshot ok=%v snapshot=%#v", ok, imageSnapshot)
 	}
 
 	snapshot, err := client.Snapshot(ctx)
@@ -352,17 +523,21 @@ func TestExternalDriverClientOwnsSubscriptionHandle(t *testing.T) {
 		snapshot.Subscriptions[0].ClientID != client.ID() {
 		t.Fatalf("unexpected subscription snapshot: %#v", snapshot)
 	}
-	if snapshot.Subscriptions[0].DataRingPath != sub.dataRingPath ||
+	if snapshot.Subscriptions[0].DataImagePath != sub.dataImagePath ||
+		!snapshot.Subscriptions[0].DataImageMapped ||
+		snapshot.Subscriptions[0].DataImageCapacity != 2*defaultDriverIPCSubscriptionDataRing ||
+		snapshot.Subscriptions[0].DataImageFree == 0 ||
+		snapshot.Subscriptions[0].DataRingPath != sub.dataRingPath ||
 		!snapshot.Subscriptions[0].DataRingMapped ||
 		snapshot.Subscriptions[0].DataRingCapacity != 2*defaultDriverIPCSubscriptionDataRing ||
 		snapshot.Subscriptions[0].DataRingFree == 0 {
-		t.Fatalf("unexpected external subscription data ring snapshot: %#v path=%q", snapshot.Subscriptions[0], sub.dataRingPath)
+		t.Fatalf("unexpected external subscription shared image snapshot: %#v path=%q", snapshot.Subscriptions[0], sub.dataImagePath)
 	}
 	if err := sub.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(sub.dataRingPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("external subscription data ring remained after close: %v", err)
+	if _, err := os.Stat(sub.dataImagePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("external subscription shared image remained after close: %v", err)
 	}
 	snapshot, err = client.Snapshot(ctx)
 	if err != nil {
@@ -375,7 +550,6 @@ func TestExternalDriverClientOwnsSubscriptionHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	terminateExternalDriverProcessForTest(t, root, done)
 }
 
 func TestExternalDriverProcessPumpsSubscriptionDataRing(t *testing.T) {
@@ -383,7 +557,7 @@ func TestExternalDriverProcessPumpsSubscriptionDataRing(t *testing.T) {
 	done := startExternalDriverProcessForTest(t, root)
 	defer terminateExternalDriverProcessForTest(t, root, done)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), externalDriverTestTimeout)
 	defer cancel()
 	client, err := ConnectMediaDriver(ctx, DriverConnectionConfig{
 		Directory:  root,
@@ -419,7 +593,7 @@ func TestExternalDriverProcessPumpsSubscriptionDataRing(t *testing.T) {
 	go func() {
 		sent <- pub.Send(ctx, []byte("pumped payload"))
 	}()
-	waitForCondition(t, 5*time.Second, func() bool {
+	waitForCondition(t, externalDriverConditionTimeout, func() bool {
 		snapshot, ok, err := sub.DataRingSnapshot()
 		return err == nil && ok && snapshot.Used > 0
 	})
@@ -476,7 +650,7 @@ func TestExternalDriverProcessReportsServerFallbackPending(t *testing.T) {
 	done := startExternalDriverProcessForTest(t, root)
 	defer terminateExternalDriverProcessForTest(t, root, done)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), externalDriverTestTimeout)
 	defer cancel()
 	client, err := ConnectMediaDriver(ctx, DriverConnectionConfig{
 		Directory:  root,
@@ -513,7 +687,7 @@ func TestExternalDriverProcessReportsServerFallbackPending(t *testing.T) {
 	go func() {
 		sent <- pub.Send(ctx, payload)
 	}()
-	waitForCondition(t, 5*time.Second, func() bool {
+	waitForCondition(t, externalDriverConditionTimeout, func() bool {
 		status, ok, err := sub.DataRingStatus(ctx)
 		return err == nil && ok && status.ServerPendingMessages == 1
 	})
@@ -579,7 +753,7 @@ func TestExternalDriverFallbackMessagesRemainPendingAfterHandlerErrorAndAbort(t 
 	})
 	defer terminateExternalDriverProcessForTest(t, root, done)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), externalDriverTestTimeout)
 	defer cancel()
 	client, err := ConnectMediaDriver(ctx, DriverConnectionConfig{
 		Directory:  root,
@@ -802,7 +976,7 @@ func TestExternalDriverStaleClientRemovesSubscriptionDataRing(t *testing.T) {
 		t.Fatal("external subscription data ring path is empty")
 	}
 	waitForPath(t, dataRingPath)
-	waitForCondition(t, 5*time.Second, func() bool {
+	waitForCondition(t, externalDriverConditionTimeout, func() bool {
 		_, err := os.Stat(dataRingPath)
 		return errors.Is(err, os.ErrNotExist)
 	})

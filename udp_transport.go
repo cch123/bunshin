@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -37,6 +38,32 @@ type udpFragmentSet struct {
 	count    int
 }
 
+type udpPeer struct {
+	remote              string
+	framesReceived      int
+	helloFramesReceived int
+	dataFramesReceived  int
+	helloFramesSent     int
+	statusFramesSent    int
+	ackFramesSent       int
+	nakFramesSent       int
+	nakMessagesSent     uint64
+	nakRetriesSent      int
+	errorFramesSent     int
+	lastFrameAt         time.Time
+	lastHelloAt         time.Time
+	lastDataAt          time.Time
+	lastHelloSentAt     time.Time
+	lastStatusAt        time.Time
+	lastAckAt           time.Time
+	lastNAKAt           time.Time
+	lastNAKRetryAt      time.Time
+	lastErrorAt         time.Time
+	lastSequence        uint64
+	lastNAKFromSequence uint64
+	lastNAKToSequence   uint64
+}
+
 type udpPendingDestination struct {
 	addr      net.Addr
 	multicast bool
@@ -48,15 +75,31 @@ type udpDestinationSnapshot struct {
 }
 
 type udpDestination struct {
-	endpoint            string
-	addr                net.Addr
-	lastSetupAt         time.Time
-	lastStatusAt        time.Time
-	lastAckAt           time.Time
-	lastFeedbackAt      time.Time
-	lastSequence        uint64
-	lastRTT             time.Duration
-	retransmittedFrames int
+	endpoint              string
+	addr                  net.Addr
+	setupFrames           int
+	statusFrames          int
+	ackFrames             int
+	nakFrames             int
+	nakMessages           uint64
+	nakCacheMisses        uint64
+	responseTimeouts      int
+	lastSetupAt           time.Time
+	lastStatusAt          time.Time
+	lastAckAt             time.Time
+	lastNAKAt             time.Time
+	lastNAKCacheMissAt    time.Time
+	lastResponseTimeoutAt time.Time
+	lastRetransmitAt      time.Time
+	lastFeedbackAt        time.Time
+	lastSequence          uint64
+	lastNAKFromSequence   uint64
+	lastNAKToSequence     uint64
+	lastNAKMissSequence   uint64
+	lastTimeoutSequence   uint64
+	lastRTT               time.Duration
+	retransmittedFrames   int
+	retransmittedMessages uint64
 }
 
 func listenUDPTransport(localAddr, remoteAddr, multicastInterface string, packetConn net.PacketConn) (net.PacketConn, net.Addr, error) {
@@ -661,7 +704,11 @@ func (p *Publication) readUDPResponses(ctx context.Context, appendResult termApp
 		n, remote, err := p.udpConn.ReadFrom(buf)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
+				p.recordUDPPendingDestinationTimeoutsLocked(pending, seq, time.Now())
 				return acks, ctxErr
+			}
+			if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+				p.recordUDPPendingDestinationTimeoutsLocked(pending, seq, time.Now())
 			}
 			return acks, err
 		}
@@ -872,9 +919,11 @@ func (p *Publication) applyUDPNak(remote net.Addr, f frame) error {
 	if nak.toSequence-nak.fromSequence+1 > maxUDPNakRange {
 		return fmt.Errorf("nak range too large: %d-%d", nak.fromSequence, nak.toSequence)
 	}
+	p.recordUDPDestinationNAKLocked("", remote, nak.fromSequence, nak.toSequence, time.Now())
 	for seq := nak.fromSequence; seq <= nak.toSequence; seq++ {
 		entry := p.udpRetransmit[seq]
 		if len(entry.datagrams) == 0 {
+			p.recordUDPDestinationNAKCacheMissLocked("", remote, seq, time.Now())
 			continue
 		}
 		if err := p.writeUDPDatagrams(remote, entry.datagrams); err != nil {
@@ -897,6 +946,7 @@ func (p *Publication) recordUDPDestinationSetupLocked(destinationID string, remo
 	if destination == nil {
 		return
 	}
+	destination.setupFrames++
 	destination.lastSetupAt = now
 	destination.lastFeedbackAt = now
 }
@@ -906,6 +956,7 @@ func (p *Publication) recordUDPDestinationStatusLocked(destinationID string, rem
 	if destination == nil {
 		return
 	}
+	destination.statusFrames++
 	destination.lastStatusAt = now
 	destination.lastFeedbackAt = now
 	destination.lastSequence = seq
@@ -916,10 +967,53 @@ func (p *Publication) recordUDPDestinationAckLocked(destinationID string, remote
 	if destination == nil {
 		return
 	}
+	destination.ackFrames++
 	destination.lastAckAt = now
 	destination.lastFeedbackAt = now
 	destination.lastSequence = seq
 	destination.lastRTT = rtt
+}
+
+func (p *Publication) recordUDPDestinationNAKLocked(destinationID string, remote net.Addr, fromSeq, toSeq uint64, now time.Time) {
+	destination := p.udpDestinationForFeedbackLocked(destinationID, remote)
+	if destination == nil {
+		return
+	}
+	destination.nakFrames++
+	destination.nakMessages += toSeq - fromSeq + 1
+	destination.lastNAKAt = now
+	destination.lastFeedbackAt = now
+	destination.lastNAKFromSequence = fromSeq
+	destination.lastNAKToSequence = toSeq
+}
+
+func (p *Publication) recordUDPDestinationNAKCacheMissLocked(destinationID string, remote net.Addr, seq uint64, now time.Time) {
+	destination := p.udpDestinationForFeedbackLocked(destinationID, remote)
+	if destination == nil {
+		return
+	}
+	destination.nakCacheMisses++
+	destination.lastNAKCacheMissAt = now
+	destination.lastFeedbackAt = now
+	destination.lastNAKMissSequence = seq
+}
+
+func (p *Publication) recordUDPPendingDestinationTimeoutsLocked(pending map[string]udpPendingDestination, seq uint64, now time.Time) {
+	for id, destination := range pending {
+		p.recordUDPDestinationResponseTimeoutLocked(id, destination.addr, seq, now)
+	}
+}
+
+func (p *Publication) recordUDPDestinationResponseTimeoutLocked(destinationID string, remote net.Addr, seq uint64, now time.Time) {
+	destination := p.udpDestinationForFeedbackLocked(destinationID, remote)
+	if destination == nil {
+		return
+	}
+	destination.responseTimeouts++
+	destination.lastResponseTimeoutAt = now
+	destination.lastFeedbackAt = now
+	destination.lastSequence = seq
+	destination.lastTimeoutSequence = seq
 }
 
 func (p *Publication) recordUDPDestinationRetransmitLocked(destinationID string, remote net.Addr, seq uint64, frames int, now time.Time) {
@@ -927,9 +1021,11 @@ func (p *Publication) recordUDPDestinationRetransmitLocked(destinationID string,
 	if destination == nil {
 		return
 	}
+	destination.lastRetransmitAt = now
 	destination.lastFeedbackAt = now
 	destination.lastSequence = seq
 	destination.retransmittedFrames += frames
+	destination.retransmittedMessages++
 }
 
 func (p *Publication) udpDestinationForFeedbackLocked(destinationID string, remote net.Addr) *udpDestination {
@@ -941,6 +1037,16 @@ func (p *Publication) udpDestinationForFeedbackLocked(destinationID string, remo
 	remoteID := remoteAddrString(remote)
 	for _, destination := range p.udpDestinations {
 		if destination != nil && remoteAddrString(destination.addr) == remoteID {
+			return destination
+		}
+	}
+	remoteUDP, _ := remote.(*net.UDPAddr)
+	for _, destination := range p.udpDestinations {
+		if destination == nil || !isMulticastUDPAddr(destination.addr) {
+			continue
+		}
+		destinationUDP, _ := destination.addr.(*net.UDPAddr)
+		if remoteUDP == nil || destinationUDP == nil || remoteUDP.Port == destinationUDP.Port {
 			return destination
 		}
 	}
@@ -975,16 +1081,32 @@ func (d *udpDestination) status(now time.Time, receiverTimeout time.Duration) UD
 	}
 	active := !lastFeedbackAt.IsZero() && now.Sub(lastFeedbackAt) <= receiverTimeout
 	return UDPDestinationStatus{
-		Endpoint:            d.endpoint,
-		Remote:              remoteAddrString(d.addr),
-		Active:              active,
-		LastSetupAt:         d.lastSetupAt,
-		LastStatusAt:        d.lastStatusAt,
-		LastAckAt:           d.lastAckAt,
-		LastFeedbackAt:      lastFeedbackAt,
-		LastSequence:        d.lastSequence,
-		LastRTT:             d.lastRTT,
-		RetransmittedFrames: d.retransmittedFrames,
+		Endpoint:              d.endpoint,
+		Remote:                remoteAddrString(d.addr),
+		Active:                active,
+		SetupFramesReceived:   d.setupFrames,
+		StatusFramesReceived:  d.statusFrames,
+		AckFramesReceived:     d.ackFrames,
+		NAKFramesReceived:     d.nakFrames,
+		NAKMessagesReceived:   d.nakMessages,
+		NAKCacheMisses:        d.nakCacheMisses,
+		ResponseTimeouts:      d.responseTimeouts,
+		LastSetupAt:           d.lastSetupAt,
+		LastStatusAt:          d.lastStatusAt,
+		LastAckAt:             d.lastAckAt,
+		LastNAKAt:             d.lastNAKAt,
+		LastNAKCacheMissAt:    d.lastNAKCacheMissAt,
+		LastResponseTimeoutAt: d.lastResponseTimeoutAt,
+		LastRetransmitAt:      d.lastRetransmitAt,
+		LastFeedbackAt:        lastFeedbackAt,
+		LastSequence:          d.lastSequence,
+		LastNAKFromSequence:   d.lastNAKFromSequence,
+		LastNAKToSequence:     d.lastNAKToSequence,
+		LastNAKMissSequence:   d.lastNAKMissSequence,
+		LastTimeoutSequence:   d.lastTimeoutSequence,
+		LastRTT:               d.lastRTT,
+		RetransmittedFrames:   d.retransmittedFrames,
+		RetransmittedMessages: d.retransmittedMessages,
 	}
 }
 
@@ -1004,7 +1126,7 @@ func (s *Subscription) serveUDP(ctx context.Context, handler Handler) error {
 
 	buf := make([]byte, maxFrameSize)
 	for {
-		if err := s.udpConn.SetReadDeadline(udpDeadline(ctx)); err != nil {
+		if err := s.udpConn.SetReadDeadline(s.udpReadDeadline(ctx)); err != nil {
 			return err
 		}
 		n, remote, err := s.udpConn.ReadFrom(buf)
@@ -1021,6 +1143,7 @@ func (s *Subscription) serveUDP(ctx context.Context, handler Handler) error {
 				return ctx.Err()
 			}
 			if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+				_ = s.retryUDPNaks()
 				continue
 			}
 			s.log(ctx, LogLevelError, "udp", "udp read failed", nil, err)
@@ -1038,6 +1161,7 @@ func (s *Subscription) serveUDP(ctx context.Context, handler Handler) error {
 		s.metrics.incFramesReceived(1)
 		switch f.typ {
 		case frameHello:
+			s.recordUDPPeerHello(remote)
 			_ = s.writeUDPHello(remote, f)
 		case frameData:
 			go func(remote net.Addr, f frame) {
@@ -1056,18 +1180,205 @@ func (s *Subscription) serveUDP(ctx context.Context, handler Handler) error {
 	}
 }
 
+func (s *Subscription) udpReadDeadline(ctx context.Context) time.Time {
+	deadline := udpDeadline(ctx)
+	if s != nil && s.udpNakRetryInterval > 0 {
+		retryDeadline := time.Now().Add(s.udpNakRetryInterval)
+		if retryDeadline.Before(deadline) {
+			return retryDeadline
+		}
+	}
+	return deadline
+}
+
+func (s *Subscription) retryUDPNaks() error {
+	if s == nil || s.udpNakRetryInterval <= 0 {
+		return nil
+	}
+	var err error
+	for _, observation := range s.loss.retryPending(s.udpNakRetryInterval) {
+		remote, resolveErr := net.ResolveUDPAddr("udp", observation.Source)
+		if resolveErr != nil {
+			err = errors.Join(err, resolveErr)
+			continue
+		}
+		if writeErr := s.writeUDPNak(remote, observation); writeErr != nil {
+			err = errors.Join(err, writeErr)
+		}
+	}
+	return err
+}
+
 func (s *Subscription) observeUDPPeer(remote net.Addr) {
 	if remote == nil {
 		return
 	}
-	source := remoteAddrString(remote)
+	now := time.Now()
 	s.udpMu.Lock()
-	defer s.udpMu.Unlock()
-	if _, ok := s.udpPeers[source]; ok {
+	peer, created := s.udpPeerLocked(remote)
+	peer.framesReceived++
+	peer.lastFrameAt = now
+	s.udpMu.Unlock()
+	if created {
+		s.metrics.incConnectionsAccepted()
+	}
+}
+
+func (s *Subscription) udpPeerLocked(remote net.Addr) (*udpPeer, bool) {
+	source := remoteAddrString(remote)
+	if s.udpPeers == nil {
+		s.udpPeers = make(map[string]*udpPeer)
+	}
+	peer := s.udpPeers[source]
+	if peer != nil {
+		return peer, false
+	}
+	peer = &udpPeer{remote: source}
+	s.udpPeers[source] = peer
+	return peer, true
+}
+
+func (s *Subscription) recordUDPPeerHello(remote net.Addr) {
+	if remote == nil {
 		return
 	}
-	s.udpPeers[source] = struct{}{}
-	s.metrics.incConnectionsAccepted()
+	now := time.Now()
+	s.udpMu.Lock()
+	peer, _ := s.udpPeerLocked(remote)
+	peer.helloFramesReceived++
+	peer.lastHelloAt = now
+	s.udpMu.Unlock()
+}
+
+func (s *Subscription) recordUDPPeerData(remote net.Addr, f frame) {
+	if remote == nil {
+		return
+	}
+	now := time.Now()
+	s.udpMu.Lock()
+	peer, _ := s.udpPeerLocked(remote)
+	peer.dataFramesReceived++
+	peer.lastDataAt = now
+	peer.lastSequence = f.seq
+	s.udpMu.Unlock()
+}
+
+func (s *Subscription) recordUDPPeerHelloSent(remote net.Addr) {
+	if remote == nil {
+		return
+	}
+	now := time.Now()
+	s.udpMu.Lock()
+	peer, _ := s.udpPeerLocked(remote)
+	peer.helloFramesSent++
+	peer.lastHelloSentAt = now
+	s.udpMu.Unlock()
+}
+
+func (s *Subscription) recordUDPPeerStatusSent(remote net.Addr, f frame) {
+	if remote == nil {
+		return
+	}
+	now := time.Now()
+	s.udpMu.Lock()
+	peer, _ := s.udpPeerLocked(remote)
+	peer.statusFramesSent++
+	peer.lastStatusAt = now
+	peer.lastSequence = f.seq
+	s.udpMu.Unlock()
+}
+
+func (s *Subscription) recordUDPPeerAckSent(remote net.Addr, f frame) {
+	if remote == nil {
+		return
+	}
+	now := time.Now()
+	s.udpMu.Lock()
+	peer, _ := s.udpPeerLocked(remote)
+	peer.ackFramesSent++
+	peer.lastAckAt = now
+	peer.lastSequence = f.seq
+	s.udpMu.Unlock()
+}
+
+func (s *Subscription) recordUDPPeerNAKSent(remote net.Addr, observation LossObservation, fromSeq, toSeq uint64) {
+	if remote == nil {
+		return
+	}
+	now := time.Now()
+	s.udpMu.Lock()
+	peer, _ := s.udpPeerLocked(remote)
+	peer.nakFramesSent++
+	peer.nakMessagesSent += toSeq - fromSeq + 1
+	if observation.Retry {
+		peer.nakRetriesSent++
+		peer.lastNAKRetryAt = now
+	}
+	peer.lastNAKAt = now
+	peer.lastNAKFromSequence = fromSeq
+	peer.lastNAKToSequence = toSeq
+	s.udpMu.Unlock()
+}
+
+func (s *Subscription) recordUDPPeerErrorSent(remote net.Addr) {
+	if remote == nil {
+		return
+	}
+	now := time.Now()
+	s.udpMu.Lock()
+	peer, _ := s.udpPeerLocked(remote)
+	peer.errorFramesSent++
+	peer.lastErrorAt = now
+	s.udpMu.Unlock()
+}
+
+func (s *Subscription) UDPPeerStatuses() []UDPSubscriptionPeerStatus {
+	if s == nil || s.transportMode != TransportUDP {
+		return nil
+	}
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+
+	statuses := make([]UDPSubscriptionPeerStatus, 0, len(s.udpPeers))
+	now := time.Now()
+	for _, peer := range s.udpPeers {
+		if peer == nil {
+			continue
+		}
+		statuses = append(statuses, peer.status(now))
+	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Remote < statuses[j].Remote })
+	return statuses
+}
+
+func (p *udpPeer) status(now time.Time) UDPSubscriptionPeerStatus {
+	active := !p.lastFrameAt.IsZero() && now.Sub(p.lastFrameAt) <= defaultFlowControlReceiverTimeout
+	return UDPSubscriptionPeerStatus{
+		Remote:              p.remote,
+		Active:              active,
+		FramesReceived:      p.framesReceived,
+		HelloFramesReceived: p.helloFramesReceived,
+		DataFramesReceived:  p.dataFramesReceived,
+		HelloFramesSent:     p.helloFramesSent,
+		StatusFramesSent:    p.statusFramesSent,
+		AckFramesSent:       p.ackFramesSent,
+		NAKFramesSent:       p.nakFramesSent,
+		NAKMessagesSent:     p.nakMessagesSent,
+		NAKRetriesSent:      p.nakRetriesSent,
+		ErrorFramesSent:     p.errorFramesSent,
+		LastFrameAt:         p.lastFrameAt,
+		LastHelloAt:         p.lastHelloAt,
+		LastDataAt:          p.lastDataAt,
+		LastHelloSentAt:     p.lastHelloSentAt,
+		LastStatusAt:        p.lastStatusAt,
+		LastAckAt:           p.lastAckAt,
+		LastNAKAt:           p.lastNAKAt,
+		LastNAKRetryAt:      p.lastNAKRetryAt,
+		LastErrorAt:         p.lastErrorAt,
+		LastSequence:        p.lastSequence,
+		LastNAKFromSequence: p.lastNAKFromSequence,
+		LastNAKToSequence:   p.lastNAKToSequence,
+	}
 }
 
 func (s *Subscription) dataUDP(ctx context.Context, remote net.Addr, f frame, handler Handler) error {
@@ -1085,7 +1396,8 @@ func (s *Subscription) deliverUDPData(ctx context.Context, remote net.Addr, f fr
 		}
 		return false, &ProtocolError{Code: uint16(protocolErrorUnsupportedType), Message: "unsupported stream id"}
 	}
-	observations := s.loss.observe(f, remote)
+	s.recordUDPPeerData(remote, f)
+	observations := s.loss.observeWithRetry(f, remote, s.udpNakRetryInterval)
 	for _, observation := range observations {
 		if err := s.writeUDPNak(remote, observation); err != nil {
 			return false, err
@@ -1246,6 +1558,7 @@ func (s *Subscription) ackUDP(remote net.Addr, f frame) error {
 	}
 	s.metrics.incFramesSent(1)
 	s.metrics.incAcksSent()
+	s.recordUDPPeerAckSent(remote, f)
 	return nil
 }
 
@@ -1272,6 +1585,7 @@ func (s *Subscription) writeUDPStatus(remote net.Addr, f frame) error {
 		return err
 	}
 	s.metrics.incFramesSent(1)
+	s.recordUDPPeerStatusSent(remote, f)
 	return nil
 }
 
@@ -1298,6 +1612,7 @@ func (s *Subscription) writeUDPNak(remote net.Addr, observation LossObservation)
 			return err
 		}
 		s.metrics.incFramesSent(1)
+		s.recordUDPPeerNAKSent(remote, observation, from, to)
 		if to == observation.ToSequence {
 			return nil
 		}
@@ -1328,6 +1643,7 @@ func (s *Subscription) writeUDPHello(remote net.Addr, f frame) error {
 		return err
 	}
 	s.metrics.incFramesSent(1)
+	s.recordUDPPeerHelloSent(remote)
 	return nil
 }
 
@@ -1349,6 +1665,7 @@ func (s *Subscription) writeUDPError(remote net.Addr, streamID, sessionID uint32
 		return err
 	}
 	s.metrics.incFramesSent(1)
+	s.recordUDPPeerErrorSent(remote)
 	return nil
 }
 

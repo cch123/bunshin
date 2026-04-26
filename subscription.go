@@ -49,6 +49,7 @@ type SubscriptionConfig struct {
 	AvailableImage         ImageHandler
 	UnavailableImage       ImageHandler
 	UDPMulticastInterface  string
+	UDPNakRetryInterval    time.Duration
 	LocalSpy               bool
 	LocalSpyBuffer         int
 	Archive                *Archive
@@ -64,6 +65,33 @@ type SubscriptionConfig struct {
 	WriteBufferBytes int
 }
 
+type UDPSubscriptionPeerStatus struct {
+	Remote              string    `json:"remote"`
+	Active              bool      `json:"active"`
+	FramesReceived      int       `json:"frames_received,omitempty"`
+	HelloFramesReceived int       `json:"hello_frames_received,omitempty"`
+	DataFramesReceived  int       `json:"data_frames_received,omitempty"`
+	HelloFramesSent     int       `json:"hello_frames_sent,omitempty"`
+	StatusFramesSent    int       `json:"status_frames_sent,omitempty"`
+	AckFramesSent       int       `json:"ack_frames_sent,omitempty"`
+	NAKFramesSent       int       `json:"nak_frames_sent,omitempty"`
+	NAKMessagesSent     uint64    `json:"nak_messages_sent,omitempty"`
+	NAKRetriesSent      int       `json:"nak_retries_sent,omitempty"`
+	ErrorFramesSent     int       `json:"error_frames_sent,omitempty"`
+	LastFrameAt         time.Time `json:"last_frame_at,omitempty"`
+	LastHelloAt         time.Time `json:"last_hello_at,omitempty"`
+	LastDataAt          time.Time `json:"last_data_at,omitempty"`
+	LastHelloSentAt     time.Time `json:"last_hello_sent_at,omitempty"`
+	LastStatusAt        time.Time `json:"last_status_at,omitempty"`
+	LastAckAt           time.Time `json:"last_ack_at,omitempty"`
+	LastNAKAt           time.Time `json:"last_nak_at,omitempty"`
+	LastNAKRetryAt      time.Time `json:"last_nak_retry_at,omitempty"`
+	LastErrorAt         time.Time `json:"last_error_at,omitempty"`
+	LastSequence        uint64    `json:"last_sequence,omitempty"`
+	LastNAKFromSequence uint64    `json:"last_nak_from_sequence,omitempty"`
+	LastNAKToSequence   uint64    `json:"last_nak_to_sequence,omitempty"`
+}
+
 type Subscription struct {
 	transportMode            TransportMode
 	listener                 *quic.Listener
@@ -71,7 +99,8 @@ type Subscription struct {
 	udpOwnConn               bool
 	udpMu                    sync.Mutex
 	udpFragments             map[udpFragmentKey]*udpFragmentSet
-	udpPeers                 map[string]struct{}
+	udpPeers                 map[string]*udpPeer
+	udpNakRetryInterval      time.Duration
 	localSpy                 bool
 	localSpyID               uint64
 	localSpyKey              localSpyKey
@@ -113,6 +142,7 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 			metrics:                  cfg.Metrics,
 			logger:                   cfg.Logger,
 			loss:                     newLossDetector(cfg.Metrics, cfg.LossHandler),
+			udpNakRetryInterval:      cfg.UDPNakRetryInterval,
 			availableImage:           cfg.AvailableImage,
 			unavailableImage:         cfg.UnavailableImage,
 			archive:                  cfg.Archive,
@@ -153,10 +183,11 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 			udpConn:                  conn,
 			udpOwnConn:               cfg.PacketConn == nil,
 			udpFragments:             make(map[udpFragmentKey]*udpFragmentSet),
-			udpPeers:                 make(map[string]struct{}),
+			udpPeers:                 make(map[string]*udpPeer),
 			metrics:                  cfg.Metrics,
 			logger:                   cfg.Logger,
 			loss:                     newLossDetector(cfg.Metrics, cfg.LossHandler),
+			udpNakRetryInterval:      cfg.UDPNakRetryInterval,
 			availableImage:           cfg.AvailableImage,
 			unavailableImage:         cfg.UnavailableImage,
 			archive:                  cfg.Archive,
@@ -197,6 +228,7 @@ func ListenSubscription(cfg SubscriptionConfig) (*Subscription, error) {
 		metrics:                  cfg.Metrics,
 		logger:                   cfg.Logger,
 		loss:                     newLossDetector(cfg.Metrics, cfg.LossHandler),
+		udpNakRetryInterval:      cfg.UDPNakRetryInterval,
 		availableImage:           cfg.AvailableImage,
 		unavailableImage:         cfg.UnavailableImage,
 		archive:                  cfg.Archive,

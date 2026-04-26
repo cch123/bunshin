@@ -76,7 +76,7 @@ func runDriver(args []string) error {
 	eventRingCapacity := flags.Int("event-ring-capacity", 64*1024, "driver IPC event ring capacity")
 	pollLimit := flags.Int("poll-limit", 64, "max IPC commands to poll per driver loop")
 	subscriptionPumpLimit := flags.Int("subscription-pump-limit", 64, "max external subscription messages to pump per driver loop")
-	disableSubscriptionPump := flags.Bool("disable-subscription-pump", false, "disable background pumping of external subscriptions into data rings")
+	disableSubscriptionPump := flags.Bool("disable-subscription-pump", false, "disable background pumping of external subscriptions into shared images")
 	preserveIPC := flags.Bool("preserve-ipc", false, "preserve existing IPC ring contents")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -165,11 +165,21 @@ func streamsDriver(args []string) (bunshin.DriverSnapshot, error) {
 	flags := flag.NewFlagSet("streams", flag.ExitOnError)
 	dir := flags.String("dir", "", "driver directory")
 	timeout := flags.Duration("timeout", 5*time.Second, "snapshot timeout")
+	report := flags.Bool("report", false, "read the persisted streams report instead of querying the live driver")
 	if err := flags.Parse(args); err != nil {
 		return bunshin.DriverSnapshot{}, err
 	}
 	if *dir == "" {
 		return bunshin.DriverSnapshot{}, errors.New("driver directory is required")
+	}
+	if *report {
+		streams, err := readDriverReport[bunshin.DriverStreamsReportFile](*dir, func(layout bunshin.DriverDirectoryLayout) string {
+			return layout.StreamsReportFile
+		})
+		if err != nil {
+			return bunshin.DriverSnapshot{}, err
+		}
+		return streams.Snapshot, nil
 	}
 	return driverSnapshot(*dir, *timeout)
 }
@@ -329,7 +339,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "       bunshin-driver counters -dir PATH")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver errors -dir PATH")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver loss -dir PATH")
-	fmt.Fprintln(os.Stderr, "       bunshin-driver streams -dir PATH [options]")
+	fmt.Fprintln(os.Stderr, "       bunshin-driver streams -dir PATH [-report] [options]")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver rings -dir PATH [-report] [options]")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver flush -dir PATH [options]")
 	fmt.Fprintln(os.Stderr, "       bunshin-driver terminate -dir PATH [options]")

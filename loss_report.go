@@ -15,6 +15,7 @@ type LossObservation struct {
 	ToSequence      uint64
 	MissingMessages uint64
 	ObservedAt      time.Time
+	Retry           bool
 }
 
 type LossReport struct {
@@ -22,9 +23,11 @@ type LossReport struct {
 	SessionID        uint32
 	Source           string
 	ObservationCount uint64
+	RetryCount       uint64
 	MissingMessages  uint64
 	FirstObservation time.Time
 	LastObservation  time.Time
+	LastRetry        time.Time
 }
 
 type LossHandler func(LossObservation)
@@ -47,6 +50,13 @@ type lossState struct {
 	next          uint64
 	reportedUntil uint64
 	receivedAhead map[uint64]struct{}
+	pending       []lossPendingRange
+}
+
+type lossPendingRange struct {
+	from      uint64
+	to        uint64
+	lastNakAt time.Time
 }
 
 func newLossDetector(metrics *Metrics, handler LossHandler) *lossDetector {
@@ -59,6 +69,10 @@ func newLossDetector(metrics *Metrics, handler LossHandler) *lossDetector {
 }
 
 func (d *lossDetector) observe(f frame, remote net.Addr) []LossObservation {
+	return d.observeWithRetry(f, remote, 0)
+}
+
+func (d *lossDetector) observeWithRetry(f frame, remote net.Addr, retryInterval time.Duration) []LossObservation {
 	if d == nil || f.seq == 0 {
 		return nil
 	}
@@ -70,7 +84,28 @@ func (d *lossDetector) observe(f frame, remote net.Addr) []LossObservation {
 	}
 	now := time.Now()
 
-	observations := d.observeSequence(key, f.seq, now)
+	observations := d.observeSequenceWithRetry(key, f.seq, now, retryInterval)
+	for _, observation := range observations {
+		if d.handler != nil {
+			d.handler(observation)
+		}
+	}
+	return observations
+}
+
+func (d *lossDetector) retryPending(retryInterval time.Duration) []LossObservation {
+	if d == nil || retryInterval <= 0 {
+		return nil
+	}
+	now := time.Now()
+
+	d.mu.Lock()
+	var observations []LossObservation
+	for key, state := range d.states {
+		observations = append(observations, d.retryMissingRanges(key, state, now, retryInterval)...)
+	}
+	d.mu.Unlock()
+
 	for _, observation := range observations {
 		if d.handler != nil {
 			d.handler(observation)
@@ -80,6 +115,10 @@ func (d *lossDetector) observe(f frame, remote net.Addr) []LossObservation {
 }
 
 func (d *lossDetector) observeSequence(key lossKey, seq uint64, observedAt time.Time) []LossObservation {
+	return d.observeSequenceWithRetry(key, seq, observedAt, 0)
+}
+
+func (d *lossDetector) observeSequenceWithRetry(key lossKey, seq uint64, observedAt time.Time, retryInterval time.Duration) []LossObservation {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -91,10 +130,11 @@ func (d *lossDetector) observeSequence(key lossKey, seq uint64, observedAt time.
 		}
 		d.states[key] = state
 	}
+	state.removePending(seq)
 
 	switch {
 	case seq < state.next:
-		return nil
+		return d.retryMissingRanges(key, state, observedAt, retryInterval)
 	case seq == state.next:
 		state.next++
 		for {
@@ -104,16 +144,18 @@ func (d *lossDetector) observeSequence(key lossKey, seq uint64, observedAt time.
 			delete(state.receivedAhead, state.next)
 			state.next++
 		}
-		return nil
+		state.trimPendingBelow(state.next)
+		return d.retryMissingRanges(key, state, observedAt, retryInterval)
 	default:
 		if _, ok := state.receivedAhead[seq]; ok {
-			return nil
+			return d.retryMissingRanges(key, state, observedAt, retryInterval)
 		}
 		observations := d.recordMissingRanges(key, state, seq, observedAt)
 		state.receivedAhead[seq] = struct{}{}
 		if seq-1 > state.reportedUntil {
 			state.reportedUntil = seq - 1
 		}
+		observations = append(observations, d.retryMissingRanges(key, state, observedAt, retryInterval)...)
 		return observations
 	}
 }
@@ -146,11 +188,13 @@ func (d *lossDetector) recordMissingRanges(key lossKey, state *lossState, seq ui
 		}
 		if received > rangeStart {
 			observations = append(observations, d.recordMissingRange(key, rangeStart, received-1, observedAt))
+			state.addPendingRange(rangeStart, received-1, observedAt)
 		}
 		rangeStart = received + 1
 	}
 	if rangeStart <= end {
 		observations = append(observations, d.recordMissingRange(key, rangeStart, end, observedAt))
+		state.addPendingRange(rangeStart, end, observedAt)
 	}
 	return observations
 }
@@ -181,6 +225,104 @@ func (d *lossDetector) recordMissingRange(key lossKey, from, to uint64, observed
 		MissingMessages: missingMessages,
 		ObservedAt:      observedAt,
 	}
+}
+
+func (d *lossDetector) retryMissingRanges(key lossKey, state *lossState, observedAt time.Time, retryInterval time.Duration) []LossObservation {
+	if retryInterval <= 0 || len(state.pending) == 0 {
+		return nil
+	}
+	var observations []LossObservation
+	for i := range state.pending {
+		pending := &state.pending[i]
+		if observedAt.Sub(pending.lastNakAt) < retryInterval {
+			continue
+		}
+		pending.lastNakAt = observedAt
+		observations = append(observations, d.retryMissingRange(key, pending.from, pending.to, observedAt))
+	}
+	return observations
+}
+
+func (d *lossDetector) retryMissingRange(key lossKey, from, to uint64, observedAt time.Time) LossObservation {
+	missingMessages := to - from + 1
+	report := d.reports[key]
+	if report == nil {
+		report = &LossReport{
+			StreamID:         key.streamID,
+			SessionID:        key.sessionID,
+			Source:           key.source,
+			FirstObservation: observedAt,
+		}
+		d.reports[key] = report
+	}
+	report.RetryCount++
+	report.LastRetry = observedAt
+	report.LastObservation = observedAt
+
+	return LossObservation{
+		StreamID:        key.streamID,
+		SessionID:       key.sessionID,
+		Source:          key.source,
+		FromSequence:    from,
+		ToSequence:      to,
+		MissingMessages: missingMessages,
+		ObservedAt:      observedAt,
+		Retry:           true,
+	}
+}
+
+func (s *lossState) addPendingRange(from, to uint64, lastNakAt time.Time) {
+	if from > to {
+		return
+	}
+	s.pending = append(s.pending, lossPendingRange{
+		from:      from,
+		to:        to,
+		lastNakAt: lastNakAt,
+	})
+}
+
+func (s *lossState) removePending(seq uint64) {
+	if len(s.pending) == 0 {
+		return
+	}
+	nextPending := s.pending[:0]
+	for _, pending := range s.pending {
+		switch {
+		case seq < pending.from || seq > pending.to:
+			nextPending = append(nextPending, pending)
+		case pending.from == pending.to:
+			continue
+		case seq == pending.from:
+			pending.from++
+			nextPending = append(nextPending, pending)
+		case seq == pending.to:
+			pending.to--
+			nextPending = append(nextPending, pending)
+		default:
+			left := lossPendingRange{from: pending.from, to: seq - 1, lastNakAt: pending.lastNakAt}
+			right := lossPendingRange{from: seq + 1, to: pending.to, lastNakAt: pending.lastNakAt}
+			nextPending = append(nextPending, left, right)
+		}
+	}
+	s.pending = nextPending
+}
+
+func (s *lossState) trimPendingBelow(seq uint64) {
+	if len(s.pending) == 0 {
+		return
+	}
+	nextPending := s.pending[:0]
+	for _, pending := range s.pending {
+		if pending.to < seq {
+			continue
+		}
+		if pending.from < seq {
+			pending.from = seq
+		}
+		nextPending = append(nextPending, pending)
+	}
+	s.pending = nextPending
 }
 
 func (d *lossDetector) snapshot() []LossReport {

@@ -34,8 +34,8 @@ Implemented Bunshin-native areas:
 
 - Publication/subscription API with QUIC and explicit UDP transports.
 - Term-buffer position model and back pressure.
-- UDP HELLO setup, status, NAK repair, RTT feedback, endpoint liveness, multicast, multi-destination, and local spy support.
-- Embeddable and out-of-process media driver boundary with IPC command rings, per-client response rings, mmap-backed publication term buffers, per-subscription mmap data rings, and configurable driver agent loops.
+- UDP HELLO setup, status, NAK repair, RTT feedback, sender endpoint diagnostics, receiver peer diagnostics, multicast, multi-destination, and local spy support.
+- Embeddable and out-of-process media driver boundary with IPC command rings, per-client response rings, mmap-backed publication term buffers, per-subscription mmap shared images, and configurable driver agent loops.
 - Archive recording, replay, catalog, segment operations, replay merge, and replication.
 - Cluster replicated-log, snapshot, quorum, remote member transport, membership runtime hooks, backup, learner, and control primitives.
 - Driver counters, loss reports, error reports, and CLI inspection.
@@ -45,8 +45,8 @@ Known gaps versus a mature Aeron-style stack:
 
 - Bunshin does not implement Aeron wire protocol, Aeron CnC files, Aeron Archive protocol, or Aeron Cluster protocol.
 - Bunshin does not expose Aeron client APIs or guarantee behavior parity with Aeron tools.
-- External driver subscriptions can be polled by out-of-process clients over Bunshin IPC and per-subscription mmap data rings, including explicit data-ring back-pressure status, but clients do not yet poll full shared images like Aeron clients.
-- QUIC is the default reliable transport. The UDP backend has Bunshin-native setup, status, NAK repair, RTT feedback, endpoint liveness, and receiver-image rebuild tracking, but it is not a full Aeron congestion-control implementation.
+- External driver subscriptions are polled by out-of-process clients through per-subscription mmap shared images. The legacy data-ring status fields remain as compatibility aliases for the same mapped image state.
+- QUIC is the default reliable transport. The UDP backend has Bunshin-native setup, status, NAK repair with optional retry, RTT feedback, sender endpoint diagnostics, receiver peer diagnostics, receiver-image rebuild tracking, and optional AIMD congestion-window policy, but it is not a full Aeron congestion-control implementation.
 - Bunshin Archive records delivered Bunshin messages and metadata. It does not yet record raw Aeron-style image fragments or expose SBE control and recording-event streams.
 - Bunshin Cluster uses Bunshin-native remote member transport and quorum gating. It does not yet provide Aeron Cluster protocol compatibility or automatic backup promotion.
 - Tooling reads Bunshin JSON reports and native catalogs, not Aeron CnC, catalog, SBE, AeronStat, LossStat, ArchiveTool, or ClusterTool formats. Adapter projects must explicitly map Bunshin JSON files into Aeron-shaped output if that is desired.

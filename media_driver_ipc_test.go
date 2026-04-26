@@ -278,7 +278,9 @@ func TestDriverIPCServerHandlesSubscriptionsAndReportFlush(t *testing.T) {
 	if added.Type != DriverIPCEventSubscriptionAdded ||
 		added.ClientID != opened.ClientID ||
 		added.ResourceID == 0 ||
+		added.DataImagePath == "" ||
 		added.DataRingPath == "" ||
+		added.DataImagePath != added.DataRingPath ||
 		!strings.HasPrefix(added.Message, "127.0.0.1:") {
 		t.Fatalf("unexpected subscription event: %#v", added)
 	}
@@ -295,6 +297,10 @@ func TestDriverIPCServerHandlesSubscriptionsAndReportFlush(t *testing.T) {
 		snapshot.CorrelationID != snapshotCorrelation ||
 		snapshot.Snapshot == nil ||
 		len(snapshot.Snapshot.Subscriptions) != 1 ||
+		snapshot.Snapshot.Subscriptions[0].DataImagePath != added.DataImagePath ||
+		!snapshot.Snapshot.Subscriptions[0].DataImageMapped ||
+		snapshot.Snapshot.Subscriptions[0].DataImageCapacity != 4096 ||
+		snapshot.Snapshot.Subscriptions[0].DataImageFree == 0 ||
 		snapshot.Snapshot.Subscriptions[0].DataRingPath != added.DataRingPath ||
 		!snapshot.Snapshot.Subscriptions[0].DataRingMapped ||
 		snapshot.Snapshot.Subscriptions[0].DataRingCapacity != 4096 ||
@@ -338,6 +344,7 @@ func TestDriverIPCServerHandlesSubscriptionsAndReportFlush(t *testing.T) {
 		flushed.Directory == nil ||
 		flushed.Directory.Counters.Subscriptions != 1 ||
 		len(flushed.Directory.Rings.Subscriptions) != 1 ||
+		flushed.Directory.Rings.Subscriptions[0].ImagePath != added.DataImagePath ||
 		flushed.Directory.Rings.Subscriptions[0].Path != added.DataRingPath ||
 		flushed.Directory.Rings.Subscriptions[0].Capacity != 4096 {
 		t.Fatalf("unexpected flush event: %#v", flushed)
@@ -348,6 +355,7 @@ func TestDriverIPCServerHandlesSubscriptionsAndReportFlush(t *testing.T) {
 	}
 	rings := readDriverJSON[DriverRingsReportFile](t, layout.RingsReportFile)
 	if len(rings.Subscriptions) != 1 ||
+		rings.Subscriptions[0].ImagePath != added.DataImagePath ||
 		rings.Subscriptions[0].Path != added.DataRingPath ||
 		rings.Subscriptions[0].Capacity != 4096 {
 		t.Fatalf("unexpected rings report file: %#v", rings)
@@ -434,11 +442,11 @@ func TestDriverIPCSubscriptionPollReportsDataRingBackPressure(t *testing.T) {
 		owned.subscription = spy
 	}
 
-	dataRing := server.dataRings[added.ResourceID]
-	if dataRing == nil {
-		t.Fatalf("server did not create data ring for subscription %d", added.ResourceID)
+	dataImage := server.dataImages[added.ResourceID]
+	if dataImage == nil {
+		t.Fatalf("server did not create shared image for subscription %d", added.ResourceID)
 	}
-	fillIPCRingForTest(t, dataRing, []byte("pad"))
+	fillSubscriptionImageForTest(t, dataImage, Message{StreamID: 56, SessionID: 66, Payload: []byte("pad")})
 	spy.localSpyCh <- Message{
 		StreamID:  56,
 		SessionID: 66,
@@ -465,6 +473,9 @@ func TestDriverIPCSubscriptionPollReportsDataRingBackPressure(t *testing.T) {
 		!polled.BackPressured ||
 		polled.MessageCount != 0 ||
 		len(polled.Messages) != 0 ||
+		polled.DataImagePath != added.DataImagePath ||
+		polled.DataImageCapacity != 4096 ||
+		polled.DataImageUsed == 0 ||
 		polled.DataRingPath != added.DataRingPath ||
 		polled.DataRingCapacity != 4096 ||
 		polled.DataRingUsed == 0 {
@@ -662,7 +673,9 @@ func TestDriverIPCSubscriptionPumpQueuesFallbackWhenMessageExceedsDataRing(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot.Subscriptions) != 1 || snapshot.Subscriptions[0].DataRingPendingMessages != 1 {
+	if len(snapshot.Subscriptions) != 1 ||
+		snapshot.Subscriptions[0].DataImagePendingMessages != 1 ||
+		snapshot.Subscriptions[0].DataRingPendingMessages != 1 {
 		t.Fatalf("snapshot did not report pending fallback: %#v", snapshot.Subscriptions)
 	}
 
@@ -766,6 +779,20 @@ func fillIPCRingForTest(t *testing.T, ring *IPCRing, payload []byte) {
 	t.Helper()
 	for {
 		err := ring.Offer(payload)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, ErrIPCRingFull) {
+			return
+		}
+		t.Fatal(err)
+	}
+}
+
+func fillSubscriptionImageForTest(t *testing.T, image *DriverSubscriptionImage, msg Message) {
+	t.Helper()
+	for {
+		err := image.OfferMessage(msg)
 		if err == nil {
 			continue
 		}

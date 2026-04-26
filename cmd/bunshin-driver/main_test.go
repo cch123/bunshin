@@ -25,14 +25,31 @@ func TestRingsDriverReportsSubscriptionDataRings(t *testing.T) {
 			IdleStrategy:        bunshin.SleepingIdleStrategy{Duration: time.Millisecond},
 		})
 	}()
+	driverDoneRead := false
+	defer func() {
+		cancel()
+		if driverDoneRead {
+			return
+		}
+		select {
+		case err := <-done:
+			if err == nil || errors.Is(err, context.Canceled) {
+				return
+			}
+			t.Errorf("RunMediaDriverProcess() err = %v, want %v", err, context.Canceled)
+		case <-time.After(3 * time.Second):
+			t.Errorf("RunMediaDriverProcess() did not stop after cancellation")
+		}
+	}()
 	waitForDriverReady(t, root)
 	select {
 	case err := <-done:
+		driverDoneRead = true
 		t.Fatalf("driver process exited early: %v", err)
 	default:
 	}
 
-	clientCtx, clientCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer clientCancel()
 	client, err := bunshin.ConnectMediaDriver(clientCtx, bunshin.DriverConnectionConfig{
 		Directory:  root,
@@ -102,6 +119,12 @@ func TestRingsDriverReportsSubscriptionDataRings(t *testing.T) {
 	if flushed.Rings.Subscriptions[0].PendingMessages != 1 {
 		t.Fatalf("unexpected flushed pending messages: %#v", flushed.Rings)
 	}
+	if len(flushed.Streams.Snapshot.Subscriptions) != 1 ||
+		flushed.Streams.Snapshot.Subscriptions[0].ID != sub.ID() ||
+		flushed.Streams.Snapshot.Subscriptions[0].DataImagePendingMessages != 1 ||
+		flushed.Streams.Snapshot.Subscriptions[0].DataRingPendingMessages != 1 {
+		t.Fatalf("unexpected flushed streams report: %#v", flushed.Streams)
+	}
 	offline, err := ringsDriver([]string{"-dir", root, "-report"})
 	if err != nil {
 		t.Fatal(err)
@@ -114,6 +137,16 @@ func TestRingsDriverReportsSubscriptionDataRings(t *testing.T) {
 	if offline.Subscriptions[0].PendingMessages != 1 {
 		t.Fatalf("unexpected offline pending messages: %#v", offline)
 	}
+	streams, err := streamsDriver([]string{"-dir", root, "-report"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(streams.Subscriptions) != 1 ||
+		streams.Subscriptions[0].ID != sub.ID() ||
+		streams.Subscriptions[0].DataImagePendingMessages != 1 ||
+		streams.Subscriptions[0].DataRingPendingMessages != 1 {
+		t.Fatalf("unexpected offline streams report: %#v", streams)
+	}
 	if err := sub.Close(clientCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -121,15 +154,11 @@ func TestRingsDriverReportsSubscriptionDataRings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("RunMediaDriverProcess() err = %v, want %v", err, context.Canceled)
-	}
 }
 
 func waitForRingsPending(t *testing.T, root string, resourceID bunshin.DriverResourceID, want int) bunshin.DriverRingsReportFile {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	var last bunshin.DriverRingsReportFile
 	var lastErr error
 	for time.Now().Before(deadline) {

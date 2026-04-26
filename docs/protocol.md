@@ -26,13 +26,13 @@ The compatibility boundary is intentional:
 - The default UDP MTU is 1,400 bytes to avoid common Ethernet fragmentation. Applications can override `MTUBytes`.
 - Publications can lower `MTUBytes` to force smaller DATA frames. `MaxPayloadBytes` controls the maximum application payload, which can span multiple DATA frames.
 - Delivery reliability, retransmission, flow control, congestion control, and TLS are provided by QUIC through `quic-go`.
-- UDP transport performs per-destination HELLO setup, sends DATA frames to one or more unicast or multicast destinations, and waits for receiver STATUS plus application-level ACK or ERROR frames. It does not yet implement full congestion control or transport-level security.
+- UDP transport performs per-destination HELLO setup, sends DATA frames to one or more unicast or multicast destinations, and waits for receiver STATUS plus application-level ACK, NAK, or ERROR frames. `PublicationConfig.UDPCongestionControl` can apply a Bunshin-native congestion window on top of receiver STATUS flow control. UDP does not implement transport-level security.
 - Bunshin ACK frames confirm application-level handling, not packet-level delivery.
 - Publications apply a bounded send window before appending frames to the term log. The default window is one term buffer.
 - Publication flow control is strategy-driven. The default strategy is unicast max-right-edge flow control.
 - Subscriptions detect sequence gaps per stream/session/source and expose process-local loss reports.
 - Subscriptions deliver messages to the application in sequence order per stream/session/source.
-- Full congestion control is not implemented yet.
+- UDP congestion behavior is Bunshin-native; Aeron wire-level congestion-control compatibility remains out of scope unless an explicit adapter is added.
 
 ## Byte Order
 
@@ -176,6 +176,8 @@ For UDP multi-destination sends, a spy can observe any active destination it mat
 
 `MaxMulticastFlowControl` applies the same max-right-edge rule for multicast-style receiver sets. `MinMulticastFlowControl` tracks receiver right edges and uses the slowest active receiver until that receiver times out. `PreferredMulticastFlowControl` gives a configured receiver ID set priority; if any preferred receiver is active, the sender limit is based on the slowest preferred receiver, otherwise it falls back to the slowest active receiver. QUIC publications currently have one remote endpoint. UDP publications can send to multiple unicast destinations or a multicast group, so these strategies can track multiple receiver right edges.
 
+For UDP publications, `PublicationConfig.UDPCongestionControl` can additionally tune the effective sender window from transport feedback. Bunshin includes `AIMDUDPCongestionControl`, which increases the congestion window after ACK/RTT feedback and decreases it after NAK-driven retransmit feedback. The effective publication window is the lower of receiver STATUS flow control and the configured UDP congestion window. This remains Bunshin-native congestion behavior, not Aeron's wire-level congestion-control protocol.
+
 ## UDP Destinations
 
 `PublicationConfig.RemoteAddr` supplies the initial UDP destination. `PublicationConfig.UDPDestinations` can add more destinations at dial time. Channel URIs can also carry repeated `destination=` parameters, and `ChannelURI.PublicationConfig` maps them into the UDP destination list. This covers manual MDC configuration. `Publication.AddDestination`, `Publication.RemoveDestination`, and `Publication.Destinations` provide dynamic MDC control after dial.
@@ -184,7 +186,9 @@ Each UDP `Send` first ensures that each destination has a fresh setup handshake.
 
 UDP publications preserve the configured destination endpoint strings separately from the current resolved UDP addresses. `Publication.ReResolveDestinations` refreshes all destination addresses on demand. `PublicationConfig.UDPNameResolutionInterval` refreshes them before sends when the interval has elapsed, and channel URIs can set the same behavior with `name-resolution-interval=10s`. `Publication.DestinationEndpoints` returns the configured endpoint strings; `Publication.Destinations` returns the current resolved addresses.
 
-`Publication.DestinationStatuses` returns a liveness snapshot for each active UDP destination: configured endpoint, resolved remote address, active flag, last setup time, last STATUS time, last ACK time, last feedback time, last sequence, last RTT, and retransmitted frame count. `PublicationConfig.UDPReceiverTimeout` controls how long a destination remains active after feedback; it defaults to the same timeout used by multicast flow-control receiver tracking.
+`Publication.DestinationStatuses` returns a liveness and diagnostics snapshot for each active UDP destination: configured endpoint, resolved remote address, active flag, setup/STATUS/ACK/NAK frame counts, NAK message counts and range, retransmit cache misses, response timeouts, last setup/STATUS/ACK/NAK/cache-miss/timeout/retransmit/feedback times, last sequence, last RTT, retransmitted message count, and retransmitted frame count. `PublicationConfig.UDPReceiverTimeout` controls how long a destination remains active after feedback; it defaults to the same timeout used by multicast flow-control receiver tracking.
+
+`Subscription.UDPPeerStatuses` returns the receiver-side view for each observed UDP peer: received frame counts, HELLO/DATA counts, sent HELLO/STATUS/ACK/NAK/ERROR counts, NAK retry counts, last NAK range, last sequence, and liveness timestamps. Driver subscription snapshots include the same peer diagnostics for external tooling.
 
 UDP channel endpoints may use wildcard ports such as `endpoint=127.0.0.1:0`. After a subscription binds, `Subscription.ChannelURI` reports the concrete bound endpoint with the actual port. `Publication.ChannelURI` reports the configured publication endpoint, dynamic destinations, and name-resolution interval.
 
@@ -213,7 +217,9 @@ UDP subscriptions send NAK frames when sequence-gap detection observes missing m
 | 0 | 8 | uint64 | From sequence | First missing publisher sequence, inclusive. |
 | 8 | 8 | uint64 | To sequence | Last missing publisher sequence, inclusive. |
 
-UDP publications keep a bounded retransmit cache of recently sent DATA datagrams. `PublicationConfig.UDPRetransmitBufferBytes` controls the cache size and defaults to 1 MiB on the UDP transport. When a NAK range matches cached DATA, the publication retransmits those datagrams and increments the retransmit counter. NAK ranges are capped to avoid unbounded repair loops.
+UDP publications keep a bounded retransmit cache of recently sent DATA datagrams. `PublicationConfig.UDPRetransmitBufferBytes` controls the cache size and defaults to 1 MiB on the UDP transport. When a NAK range matches cached DATA, the publication retransmits those datagrams and increments the retransmit counter. When requested sequences have already fallen out of cache, destination diagnostics increment `NAKCacheMisses` and record the last missed sequence. NAK ranges are capped to avoid unbounded repair loops.
+
+`SubscriptionConfig.UDPNakRetryInterval` can enable receiver-side NAK retry while a sequence gap remains open. The UDP read loop wakes at that interval and sends another NAK for each still-pending range. Later DATA frames can also trigger due retries. Loss reports expose `RetryCount` and `LastRetry` separately from first-observation counts so diagnostics can distinguish new gaps from repair retries.
 
 ## Gap Detection
 

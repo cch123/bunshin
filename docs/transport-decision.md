@@ -27,8 +27,8 @@ For an Aeron-like goal, the evaluation must also consider:
 - The hand-written UDP ACK/retransmit implementation has been replaced by QUIC streams.
 - Reliability, retransmission, flow control, congestion control, and TLS are owned by `quic-go`.
 - Bunshin's ACK frame now confirms application-level handling over a reliable QUIC stream rather than packet-level delivery.
-- `TransportUDP` performs a Bunshin HELLO setup handshake per destination, then sends Bunshin DATA frames as UDP datagrams to one or more unicast or multicast destinations and waits for receiver STATUS plus application-level ACK or ERROR frames. It shares the publication/subscription API, term metadata, flow-control strategy hook, fragmentation, reassembly, ordered delivery, loss observation, NAK repair, destination liveness snapshots, RTT metrics, transport feedback hooks, and metrics path.
-- UDP does not yet provide full congestion control or transport-level security.
+- `TransportUDP` performs a Bunshin HELLO setup handshake per destination, then sends Bunshin DATA frames as UDP datagrams to one or more unicast or multicast destinations and waits for receiver STATUS plus application-level ACK, NAK, or ERROR frames. It shares the publication/subscription API, term metadata, flow-control strategy hook, fragmentation, reassembly, ordered delivery, receiver image rebuild buffers, loss observation, optional NAK retry, NAK repair, destination liveness and repair diagnostics, RTT metrics, transport feedback hooks, optional AIMD congestion-window policy, and metrics path.
+- UDP does not provide Aeron wire-level congestion-control compatibility or transport-level security.
 - Bunshin does not perform a mandatory payload CRC32 on top of QUIC. Like Aeron, it exposes an application-defined reserved value that can carry a checksum or timestamp when needed.
 - Bunshin frame fields use little-endian byte order to align with Aeron's data-header convention.
 - Publications apply a bounded send window before appending to the term log. If the window is exhausted, `Send` waits for ACK capacity until its context is done and records a back-pressure event.
@@ -48,6 +48,6 @@ For an Aeron-like goal, the evaluation must also consider:
 
 ## Next Implementation Steps
 
-1. Add richer congestion-control strategies on top of the UDP transport feedback hook.
+1. Benchmark and tune UDP loss recovery, fanout, receiver-lag, and congestion-window behavior under production-like workloads.
 2. Benchmark QUIC, UDP, IPC, and future Aeron-backed options under the same message workloads.
 3. Add richer driver agent-loop scheduling around the completed transport primitives.

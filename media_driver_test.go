@@ -167,6 +167,24 @@ func TestMediaDriverCreatesMmapTermBuffers(t *testing.T) {
 		len(snapshot.Publications[0].TermBufferFiles) != termPartitionCount {
 		t.Fatalf("unexpected mapped publication snapshot: %#v", snapshot.Publications)
 	}
+	peerStatuses := snapshot.Subscriptions[0].UDPPeerStatuses
+	if len(peerStatuses) != 1 ||
+		!peerStatuses[0].Active ||
+		peerStatuses[0].DataFramesReceived != 1 ||
+		peerStatuses[0].StatusFramesSent != 1 ||
+		peerStatuses[0].AckFramesSent != 1 ||
+		peerStatuses[0].LastSequence != 1 {
+		t.Fatalf("unexpected subscription peer statuses: %#v", peerStatuses)
+	}
+	destinationStatuses := snapshot.Publications[0].UDPDestinationStatuses
+	if len(destinationStatuses) != 1 ||
+		!destinationStatuses[0].Active ||
+		destinationStatuses[0].SetupFramesReceived != 1 ||
+		destinationStatuses[0].StatusFramesReceived != 1 ||
+		destinationStatuses[0].AckFramesReceived != 1 ||
+		destinationStatuses[0].LastRTT <= 0 {
+		t.Fatalf("unexpected publication destination statuses: %#v", destinationStatuses)
+	}
 	for _, path := range snapshot.Publications[0].TermBufferFiles {
 		info, err := os.Stat(path)
 		if err != nil {

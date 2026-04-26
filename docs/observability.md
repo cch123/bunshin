@@ -9,7 +9,7 @@ Bunshin exposes observability at two layers:
 
 Aeron exposes counters through its media driver and tooling. Bunshin's embeddable media driver exposes lifecycle counters through `MediaDriver.Snapshot`; the `Metrics` type remains a process-local counter set for stable application-level publication/subscription behavior.
 
-QUIC-specific details are exposed through qlog rather than being normalized into Bunshin counters. UDP exposes Bunshin frame-level counters, retransmit counts, RTT summaries, and transport feedback callbacks.
+QUIC-specific details are exposed through qlog rather than being normalized into Bunshin counters. UDP exposes Bunshin frame-level counters, retransmit counts, RTT summaries, transport feedback callbacks, and per-destination liveness/repair diagnostics.
 
 ## Metrics
 
@@ -54,15 +54,17 @@ Counters currently include connections opened/accepted, messages and bytes sent/
 
 `PublicationConfig.TransportFeedback` receives UDP RTT observations after ACK and retransmit observations after NAK repair. This hook is intentionally low-level so applications can experiment with congestion-control policy without replacing the default QUIC transport.
 
+UDP publications also expose `Publication.DestinationStatuses()`. Each destination snapshot includes setup/STATUS/ACK/NAK counts, the last NAK range, retransmit counts, retransmit-cache miss counts, response timeouts, last RTT, and liveness timestamps. UDP subscriptions expose `Subscription.UDPPeerStatuses()` with the receiver-side peer view, including received DATA/HELLO counts and sent STATUS/ACK/NAK/ERROR counts. Driver publication and subscription snapshots include the same destination and peer diagnostics for external tooling.
+
 Subscriptions also keep process-local loss reports:
 
 ```go
 for _, report := range sub.LossReports() {
-    fmt.Println(report.StreamID, report.SessionID, report.ObservationCount, report.MissingMessages)
+    fmt.Println(report.StreamID, report.SessionID, report.ObservationCount, report.RetryCount, report.MissingMessages)
 }
 ```
 
-These reports mirror the diagnostic intent of Aeron's LossStat (https://aeron.io/docs/aeron/aeron-tooling/#loss-stat), but they are based on Bunshin publisher sequence gaps rather than media-driver packet loss.
+These reports mirror the diagnostic intent of Aeron's LossStat (https://aeron.io/docs/aeron/aeron-tooling/#loss-stat), but they are based on Bunshin publisher sequence gaps rather than media-driver packet loss. For UDP subscriptions with `UDPNakRetryInterval` enabled, `RetryCount` and `LastRetry` report repeated NAKs for still-open gaps.
 
 Subscriptions expose image snapshots for stream/session/source status:
 

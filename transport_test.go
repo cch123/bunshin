@@ -1536,7 +1536,8 @@ func TestUDPPublicationDynamicDestinations(t *testing.T) {
 	}
 	for _, status := range statuses {
 		if !status.Active || status.Remote == "" || status.LastSequence != 1 ||
-			status.LastSetupAt.IsZero() || status.LastStatusAt.IsZero() || status.LastAckAt.IsZero() || status.LastRTT <= 0 {
+			status.LastSetupAt.IsZero() || status.LastStatusAt.IsZero() || status.LastAckAt.IsZero() || status.LastRTT <= 0 ||
+			status.SetupFramesReceived != 1 || status.StatusFramesReceived != 1 || status.AckFramesReceived != 1 || status.NAKFramesReceived != 0 {
 			t.Fatalf("unexpected active destination status: %#v", status)
 		}
 	}
@@ -1733,9 +1734,90 @@ func TestUDPNakRepairRetransmitsCachedFrames(t *testing.T) {
 	if pubSnapshot.Retransmits != 1 {
 		t.Fatalf("publication retransmits = %d, want 1: %#v", pubSnapshot.Retransmits, pubSnapshot)
 	}
+	statuses := pub.DestinationStatuses()
+	if len(statuses) != 1 ||
+		statuses[0].NAKFramesReceived != 1 ||
+		statuses[0].NAKMessagesReceived != 1 ||
+		statuses[0].LastNAKFromSequence != 1 ||
+		statuses[0].LastNAKToSequence != 1 ||
+		statuses[0].RetransmittedFrames != 1 ||
+		statuses[0].RetransmittedMessages != 1 ||
+		statuses[0].LastNAKAt.IsZero() ||
+		statuses[0].LastRetransmitAt.IsZero() {
+		t.Fatalf("unexpected destination status after NAK repair: %#v", statuses)
+	}
 	subSnapshot := subMetrics.Snapshot()
 	if subSnapshot.LossGapEvents != 1 || subSnapshot.LossGapMessages != 1 {
 		t.Fatalf("unexpected subscription loss metrics: %#v", subSnapshot)
+	}
+}
+
+func TestUDPDestinationStatusReportsNAKCacheMiss(t *testing.T) {
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   116,
+		SessionID:  218,
+		RemoteAddr: "127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	err = pub.applyUDPNak(pub.udpRemote, frame{
+		typ:       frameNak,
+		streamID:  pub.streamID,
+		sessionID: pub.sessionID,
+		seq:       2,
+		payload: encodeNakPayload(nakPayload{
+			fromSequence: 1,
+			toSequence:   2,
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := pub.DestinationStatuses()
+	if len(statuses) != 1 ||
+		statuses[0].NAKFramesReceived != 1 ||
+		statuses[0].NAKMessagesReceived != 2 ||
+		statuses[0].NAKCacheMisses != 2 ||
+		statuses[0].LastNAKFromSequence != 1 ||
+		statuses[0].LastNAKToSequence != 2 ||
+		statuses[0].LastNAKMissSequence != 2 ||
+		statuses[0].RetransmittedFrames != 0 ||
+		statuses[0].RetransmittedMessages != 0 ||
+		statuses[0].LastNAKAt.IsZero() ||
+		statuses[0].LastNAKCacheMissAt.IsZero() {
+		t.Fatalf("unexpected destination status after NAK cache miss: %#v", statuses)
+	}
+}
+
+func TestUDPDestinationStatusReportsResponseTimeout(t *testing.T) {
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   118,
+		SessionID:  220,
+		RemoteAddr: "127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err = pub.readUDPResponses(ctx, termAppend{TermID: 0, Position: 64}, 7, []net.Addr{pub.udpRemote}, time.Now())
+	if err == nil {
+		t.Fatal("readUDPResponses() err = nil, want timeout")
+	}
+	statuses := pub.DestinationStatuses()
+	if len(statuses) != 1 ||
+		statuses[0].ResponseTimeouts != 1 ||
+		statuses[0].LastTimeoutSequence != 7 ||
+		statuses[0].LastSequence != 7 ||
+		statuses[0].LastResponseTimeoutAt.IsZero() {
+		t.Fatalf("unexpected destination status after response timeout: %#v", statuses)
 	}
 }
 
@@ -1832,6 +1914,87 @@ func TestUDPReceiverImageTracksOutOfOrderRebuild(t *testing.T) {
 			reports[0].RebuildMessages == 0 &&
 			reports[0].RebuildFrames == 0 &&
 			reports[0].RebuildBytes == 0
+	})
+}
+
+func TestUDPNakRetryRepeatsPendingGap(t *testing.T) {
+	lossObserved := make(chan LossObservation, 2)
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport:           TransportUDP,
+		StreamID:            143,
+		LocalAddr:           "127.0.0.1:0",
+		UDPNakRetryInterval: 5 * time.Millisecond,
+		LossHandler: func(observation LossObservation) {
+			lossObserved <- observation
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	go func() {
+		_ = sub.Serve(ctx, func(context.Context, Message) error {
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   143,
+		SessionID:  243,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	_, secondDatagrams := udpDatagramsForTest(t, pub, 2, []byte("two"))
+	if err := pub.writeUDPDatagrams(pub.udpRemote, secondDatagrams); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case observation := <-lossObserved:
+		if observation.Retry || observation.FromSequence != 1 || observation.ToSequence != 1 {
+			t.Fatalf("unexpected first loss observation: %#v", observation)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	select {
+	case observation := <-lossObserved:
+		if !observation.Retry || observation.FromSequence != 1 || observation.ToSequence != 1 {
+			t.Fatalf("unexpected retry loss observation: %#v", observation)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	reports := sub.LossReports()
+	if len(reports) != 1 || reports[0].ObservationCount != 1 || reports[0].RetryCount != 1 ||
+		reports[0].MissingMessages != 1 || reports[0].LastRetry.IsZero() {
+		t.Fatalf("unexpected loss reports after retry: %#v", reports)
+	}
+	waitForCondition(t, time.Second, func() bool {
+		statuses := sub.UDPPeerStatuses()
+		return len(statuses) == 1 &&
+			statuses[0].Active &&
+			statuses[0].FramesReceived == 1 &&
+			statuses[0].DataFramesReceived == 1 &&
+			statuses[0].NAKFramesSent >= 2 &&
+			statuses[0].NAKMessagesSent >= 2 &&
+			statuses[0].NAKRetriesSent >= 1 &&
+			statuses[0].LastSequence == 2 &&
+			statuses[0].LastNAKFromSequence == 1 &&
+			statuses[0].LastNAKToSequence == 1 &&
+			!statuses[0].LastDataAt.IsZero() &&
+			!statuses[0].LastNAKAt.IsZero() &&
+			!statuses[0].LastNAKRetryAt.IsZero()
 	})
 }
 

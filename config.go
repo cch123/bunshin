@@ -12,8 +12,9 @@ var ErrInvalidConfig = errors.New("bunshin: invalid config")
 
 type normalizedPublicationConfig struct {
 	PublicationConfig
-	mtuPayload int
-	flowLimit  int64
+	mtuPayload          int
+	flowLimit           int64
+	udpCongestionWindow int
 }
 
 func (cfg PublicationConfig) Validate() error {
@@ -110,6 +111,16 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 	if cfg.PublicationWindowBytes <= 0 {
 		return normalizedPublicationConfig{}, invalidConfigf("invalid publication window bytes: %d", cfg.PublicationWindowBytes)
 	}
+	udpCongestionWindow := 0
+	if cfg.UDPCongestionControl != nil {
+		if cfg.Transport != TransportUDP {
+			return normalizedPublicationConfig{}, invalidConfigf("UDP congestion control requires UDP transport")
+		}
+		udpCongestionWindow = cfg.UDPCongestionControl.InitialWindow(cfg.PublicationWindowBytes)
+		if udpCongestionWindow <= 0 {
+			return normalizedPublicationConfig{}, invalidConfigf("invalid UDP congestion window bytes: %d", udpCongestionWindow)
+		}
+	}
 
 	if cfg.Transport == TransportQUIC {
 		if cfg.TLSConfig == nil {
@@ -123,9 +134,10 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 	}
 
 	return normalizedPublicationConfig{
-		PublicationConfig: cfg,
-		mtuPayload:        mtuPayload,
-		flowLimit:         flowLimit,
+		PublicationConfig:   cfg,
+		mtuPayload:          mtuPayload,
+		flowLimit:           flowLimit,
+		udpCongestionWindow: udpCongestionWindow,
 	}, nil
 }
 
@@ -150,6 +162,9 @@ func normalizeSubscriptionConfig(cfg SubscriptionConfig) (SubscriptionConfig, er
 	if cfg.ReceiverWindowBytes < 0 {
 		return SubscriptionConfig{}, invalidConfigf("invalid receiver window bytes: %d", cfg.ReceiverWindowBytes)
 	}
+	if cfg.UDPNakRetryInterval < 0 {
+		return SubscriptionConfig{}, invalidConfigf("invalid UDP NAK retry interval: %s", cfg.UDPNakRetryInterval)
+	}
 	if cfg.TermBufferLength < 0 {
 		return SubscriptionConfig{}, invalidConfigf("invalid subscription term buffer length: %d", cfg.TermBufferLength)
 	}
@@ -160,7 +175,7 @@ func normalizeSubscriptionConfig(cfg SubscriptionConfig) (SubscriptionConfig, er
 		if err := validateIPCRingCapacity(cfg.DriverDataRingCapacity); err != nil {
 			return SubscriptionConfig{}, invalidConfigWrap(err)
 		}
-		if cfg.DriverDataRingCapacity < minDriverIPCMessageRecordBytes {
+		if cfg.DriverDataRingCapacity < minDriverSubscriptionImageRecordBytes {
 			return SubscriptionConfig{}, invalidConfigf("invalid subscription driver data ring capacity: %d", cfg.DriverDataRingCapacity)
 		}
 	}

@@ -83,7 +83,8 @@ type DriverSubscription struct {
 	client          *DriverClient
 	subscription    *Subscription
 	localAddr       string
-	dataRing        *IPCRing
+	dataImage       *DriverSubscriptionImage
+	dataImagePath   string
 	dataRingPath    string
 	pendingMu       sync.Mutex
 	pendingMessages []Message
@@ -161,30 +162,40 @@ type DriverClientSnapshot struct {
 }
 
 type DriverPublicationSnapshot struct {
-	ID               DriverResourceID
-	ClientID         DriverClientID
-	StreamID         uint32
-	SessionID        uint32
-	RemoteAddr       string
-	CreatedAt        time.Time
-	TermBufferFiles  []string
-	TermBufferMapped bool
+	ID                     DriverResourceID
+	ClientID               DriverClientID
+	StreamID               uint32
+	SessionID              uint32
+	RemoteAddr             string
+	CreatedAt              time.Time
+	TermBufferFiles        []string
+	TermBufferMapped       bool
+	UDPDestinationStatuses []UDPDestinationStatus
 }
 
 type DriverSubscriptionSnapshot struct {
-	ID                      DriverResourceID
-	ClientID                DriverClientID
-	StreamID                uint32
-	LocalAddr               string
-	CreatedAt               time.Time
-	DataRingPath            string
-	DataRingCapacity        int
-	DataRingUsed            int
-	DataRingFree            int
-	DataRingReadPosition    uint64
-	DataRingWritePosition   uint64
-	DataRingMapped          bool
-	DataRingPendingMessages int
+	ID                       DriverResourceID
+	ClientID                 DriverClientID
+	StreamID                 uint32
+	LocalAddr                string
+	CreatedAt                time.Time
+	UDPPeerStatuses          []UDPSubscriptionPeerStatus
+	DataImagePath            string
+	DataImageCapacity        int
+	DataImageUsed            int
+	DataImageFree            int
+	DataImageReadPosition    uint64
+	DataImageWritePosition   uint64
+	DataImageMapped          bool
+	DataImagePendingMessages int
+	DataRingPath             string
+	DataRingCapacity         int
+	DataRingUsed             int
+	DataRingFree             int
+	DataRingReadPosition     uint64
+	DataRingWritePosition    uint64
+	DataRingMapped           bool
+	DataRingPendingMessages  int
 }
 
 type DriverSubscriptionDataRingStatus struct {
@@ -197,6 +208,82 @@ type DriverSubscriptionDataRingStatus struct {
 	Mapped                bool
 	LocalPendingMessages  int
 	ServerPendingMessages int
+}
+
+type DriverSubscriptionDataImageStatus struct {
+	Path                  string
+	Capacity              int
+	Used                  int
+	Free                  int
+	ReadPosition          uint64
+	WritePosition         uint64
+	Mapped                bool
+	LocalPendingMessages  int
+	ServerPendingMessages int
+}
+
+func ipcSnapshotFromSubscriptionImage(snapshot DriverSubscriptionImageSnapshot) IPCRingSnapshot {
+	return IPCRingSnapshot{
+		Path:          snapshot.Path,
+		Capacity:      snapshot.Capacity,
+		Used:          snapshot.Used,
+		Free:          snapshot.Free,
+		ReadPosition:  snapshot.ReadPosition,
+		WritePosition: snapshot.WritePosition,
+	}
+}
+
+func (s DriverSubscriptionSnapshot) dataImagePath() string {
+	if s.DataImagePath != "" {
+		return s.DataImagePath
+	}
+	return s.DataRingPath
+}
+
+func (s DriverSubscriptionSnapshot) dataImageCapacity() int {
+	if s.DataImageCapacity != 0 {
+		return s.DataImageCapacity
+	}
+	return s.DataRingCapacity
+}
+
+func (s DriverSubscriptionSnapshot) dataImageUsed() int {
+	if s.DataImageUsed != 0 {
+		return s.DataImageUsed
+	}
+	return s.DataRingUsed
+}
+
+func (s DriverSubscriptionSnapshot) dataImageFree() int {
+	if s.DataImageFree != 0 {
+		return s.DataImageFree
+	}
+	return s.DataRingFree
+}
+
+func (s DriverSubscriptionSnapshot) dataImageReadPosition() uint64 {
+	if s.DataImageReadPosition != 0 {
+		return s.DataImageReadPosition
+	}
+	return s.DataRingReadPosition
+}
+
+func (s DriverSubscriptionSnapshot) dataImageWritePosition() uint64 {
+	if s.DataImageWritePosition != 0 {
+		return s.DataImageWritePosition
+	}
+	return s.DataRingWritePosition
+}
+
+func (s DriverSubscriptionSnapshot) dataImageMapped() bool {
+	return s.DataImageMapped || s.DataRingMapped
+}
+
+func (s DriverSubscriptionSnapshot) dataImagePendingMessages() int {
+	if s.DataImagePendingMessages != 0 {
+		return s.DataImagePendingMessages
+	}
+	return s.DataRingPendingMessages
 }
 
 type DriverImageSnapshot struct {
@@ -227,9 +314,11 @@ type DriverLossReportSnapshot struct {
 	SessionID        uint32
 	Source           string
 	ObservationCount uint64
+	RetryCount       uint64
 	MissingMessages  uint64
 	FirstObservation time.Time
 	LastObservation  time.Time
+	LastRetry        time.Time
 }
 
 type driverCommand struct {
@@ -778,14 +867,20 @@ func (c *DriverClient) AddPublication(ctx context.Context, cfg PublicationConfig
 			Type:     DriverIPCCommandAddPublication,
 			ClientID: c.id,
 			Publication: DriverIPCPublicationConfig{
-				StreamID:               cfg.StreamID,
-				SessionID:              cfg.SessionID,
-				RemoteAddr:             cfg.RemoteAddr,
-				MaxPayloadBytes:        cfg.MaxPayloadBytes,
-				MTUBytes:               cfg.MTUBytes,
-				TermBufferLength:       cfg.TermBufferLength,
-				InitialTermID:          cfg.InitialTermID,
-				PublicationWindowBytes: cfg.PublicationWindowBytes,
+				Transport:                 cfg.Transport,
+				StreamID:                  cfg.StreamID,
+				SessionID:                 cfg.SessionID,
+				RemoteAddr:                cfg.RemoteAddr,
+				UDPDestinations:           append([]string(nil), cfg.UDPDestinations...),
+				UDPMulticastInterface:     cfg.UDPMulticastInterface,
+				UDPNameResolutionInterval: cfg.UDPNameResolutionInterval,
+				UDPReceiverTimeout:        cfg.UDPReceiverTimeout,
+				MaxPayloadBytes:           cfg.MaxPayloadBytes,
+				MTUBytes:                  cfg.MTUBytes,
+				UDPRetransmitBufferBytes:  cfg.UDPRetransmitBufferBytes,
+				TermBufferLength:          cfg.TermBufferLength,
+				InitialTermID:             cfg.InitialTermID,
+				PublicationWindowBytes:    cfg.PublicationWindowBytes,
 			},
 		})
 		if err != nil {
@@ -863,28 +958,38 @@ func (c *DriverClient) AddSubscription(ctx context.Context, cfg SubscriptionConf
 			Type:     DriverIPCCommandAddSubscription,
 			ClientID: c.id,
 			Subscription: DriverIPCSubscriptionConfig{
-				StreamID:         cfg.StreamID,
-				LocalAddr:        cfg.LocalAddr,
-				DataRingCapacity: cfg.DriverDataRingCapacity,
+				Transport:             cfg.Transport,
+				StreamID:              cfg.StreamID,
+				LocalAddr:             cfg.LocalAddr,
+				UDPMulticastInterface: cfg.UDPMulticastInterface,
+				UDPNakRetryInterval:   cfg.UDPNakRetryInterval,
+				ReceiverWindowBytes:   cfg.ReceiverWindowBytes,
+				TermBufferLength:      cfg.TermBufferLength,
+				DataRingCapacity:      cfg.DriverDataRingCapacity,
 			},
 		})
 		if err != nil {
 			return nil, err
 		}
-		var dataRing *IPCRing
-		if event.DataRingPath != "" {
-			dataRing, err = OpenIPCRing(IPCRingConfig{Path: event.DataRingPath})
+		dataImagePath := event.DataImagePath
+		if dataImagePath == "" {
+			dataImagePath = event.DataRingPath
+		}
+		var dataImage *DriverSubscriptionImage
+		if dataImagePath != "" {
+			dataImage, err = OpenDriverSubscriptionImage(DriverSubscriptionImageConfig{Path: dataImagePath})
 			if err != nil {
 				_ = c.CloseSubscription(ctx, event.ResourceID)
 				return nil, err
 			}
 		}
 		return &DriverSubscription{
-			id:           event.ResourceID,
-			client:       c,
-			localAddr:    event.Message,
-			dataRing:     dataRing,
-			dataRingPath: event.DataRingPath,
+			id:            event.ResourceID,
+			client:        c,
+			localAddr:     event.Message,
+			dataImage:     dataImage,
+			dataImagePath: dataImagePath,
+			dataRingPath:  dataImagePath,
 		}, nil
 	}
 	value, err := c.driver.dispatch(ctx, func(state *driverState) (any, error) {
@@ -1064,6 +1169,16 @@ func (p *DriverPublication) LocalAddr() net.Addr {
 	return p.publication.LocalAddr()
 }
 
+func (p *DriverPublication) DestinationStatuses() []UDPDestinationStatus {
+	if p == nil {
+		return nil
+	}
+	if p.publication == nil {
+		return p.externalDestinationStatuses()
+	}
+	return p.publication.DestinationStatuses()
+}
+
 func (p *DriverPublication) Close(ctx context.Context) error {
 	return p.client.ClosePublication(ctx, p.id)
 }
@@ -1162,14 +1277,35 @@ func (s *DriverSubscription) Images() []ImageSnapshot {
 	return s.subscription.Images()
 }
 
+func (s *DriverSubscription) UDPPeerStatuses() []UDPSubscriptionPeerStatus {
+	if s == nil {
+		return nil
+	}
+	if s.subscription == nil {
+		return s.externalUDPPeerStatuses()
+	}
+	return s.subscription.UDPPeerStatuses()
+}
+
 func (s *DriverSubscription) DataRingSnapshot() (IPCRingSnapshot, bool, error) {
 	if s == nil {
 		return IPCRingSnapshot{}, false, ErrDriverClientClosed
 	}
-	if s.dataRing == nil {
+	if s.dataImage == nil {
 		return IPCRingSnapshot{}, false, nil
 	}
-	snapshot, err := s.dataRing.Snapshot()
+	snapshot, err := s.dataImage.Snapshot()
+	return ipcSnapshotFromSubscriptionImage(snapshot), true, err
+}
+
+func (s *DriverSubscription) DataImageSnapshot() (DriverSubscriptionImageSnapshot, bool, error) {
+	if s == nil {
+		return DriverSubscriptionImageSnapshot{}, false, ErrDriverClientClosed
+	}
+	if s.dataImage == nil {
+		return DriverSubscriptionImageSnapshot{}, false, nil
+	}
+	snapshot, err := s.dataImage.Snapshot()
 	return snapshot, true, err
 }
 
@@ -1181,8 +1317,8 @@ func (s *DriverSubscription) DataRingStatus(ctx context.Context) (DriverSubscrip
 		LocalPendingMessages: s.PendingMessages(),
 	}
 	ok := false
-	if s.dataRing != nil {
-		snapshot, err := s.dataRing.Snapshot()
+	if s.dataImage != nil {
+		snapshot, err := s.dataImage.Snapshot()
 		if err != nil {
 			return DriverSubscriptionDataRingStatus{}, false, err
 		}
@@ -1213,19 +1349,37 @@ func (s *DriverSubscription) DataRingStatus(ctx context.Context) (DriverSubscrip
 			continue
 		}
 		if !ok {
-			status.Path = subscription.DataRingPath
-			status.Capacity = subscription.DataRingCapacity
-			status.Used = subscription.DataRingUsed
-			status.Free = subscription.DataRingFree
-			status.ReadPosition = subscription.DataRingReadPosition
-			status.WritePosition = subscription.DataRingWritePosition
-			status.Mapped = subscription.DataRingMapped
-			ok = subscription.DataRingMapped || subscription.DataRingPath != ""
+			status.Path = subscription.dataImagePath()
+			status.Capacity = subscription.dataImageCapacity()
+			status.Used = subscription.dataImageUsed()
+			status.Free = subscription.dataImageFree()
+			status.ReadPosition = subscription.dataImageReadPosition()
+			status.WritePosition = subscription.dataImageWritePosition()
+			status.Mapped = subscription.dataImageMapped()
+			ok = subscription.dataImageMapped() || subscription.dataImagePath() != ""
 		}
-		status.ServerPendingMessages = subscription.DataRingPendingMessages
+		status.ServerPendingMessages = subscription.dataImagePendingMessages()
 		return status, ok, nil
 	}
 	return status, ok, nil
+}
+
+func (s *DriverSubscription) DataImageStatus(ctx context.Context) (DriverSubscriptionDataImageStatus, bool, error) {
+	status, ok, err := s.DataRingStatus(ctx)
+	if err != nil {
+		return DriverSubscriptionDataImageStatus{}, ok, err
+	}
+	return DriverSubscriptionDataImageStatus{
+		Path:                  status.Path,
+		Capacity:              status.Capacity,
+		Used:                  status.Used,
+		Free:                  status.Free,
+		ReadPosition:          status.ReadPosition,
+		WritePosition:         status.WritePosition,
+		Mapped:                status.Mapped,
+		LocalPendingMessages:  status.LocalPendingMessages,
+		ServerPendingMessages: status.ServerPendingMessages,
+	}, ok, nil
 }
 
 // PendingMessages reports the number of locally buffered external fallback messages.
@@ -1332,12 +1486,45 @@ func (s *DriverSubscription) externalLossReports() []LossReport {
 			SessionID:        report.SessionID,
 			Source:           report.Source,
 			ObservationCount: report.ObservationCount,
+			RetryCount:       report.RetryCount,
 			MissingMessages:  report.MissingMessages,
 			FirstObservation: report.FirstObservation,
 			LastObservation:  report.LastObservation,
+			LastRetry:        report.LastRetry,
 		})
 	}
 	return reports
+}
+
+func (p *DriverPublication) externalDestinationStatuses() []UDPDestinationStatus {
+	if p == nil || p.client == nil {
+		return nil
+	}
+	snapshot, err := p.client.Snapshot(context.Background())
+	if err != nil {
+		return nil
+	}
+	for _, publication := range snapshot.Publications {
+		if publication.ID != p.id {
+			continue
+		}
+		return append([]UDPDestinationStatus(nil), publication.UDPDestinationStatuses...)
+	}
+	return nil
+}
+
+func (s *DriverSubscription) externalUDPPeerStatuses() []UDPSubscriptionPeerStatus {
+	snapshot, ok := s.externalSnapshot()
+	if !ok {
+		return nil
+	}
+	for _, subscription := range snapshot.Subscriptions {
+		if subscription.ID != s.id {
+			continue
+		}
+		return append([]UDPSubscriptionPeerStatus(nil), subscription.UDPPeerStatuses...)
+	}
+	return nil
 }
 
 func (s *DriverSubscription) externalSnapshot() (DriverSnapshot, bool) {
@@ -1352,11 +1539,11 @@ func (s *DriverSubscription) externalSnapshot() (DriverSnapshot, bool) {
 }
 
 func (s *DriverSubscription) closeExternalDataRing() error {
-	if s == nil || s.dataRing == nil {
+	if s == nil || s.dataImage == nil {
 		return nil
 	}
-	err := s.dataRing.Close()
-	s.dataRing = nil
+	err := s.dataImage.Close()
+	s.dataImage = nil
 	return err
 }
 
@@ -1395,8 +1582,8 @@ func (s *DriverSubscription) controlledPollExternal(ctx context.Context, fragmen
 			}
 			continue
 		}
-		if s.dataRing != nil {
-			n, ok, stop, err := s.controlledPollExternalDataRing(ctx, handler)
+		if s.dataImage != nil {
+			n, ok, stop, err := s.controlledPollExternalDataImage(ctx, handler)
 			if err != nil {
 				return delivered + n, err
 			}
@@ -1432,8 +1619,8 @@ func (s *DriverSubscription) controlledPollExternal(ctx context.Context, fragmen
 			idle.Idle(0)
 			continue
 		}
-		if s.dataRing != nil && event.MessageCount > 0 {
-			n, ok, stop, err := s.controlledPollExternalDataRing(ctx, handler)
+		if s.dataImage != nil && event.MessageCount > 0 {
+			n, ok, stop, err := s.controlledPollExternalDataImage(ctx, handler)
 			if err != nil {
 				return delivered + n, err
 			}
@@ -1515,8 +1702,8 @@ func (s *DriverSubscription) pollExternal(ctx context.Context, messageLimit, fra
 		}
 		remainingMessages = messageLimit - deliveredTotal
 		remainingFragments = fragmentLimit - deliveredTotal
-		if s.dataRing != nil {
-			delivered, err = s.drainExternalDataRing(ctx, min(remainingMessages, remainingFragments), handler, shouldStop)
+		if s.dataImage != nil {
+			delivered, err = s.drainExternalDataImage(ctx, min(remainingMessages, remainingFragments), handler, shouldStop)
 			if err != nil && !errors.Is(err, ErrIPCRingEmpty) {
 				return deliveredTotal + delivered, err
 			}
@@ -1640,16 +1827,16 @@ func (s *DriverSubscription) controlledPollExternalPending(ctx context.Context, 
 	}
 }
 
-func (s *DriverSubscription) controlledPollExternalDataRing(ctx context.Context, handler ControlledHandler) (int, bool, bool, error) {
-	if s == nil || s.dataRing == nil {
+func (s *DriverSubscription) controlledPollExternalDataImage(ctx context.Context, handler ControlledHandler) (int, bool, bool, error) {
+	if s == nil || s.dataImage == nil {
 		return 0, false, false, ErrDriverIPCClosed
 	}
 	delivered := 0
 	handled := false
 	stop := false
-	_, err := pollDriverIPCMessages(s.dataRing, 1, func(ipcMessage DriverIPCMessage) error {
+	_, err := s.dataImage.PollN(1, func(msg Message) error {
 		handled = true
-		switch action := handler(ctx, ipcMessage.message()); action {
+		switch action := handler(ctx, msg); action {
 		case ControlledPollContinue, ControlledPollCommit:
 			delivered = 1
 			return nil
@@ -1679,8 +1866,8 @@ func isContextDoneError(err error) bool {
 }
 
 func (s *DriverSubscription) readExternalMessage(event DriverIPCEvent) (Message, error) {
-	if s != nil && s.dataRing != nil && event.MessageCount > 0 {
-		out, ok, err := s.readExternalDataRingMessage()
+	if s != nil && s.dataImage != nil && event.MessageCount > 0 {
+		out, ok, err := s.readExternalDataImageMessage()
 		if err != nil {
 			return Message{}, err
 		}
@@ -1699,11 +1886,11 @@ func (s *DriverSubscription) drainExternalMessages(ctx context.Context, event Dr
 	if pollShouldStop(shouldStop) {
 		return 0, nil
 	}
-	if s != nil && s.dataRing != nil && event.MessageCount > 0 {
+	if s != nil && s.dataImage != nil && event.MessageCount > 0 {
 		if len(event.Messages) > 0 {
 			return 0, ErrDriverIPCProtocol
 		}
-		delivered, err := s.drainExternalDataRing(ctx, event.MessageCount, handler, shouldStop)
+		delivered, err := s.drainExternalDataImage(ctx, event.MessageCount, handler, shouldStop)
 		if err != nil {
 			return delivered, err
 		}
@@ -1719,13 +1906,13 @@ func (s *DriverSubscription) drainExternalMessages(ctx context.Context, event Dr
 	return s.drainExternalPending(ctx, len(event.Messages), handler, shouldStop)
 }
 
-func (s *DriverSubscription) readExternalDataRingMessage() (Message, bool, error) {
-	if s == nil || s.dataRing == nil {
+func (s *DriverSubscription) readExternalDataImageMessage() (Message, bool, error) {
+	if s == nil || s.dataImage == nil {
 		return Message{}, false, ErrDriverIPCClosed
 	}
 	var out Message
-	n, err := pollDriverIPCMessages(s.dataRing, 1, func(ipcMessage DriverIPCMessage) error {
-		out = ipcMessage.message()
+	n, err := s.dataImage.PollN(1, func(msg Message) error {
+		out = msg
 		return nil
 	})
 	if err != nil {
@@ -1737,16 +1924,16 @@ func (s *DriverSubscription) readExternalDataRingMessage() (Message, bool, error
 	return out, n == 1, nil
 }
 
-func (s *DriverSubscription) drainExternalDataRing(ctx context.Context, limit int, handler Handler, shouldStop func() bool) (int, error) {
-	if s == nil || s.dataRing == nil {
+func (s *DriverSubscription) drainExternalDataImage(ctx context.Context, limit int, handler Handler, shouldStop func() bool) (int, error) {
+	if s == nil || s.dataImage == nil {
 		return 0, ErrDriverIPCClosed
 	}
 	if limit <= 0 || pollShouldStop(shouldStop) {
 		return 0, nil
 	}
 	delivered := 0
-	n, err := pollDriverIPCMessages(s.dataRing, limit, func(ipcMessage DriverIPCMessage) error {
-		if err := handler(ctx, ipcMessage.message()); err != nil {
+	n, err := s.dataImage.PollN(limit, func(msg Message) error {
+		if err := handler(ctx, msg); err != nil {
 			return err
 		}
 		delivered++
@@ -1946,14 +2133,15 @@ func (state *driverState) snapshot() DriverSnapshot {
 			publicationEndpoints[endpoint] = struct{}{}
 		}
 		snapshot.Publications = append(snapshot.Publications, DriverPublicationSnapshot{
-			ID:               publication.id,
-			ClientID:         publication.clientID,
-			StreamID:         publication.streamID,
-			SessionID:        publication.sessionID,
-			RemoteAddr:       publication.remoteAddr,
-			CreatedAt:        publication.createdAt,
-			TermBufferFiles:  append([]string(nil), publication.termBufferFiles...),
-			TermBufferMapped: publication.termBufferMapped,
+			ID:                     publication.id,
+			ClientID:               publication.clientID,
+			StreamID:               publication.streamID,
+			SessionID:              publication.sessionID,
+			RemoteAddr:             publication.remoteAddr,
+			CreatedAt:              publication.createdAt,
+			TermBufferFiles:        append([]string(nil), publication.termBufferFiles...),
+			TermBufferMapped:       publication.termBufferMapped,
+			UDPDestinationStatuses: publicationDestinationStatuses(publication),
 		})
 	}
 	for _, subscription := range state.subscriptions {
@@ -1961,11 +2149,12 @@ func (state *driverState) snapshot() DriverSnapshot {
 			subscriptionEndpoints[endpoint] = struct{}{}
 		}
 		snapshot.Subscriptions = append(snapshot.Subscriptions, DriverSubscriptionSnapshot{
-			ID:        subscription.id,
-			ClientID:  subscription.clientID,
-			StreamID:  subscription.streamID,
-			LocalAddr: subscription.localAddr,
-			CreatedAt: subscription.createdAt,
+			ID:              subscription.id,
+			ClientID:        subscription.clientID,
+			StreamID:        subscription.streamID,
+			LocalAddr:       subscription.localAddr,
+			CreatedAt:       subscription.createdAt,
+			UDPPeerStatuses: subscriptionPeerStatuses(subscription),
 		})
 		if subscription.subscription != nil {
 			for _, image := range subscription.subscription.Images() {
@@ -1998,9 +2187,11 @@ func (state *driverState) snapshot() DriverSnapshot {
 					SessionID:        report.SessionID,
 					Source:           report.Source,
 					ObservationCount: report.ObservationCount,
+					RetryCount:       report.RetryCount,
 					MissingMessages:  report.MissingMessages,
 					FirstObservation: report.FirstObservation,
 					LastObservation:  report.LastObservation,
+					LastRetry:        report.LastRetry,
 				})
 			}
 		}
@@ -2093,6 +2284,28 @@ func driverPublicationEndpoints(publication *driverPublicationState) []string {
 		return []string{publication.remoteAddr}
 	}
 	return nil
+}
+
+func publicationDestinationStatuses(publication *driverPublicationState) []UDPDestinationStatus {
+	if publication == nil || publication.publication == nil {
+		return nil
+	}
+	statuses := publication.publication.DestinationStatuses()
+	if len(statuses) == 0 {
+		return nil
+	}
+	return append([]UDPDestinationStatus(nil), statuses...)
+}
+
+func subscriptionPeerStatuses(subscription *driverSubscriptionState) []UDPSubscriptionPeerStatus {
+	if subscription == nil || subscription.subscription == nil {
+		return nil
+	}
+	statuses := subscription.subscription.UDPPeerStatuses()
+	if len(statuses) == 0 {
+		return nil
+	}
+	return append([]UDPSubscriptionPeerStatus(nil), statuses...)
 }
 
 func driverSubscriptionEndpoint(subscription *driverSubscriptionState) string {

@@ -89,7 +89,7 @@ func (s *Subscription) pollUDP(ctx context.Context, messageLimit, fragmentLimit 
 	fragments := 0
 	buf := make([]byte, maxFrameSize)
 	for delivered < messageLimit && fragments < fragmentLimit && !pollShouldStop(shouldStop) {
-		if err := s.udpConn.SetReadDeadline(udpDeadline(ctx)); err != nil {
+		if err := s.udpConn.SetReadDeadline(s.udpReadDeadline(ctx)); err != nil {
 			return delivered, err
 		}
 		n, remote, err := s.udpConn.ReadFrom(buf)
@@ -112,6 +112,9 @@ func (s *Subscription) pollUDP(ctx context.Context, messageLimit, fragmentLimit 
 				return 0, ctx.Err()
 			}
 			if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+				if retryErr := s.retryUDPNaks(); retryErr != nil && delivered == 0 && fragments == 0 {
+					return delivered, retryErr
+				}
 				if delivered > 0 || fragments > 0 {
 					return delivered, nil
 				}
@@ -132,6 +135,7 @@ func (s *Subscription) pollUDP(ctx context.Context, messageLimit, fragmentLimit 
 		s.metrics.incFramesReceived(1)
 		switch f.typ {
 		case frameHello:
+			s.recordUDPPeerHello(remote)
 			if err := s.writeUDPHello(remote, f); err != nil {
 				return delivered, err
 			}

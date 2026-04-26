@@ -9,6 +9,7 @@ func TestPublicAPIContract(t *testing.T) {
 		ListenSubscription,
 		StartMediaDriver,
 		OpenDriverIPC,
+		OpenDriverSubscriptionImage,
 		OpenIPCRing,
 		OpenArchive,
 		StartArchiveControlServer,
@@ -27,6 +28,7 @@ func TestPublicAPIContract(t *testing.T) {
 		NewBackoffIdleStrategy,
 		NewMinMulticastFlowControl,
 		NewPreferredMulticastFlowControl,
+		NewAIMDUDPCongestionControl,
 		ParseChannelURI,
 	}
 	configs := []any{
@@ -35,6 +37,7 @@ func TestPublicAPIContract(t *testing.T) {
 		DriverConfig{},
 		DriverConnectionConfig{},
 		DriverIPCConfig{},
+		DriverSubscriptionImageConfig{},
 		IPCRingConfig{},
 		ArchiveConfig{},
 		ArchiveReplayConfig{},
