@@ -16,7 +16,7 @@ import (
 const (
 	DriverIPCProtocolVersion               = 1
 	defaultDriverIPCSubscriptionPollWindow = 10 * time.Millisecond
-	defaultDriverIPCSubscriptionPumpWindow = time.Millisecond
+	defaultDriverIPCSubscriptionPumpWindow = defaultDriverIPCSubscriptionPollWindow
 	defaultDriverIPCSubscriptionDataRing   = 1024 * 1024
 )
 
