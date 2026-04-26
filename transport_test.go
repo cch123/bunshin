@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1049,13 +1050,15 @@ func TestUDPMulticastPublicationSubscription(t *testing.T) {
 		UDPMulticastInterface: ifi.Name,
 	})
 	if err != nil {
+		if isMulticastUnavailable(err) {
+			t.Skipf("multicast unavailable: %v", err)
+		}
 		t.Fatal(err)
 	}
 	defer pub.Close()
 
 	if err := pub.Send(ctx, []byte("multicast")); err != nil {
-		var netErr net.Error
-		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		if isMulticastUnavailable(err) {
 			t.Skipf("multicast loopback unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -1068,6 +1071,20 @@ func TestUDPMulticastPublicationSubscription(t *testing.T) {
 	case <-ctx.Done():
 		t.Skipf("multicast loopback unavailable: %v", ctx.Err())
 	}
+}
+
+func isMulticastUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no route to host") ||
+		strings.Contains(message, "network is unreachable") ||
+		strings.Contains(message, "can't assign requested address")
 }
 
 func TestPublicationResponseChannelFragments(t *testing.T) {
