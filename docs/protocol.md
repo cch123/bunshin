@@ -26,13 +26,13 @@ The compatibility boundary is intentional:
 - The default UDP MTU is 1,400 bytes to avoid common Ethernet fragmentation. Applications can override `MTUBytes`.
 - Publications can lower `MTUBytes` to force smaller DATA frames. `MaxPayloadBytes` controls the maximum application payload, which can span multiple DATA frames.
 - Delivery reliability, retransmission, flow control, congestion control, and TLS are provided by QUIC through `quic-go`.
-- UDP transport sends DATA frames directly to one or more unicast or multicast destinations and waits for receiver STATUS plus application-level ACK or ERROR frames. It does not yet implement full congestion control or transport-level security.
+- UDP transport performs per-destination HELLO setup, sends DATA frames to one or more unicast or multicast destinations, and waits for receiver STATUS plus application-level ACK or ERROR frames. It does not yet implement full congestion control or transport-level security.
 - Bunshin ACK frames confirm application-level handling, not packet-level delivery.
 - Publications apply a bounded send window before appending frames to the term log. The default window is one term buffer.
 - Publication flow control is strategy-driven. The default strategy is unicast max-right-edge flow control.
 - Subscriptions detect sequence gaps per stream/session/source and expose process-local loss reports.
 - Subscriptions deliver messages to the application in sequence order per stream/session/source.
-- Full congestion control and receiver-side stream rebuilding are not implemented yet.
+- Full congestion control is not implemented yet.
 
 ## Byte Order
 
@@ -226,6 +226,8 @@ This is an application-level sequence report. It does not imply QUIC packet loss
 Subscriptions gate handler invocation by stream, session, and remote source. A message with a later sequence can be read from the transport and recorded as a gap, but it is buffered until earlier sequences for the same stream/session/source have been handled. ACK frames are sent only after the corresponding message has been delivered to the handler.
 
 Duplicate or late sequences that have already been delivered are ACKed without invoking the handler again.
+
+For UDP, a complete DATA message that arrives ahead of a sequence gap is attached to the receiver image before it is delivered. The receiver writes the DATA frames into an image-local rebuild buffer by term ID and term offset. The image `ObservedPosition` and `LastObservedSequence` advance to the highest complete DATA seen, while `CurrentPosition` and `LastSequence` advance only after ordered delivery. `Subscription.Images` and `Subscription.LagReports` expose `RebuildMessages`, `RebuildFrames`, and `RebuildBytes` so NAK repair lag is visible while missing sequences are rebuilt.
 
 ## Negotiation
 

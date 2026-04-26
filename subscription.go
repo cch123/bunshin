@@ -469,12 +469,7 @@ func (s *Subscription) deliverQUICData(ctx context.Context, remote net.Addr, str
 }
 
 func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, handler Handler) error {
-	msg := item.msg
-	msg.Image = s.imageForMessage(ctx, msg)
-	msg.Position = s.messagePosition(msg.Image, item)
-	if msg.Image != nil {
-		msg.Image.observe(msg.Position, msg.Sequence)
-	}
+	msg := s.observeMessageImage(ctx, item)
 	if s.archive != nil {
 		var (
 			record ArchiveRecord
@@ -536,6 +531,7 @@ func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, h
 	s.metrics.incMessagesReceived(len(msg.Payload))
 	if msg.Image != nil {
 		msg.Image.update(msg.Position, msg.Sequence)
+		msg.Image.completeRebuild(msg.Sequence)
 	}
 	if item.ack == nil {
 		return nil
@@ -557,6 +553,20 @@ func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, h
 		"remote_addr": remoteAddrString(msg.Remote),
 	}, nil)
 	return nil
+}
+
+func (s *Subscription) observeMessageImage(ctx context.Context, item orderedMessage) Message {
+	msg := item.msg
+	if msg.Image == nil {
+		msg.Image = s.imageForMessage(ctx, msg)
+	}
+	if msg.Position == 0 {
+		msg.Position = s.messagePosition(msg.Image, item)
+	}
+	if msg.Image != nil {
+		msg.Image.observe(msg.Position, msg.Sequence)
+	}
+	return msg
 }
 
 func (s *Subscription) messagePosition(image *Image, item orderedMessage) int64 {

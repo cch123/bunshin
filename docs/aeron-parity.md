@@ -14,7 +14,7 @@ The remaining gaps are mostly semantic depth, not just missing names. Aeron beha
 | --- | --- | --- | --- |
 | Client and driver API | Clients communicate with an out-of-process media driver over IPC and consume publications/images through shared log buffers. | External clients can register resources, send through driver IPC, receive command responses on per-client response rings, poll driver-owned subscriptions through per-subscription mmap data rings, inspect data-ring capacity and occupancy in driver snapshots, and receive explicit back-pressured poll events when a data ring cannot accept more payloads. | Promote the data rings into shared-image polling, including image lifecycle and position tracking across the driver boundary. |
 | Driver directory and CnC | Aeron tools read a CnC file, counters, error log, loss report, and driver mark files with stable binary layouts. | Bunshin writes JSON mark, counter, loss, error, and ring reports plus typed IPC rings. The adapter boundary for each format is documented in `docs/media-driver.md`. | Build explicit adapters only if Aeron tooling compatibility becomes a goal; otherwise keep these formats Bunshin-native. |
-| Transport protocol | Aeron UDP uses data, setup, status, NAK, RTT, loss detection, retransmit, image rebuild, flow control, and congestion control inside the media-driver protocol. | QUIC is default. UDP has Bunshin DATA, HELLO setup, STATUS, NAK repair, RTT feedback, endpoint liveness snapshots, multicast, multi-destination, and local spy behavior. | Deepen UDP into a full media-driver data path with receiver-side term rebuilding, richer endpoint state, loss recovery, and congestion-control semantics. |
+| Transport protocol | Aeron UDP uses data, setup, status, NAK, RTT, loss detection, retransmit, image rebuild, flow control, and congestion control inside the media-driver protocol. | QUIC is default. UDP has Bunshin DATA, HELLO setup, STATUS, NAK repair, RTT feedback, endpoint liveness snapshots, multicast, multi-destination, local spy behavior, and receiver-image rebuild buffers with high-water tracking during out-of-order rebuild. | Deepen UDP into a full media-driver data path with richer endpoint state, loss recovery, and congestion-control semantics. |
 | Flow control and MDC | Aeron has unicast, min/max multicast, tagged/preferred multicast flow control, dynamic/manual multi-destination-cast, receiver liveness, and endpoint status counters. | Bunshin has unicast, max/min multicast, and preferred-receiver flow-control strategies, manual and dynamic UDP destinations, multicast support, re-resolution, and per-destination liveness snapshots. | Deepen endpoint counters and runtime policy only if future production feedback needs Aeron-shaped diagnostics. |
 | Term buffers and zero copy | Aeron publications claim into shared log buffers and subscribers scan fragments/images from those buffers. | Bunshin has term positions, claim APIs, and mmap-backed publication term buffers for driver-managed publications. | Make mmap term buffers the actual cross-process data path for both publication and subscription images, not only driver-owned publication state. |
 | Archive recording | Aeron Archive records selected subscription images as-is, preserving Aeron data stream format in segment files. | Bunshin can record delivered messages or raw Bunshin DATA frames after ordered delivery, using a Bunshin archive record header. | Add richer descriptor metadata for source image state and continue moving recording ownership toward driver-managed image state. |
@@ -30,7 +30,7 @@ The remaining gaps are mostly semantic depth, not just missing names. Aeron beha
 
 1. Keep this document and `TASKS.md` aligned as the parity backlog changes.
 2. Complete the external media-driver data path for subscriptions and shared images.
-3. Deepen UDP transport semantics around receiver-side term rebuilding, loss recovery, and congestion control.
+3. Deepen UDP transport semantics around richer endpoint state, loss recovery, and congestion control.
 4. Move archive recording ownership closer to driver-managed image state and add live replication.
 5. Add quorum-aware failover/catch-up over remote cluster member transport before expanding higher-level cluster controls.
 6. Run the parity benchmark suite before choosing more low-level work or introducing any Aeron-backed adapter.
@@ -68,7 +68,7 @@ Use this list for incremental Aeron-semantic alignment work. Checked items can s
 - [x] Include server-side external subscription fallback pending counts in live and persisted rings diagnostics.
 - [ ] Promote external-driver subscription polling to shared or mmap-backed image state.
 - [x] Document the Aeron CnC/counter/error/loss-report adapter boundary for Bunshin-native driver reports.
-- [ ] Add receiver-side term/image rebuilding for UDP loss recovery.
+- [x] Add receiver-side term/image rebuilding for UDP loss recovery.
 - [x] Add Aeron-like UDP setup, status, NAK, RTT, and endpoint lifecycle semantics.
 - [x] Add full multi-destination-cast control modes, receiver liveness, and tagged or preferred receiver flow control.
 - [x] Add remote cluster member transport for consensus, replication, ingress, egress, and snapshots.

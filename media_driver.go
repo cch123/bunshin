@@ -213,6 +213,9 @@ type DriverImageSnapshot struct {
 	LagBytes             int64
 	LastSequence         uint64
 	LastObservedSequence uint64
+	RebuildMessages      int
+	RebuildFrames        int
+	RebuildBytes         int
 	AvailableAt          time.Time
 	UnavailableAt        time.Time
 }
@@ -1275,6 +1278,9 @@ func (s *DriverSubscription) externalImages() []ImageSnapshot {
 			LagBytes:             image.LagBytes,
 			LastSequence:         image.LastSequence,
 			LastObservedSequence: image.LastObservedSequence,
+			RebuildMessages:      image.RebuildMessages,
+			RebuildFrames:        image.RebuildFrames,
+			RebuildBytes:         image.RebuildBytes,
 			AvailableAt:          image.AvailableAt,
 			UnavailableAt:        image.UnavailableAt,
 		})
@@ -1301,6 +1307,9 @@ func (s *DriverSubscription) externalLagReports() []SubscriptionLagReport {
 			LagBytes:             image.LagBytes,
 			LastSequence:         image.LastSequence,
 			LastObservedSequence: image.LastObservedSequence,
+			RebuildMessages:      image.RebuildMessages,
+			RebuildFrames:        image.RebuildFrames,
+			RebuildBytes:         image.RebuildBytes,
 			AvailableAt:          image.AvailableAt,
 			UnavailableAt:        image.UnavailableAt,
 		})
@@ -1974,6 +1983,9 @@ func (state *driverState) snapshot() DriverSnapshot {
 					LagBytes:             image.LagBytes,
 					LastSequence:         image.LastSequence,
 					LastObservedSequence: image.LastObservedSequence,
+					RebuildMessages:      image.RebuildMessages,
+					RebuildFrames:        image.RebuildFrames,
+					RebuildBytes:         image.RebuildBytes,
 					AvailableAt:          image.AvailableAt,
 					UnavailableAt:        image.UnavailableAt,
 				})

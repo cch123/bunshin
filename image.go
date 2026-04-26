@@ -2,6 +2,7 @@ package bunshin
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -23,6 +24,7 @@ type Image struct {
 	lastSequence         uint64
 	lastObservedSequence uint64
 	unavailableAt        time.Time
+	rebuild              receiverImageRebuild
 }
 
 type ImageSnapshot struct {
@@ -37,6 +39,9 @@ type ImageSnapshot struct {
 	LagBytes             int64
 	LastSequence         uint64
 	LastObservedSequence uint64
+	RebuildMessages      int
+	RebuildFrames        int
+	RebuildBytes         int
 	AvailableAt          time.Time
 	UnavailableAt        time.Time
 }
@@ -50,8 +55,37 @@ type SubscriptionLagReport struct {
 	LagBytes             int64
 	LastSequence         uint64
 	LastObservedSequence uint64
+	RebuildMessages      int
+	RebuildFrames        int
+	RebuildBytes         int
 	AvailableAt          time.Time
 	UnavailableAt        time.Time
+}
+
+type receiverRebuildFrameKey struct {
+	termID     int32
+	termOffset int32
+}
+
+type receiverRebuildMessage struct {
+	frames []receiverRebuildFrameKey
+	bytes  int
+}
+
+type receiverRebuildEncodedFrame struct {
+	key           receiverRebuildFrameKey
+	encoded       []byte
+	alignedLength int
+}
+
+type receiverImageRebuild struct {
+	terms            map[int32][]byte
+	termFrameCounts  map[int32]int
+	frames           map[receiverRebuildFrameKey]uint64
+	messages         map[uint64]receiverRebuildMessage
+	bufferedMessages int
+	bufferedFrames   int
+	bufferedBytes    int
 }
 
 func (i *Image) CurrentPosition() int64 {
@@ -117,6 +151,9 @@ func (i *Image) Snapshot() ImageSnapshot {
 		LagBytes:             imageLag(i.currentPosition, i.observedPosition),
 		LastSequence:         i.lastSequence,
 		LastObservedSequence: i.lastObservedSequence,
+		RebuildMessages:      i.rebuild.bufferedMessages,
+		RebuildFrames:        i.rebuild.bufferedFrames,
+		RebuildBytes:         i.rebuild.bufferedBytes,
 		AvailableAt:          i.AvailableAt,
 		UnavailableAt:        i.unavailableAt,
 	}
@@ -147,6 +184,123 @@ func (i *Image) update(position int64, sequence uint64) {
 	}
 	if sequence > i.lastSequence {
 		i.lastSequence = sequence
+	}
+}
+
+func (i *Image) bufferRebuildFrames(frames []frame, sequence uint64) error {
+	if i == nil || len(frames) == 0 || sequence == 0 {
+		return nil
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if sequence <= i.lastSequence+1 {
+		return nil
+	}
+	if i.rebuild.messages != nil {
+		if _, ok := i.rebuild.messages[sequence]; ok {
+			return nil
+		}
+	}
+
+	message := receiverRebuildMessage{
+		frames: make([]receiverRebuildFrameKey, 0, len(frames)),
+	}
+	encodedFrames := make([]receiverRebuildEncodedFrame, 0, len(frames))
+	for _, f := range frames {
+		if f.typ != frameData {
+			return fmt.Errorf("non-data frame in receiver rebuild: %d", f.typ)
+		}
+		if f.seq != sequence {
+			return fmt.Errorf("receiver rebuild sequence mismatch: got %d, want %d", f.seq, sequence)
+		}
+		if f.termOffset < 0 {
+			return fmt.Errorf("invalid receiver rebuild term offset: %d", f.termOffset)
+		}
+		encoded, err := encodeFrame(f)
+		if err != nil {
+			return err
+		}
+		alignedLength := align(len(encoded), termFrameAlignment)
+		termOffset := int(f.termOffset)
+		if termOffset+alignedLength > i.TermBufferLength {
+			return fmt.Errorf("receiver rebuild frame exceeds term: offset=%d length=%d term_length=%d", termOffset, alignedLength, i.TermBufferLength)
+		}
+		key := receiverRebuildFrameKey{termID: f.termID, termOffset: f.termOffset}
+		if existing, ok := i.rebuild.frames[key]; ok {
+			if existing == sequence {
+				continue
+			}
+			return fmt.Errorf("receiver rebuild term slot already occupied: term_id=%d term_offset=%d", f.termID, f.termOffset)
+		}
+		encodedFrames = append(encodedFrames, receiverRebuildEncodedFrame{
+			key:           key,
+			encoded:       encoded,
+			alignedLength: alignedLength,
+		})
+		message.frames = append(message.frames, key)
+		message.bytes += alignedLength
+	}
+	if len(message.frames) == 0 {
+		return nil
+	}
+	i.initRebuildLocked()
+	for _, encodedFrame := range encodedFrames {
+		term := i.rebuild.terms[encodedFrame.key.termID]
+		if term == nil {
+			term = make([]byte, i.TermBufferLength)
+			i.rebuild.terms[encodedFrame.key.termID] = term
+		}
+		termOffset := int(encodedFrame.key.termOffset)
+		copy(term[termOffset:termOffset+len(encodedFrame.encoded)], encodedFrame.encoded)
+		clear(term[termOffset+len(encodedFrame.encoded) : termOffset+encodedFrame.alignedLength])
+		i.rebuild.frames[encodedFrame.key] = sequence
+		i.rebuild.termFrameCounts[encodedFrame.key.termID]++
+	}
+	i.rebuild.messages[sequence] = message
+	i.rebuild.bufferedMessages++
+	i.rebuild.bufferedFrames += len(message.frames)
+	i.rebuild.bufferedBytes += message.bytes
+	return nil
+}
+
+func (i *Image) initRebuildLocked() {
+	if i.rebuild.terms == nil {
+		i.rebuild.terms = make(map[int32][]byte)
+	}
+	if i.rebuild.termFrameCounts == nil {
+		i.rebuild.termFrameCounts = make(map[int32]int)
+	}
+	if i.rebuild.frames == nil {
+		i.rebuild.frames = make(map[receiverRebuildFrameKey]uint64)
+	}
+	if i.rebuild.messages == nil {
+		i.rebuild.messages = make(map[uint64]receiverRebuildMessage)
+	}
+}
+
+func (i *Image) completeRebuild(sequence uint64) {
+	if i == nil || sequence == 0 {
+		return
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	message, ok := i.rebuild.messages[sequence]
+	if !ok {
+		return
+	}
+	delete(i.rebuild.messages, sequence)
+	i.rebuild.bufferedMessages--
+	i.rebuild.bufferedFrames -= len(message.frames)
+	i.rebuild.bufferedBytes -= message.bytes
+	for _, key := range message.frames {
+		delete(i.rebuild.frames, key)
+		i.rebuild.termFrameCounts[key.termID]--
+		if i.rebuild.termFrameCounts[key.termID] <= 0 {
+			delete(i.rebuild.termFrameCounts, key.termID)
+			delete(i.rebuild.terms, key.termID)
+		}
 	}
 }
 
@@ -232,6 +386,9 @@ func (s *Subscription) LagReports() []SubscriptionLagReport {
 			LagBytes:             snapshot.LagBytes,
 			LastSequence:         snapshot.LastSequence,
 			LastObservedSequence: snapshot.LastObservedSequence,
+			RebuildMessages:      snapshot.RebuildMessages,
+			RebuildFrames:        snapshot.RebuildFrames,
+			RebuildBytes:         snapshot.RebuildBytes,
 			AvailableAt:          snapshot.AvailableAt,
 			UnavailableAt:        snapshot.UnavailableAt,
 		})

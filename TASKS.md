@@ -196,7 +196,7 @@ These tasks are beyond the current Bunshin-native roadmap. They are required onl
 - [x] Include server-side external subscription fallback pending counts in live and persisted rings diagnostics.
 - [ ] Promote the external-driver subscription data path from IPC message batches to shared or mmap-backed images.
 - [x] Add Aeron-style driver CnC, counter, error, and loss-report semantics, or document an explicit adapter boundary for each format that remains Bunshin-native.
-- [ ] Deepen the UDP transport with receiver image rebuilding, richer loss recovery, and congestion-control semantics comparable to Aeron's media-driver protocol.
+- [ ] Deepen the UDP transport with richer loss recovery and congestion-control semantics comparable to Aeron's media-driver protocol. Receiver-side image rebuild buffers now report out-of-order rebuild lag before delivery.
 - [x] Add full multi-destination-cast semantics, including manual and dynamic control modes, receiver liveness, and tagged or preferred receiver flow-control behavior.
 - [x] Add bounded archive replay by recording ID, position, and length while keeping zero length open-ended.
 - [x] Record raw stream/image frames in archive segments so replay can operate on recorded fragments rather than only delivered Bunshin messages.

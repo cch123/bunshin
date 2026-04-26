@@ -72,11 +72,11 @@ for _, image := range sub.Images() {
 }
 ```
 
-`Subscription.LagReports` returns the same source/session view focused on receiver lag. `ObservedPosition` advances when a message is being handled, and `CurrentPosition` advances after successful handler completion. `LagBytes` is the positive difference between those positions:
+`Subscription.LagReports` returns the same source/session view focused on receiver lag. `ObservedPosition` advances when a message is being handled. For UDP, it also advances when a complete out-of-order DATA message has been written to the receiver image rebuild buffer. `CurrentPosition` advances after successful handler completion. `LagBytes` is the positive difference between those positions, and `RebuildMessages`, `RebuildFrames`, and `RebuildBytes` report how much UDP rebuild state is waiting for ordered delivery:
 
 ```go
 for _, lag := range sub.LagReports() {
-    fmt.Println(lag.StreamID, lag.SessionID, lag.Source, lag.LagBytes)
+    fmt.Println(lag.StreamID, lag.SessionID, lag.Source, lag.LagBytes, lag.RebuildMessages)
 }
 ```
 

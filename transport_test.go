@@ -1739,6 +1739,102 @@ func TestUDPNakRepairRetransmitsCachedFrames(t *testing.T) {
 	}
 }
 
+func TestUDPReceiverImageTracksOutOfOrderRebuild(t *testing.T) {
+	lossObserved := make(chan LossObservation, 1)
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  141,
+		LocalAddr: "127.0.0.1:0",
+		LossHandler: func(observation LossObservation) {
+			lossObserved <- observation
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	delivered := make(chan uint64, 2)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			delivered <- msg.Sequence
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:  TransportUDP,
+		StreamID:   141,
+		SessionID:  241,
+		RemoteAddr: sub.LocalAddr().String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	_, firstDatagrams := udpDatagramsForTest(t, pub, 1, []byte("one"))
+	_, secondDatagrams := udpDatagramsForTest(t, pub, 2, []byte("two"))
+	if err := pub.writeUDPDatagrams(pub.udpRemote, secondDatagrams); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case observation := <-lossObserved:
+		if observation.FromSequence != 1 || observation.ToSequence != 1 {
+			t.Fatalf("unexpected loss observation: %#v", observation)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		reports := sub.LagReports()
+		return len(reports) == 1 &&
+			reports[0].LastObservedSequence == 2 &&
+			reports[0].LastSequence == 0 &&
+			reports[0].ObservedPosition > reports[0].CurrentPosition &&
+			reports[0].LagBytes == reports[0].ObservedPosition-reports[0].CurrentPosition &&
+			reports[0].RebuildMessages == 1 &&
+			reports[0].RebuildFrames == 1 &&
+			reports[0].RebuildBytes > 0
+	})
+	select {
+	case got := <-delivered:
+		t.Fatalf("delivered sequence %d before missing sequence was repaired", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	if err := pub.writeUDPDatagrams(pub.udpRemote, firstDatagrams); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []uint64{1, 2} {
+		select {
+		case got := <-delivered:
+			if got != want {
+				t.Fatalf("delivered sequence = %d, want %d", got, want)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		reports := sub.LagReports()
+		return len(reports) == 1 &&
+			reports[0].LastObservedSequence == 2 &&
+			reports[0].LastSequence == 2 &&
+			reports[0].ObservedPosition == reports[0].CurrentPosition &&
+			reports[0].LagBytes == 0 &&
+			reports[0].RebuildMessages == 0 &&
+			reports[0].RebuildFrames == 0 &&
+			reports[0].RebuildBytes == 0
+	})
+}
+
 func TestPublicationFlowControlReceivesAckStatus(t *testing.T) {
 	sub, err := ListenSubscription(SubscriptionConfig{
 		StreamID:  103,
