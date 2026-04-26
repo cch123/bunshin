@@ -121,6 +121,7 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 - [x] Add rolling upgrade and membership-change strategy.
 - [x] Add cluster control tool for describe, snapshot, suspend, resume, shutdown, and validation.
 - [x] Add cluster authentication and authorization hooks.
+- [x] Add quorum commit semantics so services consume entries only after a majority has durably recorded the log.
 
 ## Performance
 
@@ -198,12 +199,13 @@ These tasks are beyond the current Bunshin-native roadmap. They are required onl
 - [ ] Deepen the UDP transport with setup, status, NAK, RTT, loss, and receiver image rebuilding semantics comparable to Aeron's media-driver protocol.
 - [ ] Add full multi-destination-cast semantics, including manual and dynamic control modes, receiver liveness, and tagged or preferred receiver flow-control behavior.
 - [x] Add bounded archive replay by recording ID, position, and length while keeping zero length open-ended.
-- [ ] Record raw stream/image frames in archive segments so replay can operate on recorded fragments rather than only delivered Bunshin messages.
-- [ ] Promote archive control and recording-event streams from an in-process API to an external protocol with correlation IDs and control-session semantics.
-- [ ] Implement archive live replication and follow-on replay merge against live stream state rather than only Bunshin message metadata.
+- [x] Record raw stream/image frames in archive segments so replay can operate on recorded fragments rather than only delivered Bunshin messages.
+- [x] Promote archive control and recording-event streams from an in-process API to an external protocol with correlation IDs and control-session semantics.
+- [x] Implement archive live replication and follow-on replay merge against live stream state rather than only Bunshin message metadata.
 - [ ] Add remote cluster member transport for replication, consensus messages, ingress, egress, and snapshot transfer.
-- [ ] Add quorum commit semantics so services consume entries only after a majority has durably recorded the log, with leader failover and catch-up tests.
-- [ ] Integrate cluster log and snapshot storage with archive-style durable recordings.
+- [x] Add quorum commit semantics so services consume entries only after a majority has durably recorded the log.
+- [ ] Add quorum-aware leader failover and member catch-up tests over remote cluster member transport.
+- [x] Integrate cluster log and snapshot storage with archive-style durable recordings.
 - [ ] Turn membership-change and rolling-upgrade planners into applied runtime membership transitions.
 - [ ] Add Aeron parity benchmarks comparing QUIC, Bunshin UDP/IPC, and any Aeron-backed adapter under the same workloads.
 - [ ] Decide which Aeron wire, API, and tool compatibility items remain explicit non-goals versus adapter projects.

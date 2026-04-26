@@ -34,6 +34,8 @@ type ArchiveReplayResult struct {
 type ArchiveControlAction string
 
 const (
+	ArchiveControlActionOpenSession             ArchiveControlAction = "open_session"
+	ArchiveControlActionCloseSession            ArchiveControlAction = "close_session"
 	ArchiveControlActionStartRecording          ArchiveControlAction = "start_recording"
 	ArchiveControlActionStopRecording           ArchiveControlAction = "stop_recording"
 	ArchiveControlActionListRecordings          ArchiveControlAction = "list_recordings"

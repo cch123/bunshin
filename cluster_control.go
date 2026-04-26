@@ -51,6 +51,7 @@ type ClusterDescription struct {
 	Learner          ClusterLearnerStatus     `json:"learner"`
 	Replication      ClusterReplicationStatus `json:"replication"`
 	Election         ClusterElectionStatus    `json:"election"`
+	Quorum           ClusterQuorumStatus      `json:"quorum"`
 }
 
 type ClusterValidationReport struct {
@@ -219,6 +220,7 @@ func (n *ClusterNode) Describe(ctx context.Context) (ClusterDescription, error) 
 		Learner:          snapshot.Learner,
 		Replication:      snapshot.Replication,
 		Election:         snapshot.Election,
+		Quorum:           snapshot.Quorum,
 	}, nil
 }
 
@@ -251,6 +253,9 @@ func (n *ClusterNode) Validate(ctx context.Context) (ClusterValidationReport, er
 		if description.Election.Role != description.Role {
 			report.Errors = append(report.Errors, "bunshin cluster election: role does not match node role")
 		}
+	}
+	if description.Quorum.Enabled && description.Quorum.LastError != "" {
+		report.Errors = append(report.Errors, "bunshin cluster quorum: "+description.Quorum.LastError)
 	}
 	report.Healthy = len(report.Errors) == 0
 	return report, nil

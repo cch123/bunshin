@@ -76,7 +76,7 @@ func (n *ClusterNode) ScheduleTimer(ctx context.Context, timer ClusterTimer) (Cl
 		return ClusterTimer{}, err
 	}
 
-	entry, err := n.log.Append(ctx, ClusterLogEntry{
+	entry, err := n.appendClusterEntry(ctx, ClusterLogEntry{
 		Type:     ClusterLogEntryTimerSchedule,
 		TimerID:  timer.TimerID,
 		Deadline: timer.Deadline,
@@ -136,7 +136,7 @@ func (n *ClusterNode) CancelTimer(ctx context.Context, timerID ClusterTimerID) e
 		return err
 	}
 
-	entry, err := n.log.Append(ctx, ClusterLogEntry{
+	entry, err := n.appendClusterEntry(ctx, ClusterLogEntry{
 		Type:    ClusterLogEntryTimerCancel,
 		TimerID: timerID,
 	})
@@ -186,7 +186,7 @@ func (n *ClusterNode) FireDueTimers(ctx context.Context, now time.Time) ([]Clust
 	}
 	egress := make([]ClusterEgress, 0, len(due))
 	for _, timer := range due {
-		entry, err := n.log.Append(ctx, ClusterLogEntry{
+		entry, err := n.appendClusterEntry(ctx, ClusterLogEntry{
 			Type:     ClusterLogEntryTimerFire,
 			TimerID:  timer.TimerID,
 			Deadline: timer.Deadline,
@@ -249,7 +249,7 @@ func (n *ClusterNode) SendServiceMessage(ctx context.Context, msg ClusterService
 		return ClusterEgress{}, err
 	}
 
-	entry, err := n.log.Append(ctx, ClusterLogEntry{
+	entry, err := n.appendClusterEntry(ctx, ClusterLogEntry{
 		Type:          ClusterLogEntryServiceMessage,
 		CorrelationID: msg.CorrelationID,
 		SourceService: msg.SourceService,

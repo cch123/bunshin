@@ -2,9 +2,12 @@ package bunshin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestArchiveControlServerRequests(t *testing.T) {
@@ -188,4 +191,239 @@ func TestArchiveControlServerRejectsAfterClose(t *testing.T) {
 	if _, err := client.ListRecordings(context.Background()); !errors.Is(err, ErrArchiveControlClosed) {
 		t.Fatalf("ListRecordings() err = %v, want %v", err, ErrArchiveControlClosed)
 	}
+}
+
+func TestArchiveControlProtocolSessionRequestsAndEvents(t *testing.T) {
+	archive := openTestArchive(t)
+	defer archive.Close()
+
+	server, conn, encoder, decoder := startArchiveControlProtocolForTest(t, archive, ArchiveControlProtocolConfig{})
+	defer server.Close()
+	defer conn.Close()
+
+	sessionID := openArchiveControlProtocolSessionForTest(t, conn, encoder, decoder)
+	if sessionID == 0 {
+		t.Fatal("protocol session id was not assigned")
+	}
+
+	if err := encoder.Encode(ArchiveControlProtocolMessage{
+		Version:          ArchiveControlProtocolVersion,
+		Type:             ArchiveControlProtocolRequest,
+		CorrelationID:    2,
+		ControlSessionID: sessionID,
+		Action:           ArchiveControlActionStartRecording,
+		StreamID:         10,
+		StreamSessionID:  20,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	startMessages := readArchiveControlProtocolMessagesForTest(t, conn, decoder, 2)
+	startResponse := findArchiveControlProtocolResponseForTest(t, startMessages, 2)
+	if startResponse.Error != "" || startResponse.Descriptor.RecordingID == 0 {
+		t.Fatalf("unexpected start response: %#v", startResponse)
+	}
+	startEvent := findArchiveControlProtocolRecordingEventForTest(t, startMessages, ArchiveRecordingSignalStart)
+	if startEvent.ControlSessionID != sessionID || startEvent.RecordingEvent.RecordingID != startResponse.Descriptor.RecordingID {
+		t.Fatalf("unexpected start event: %#v", startEvent)
+	}
+
+	record, err := archive.Record(Message{StreamID: 10, SessionID: 20, Sequence: 1, Payload: []byte("one")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	progressEvent := readArchiveControlProtocolRecordingEventForTest(t, conn, decoder, ArchiveRecordingSignalProgress)
+	if progressEvent.RecordingEvent.NextPosition != record.NextPosition || progressEvent.RecordingEvent.PayloadLength != len("one") {
+		t.Fatalf("unexpected progress event: %#v", progressEvent)
+	}
+
+	if err := encoder.Encode(ArchiveControlProtocolMessage{
+		Version:          ArchiveControlProtocolVersion,
+		Type:             ArchiveControlProtocolRequest,
+		CorrelationID:    3,
+		ControlSessionID: sessionID,
+		Action:           ArchiveControlActionListRecordings,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	listResponse := readArchiveControlProtocolResponseForTest(t, conn, decoder, 3)
+	if listResponse.Error != "" || len(listResponse.Recordings) != 1 || listResponse.Recordings[0].RecordingID != record.RecordingID {
+		t.Fatalf("unexpected list response: %#v", listResponse)
+	}
+
+	if err := encoder.Encode(ArchiveControlProtocolMessage{
+		Version:          ArchiveControlProtocolVersion,
+		Type:             ArchiveControlProtocolRequest,
+		CorrelationID:    4,
+		ControlSessionID: sessionID,
+		Action:           ArchiveControlActionReplay,
+		Replay:           ArchiveReplayConfig{RecordingID: record.RecordingID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replayMessages := readArchiveControlProtocolMessagesForTest(t, conn, decoder, 2)
+	replayEvent := findArchiveControlProtocolReplayEventForTest(t, replayMessages, 4)
+	if replayEvent.Message == nil || string(replayEvent.Message.Payload) != "one" || replayEvent.Message.Sequence != 1 {
+		t.Fatalf("unexpected replay event: %#v", replayEvent)
+	}
+	replayResponse := findArchiveControlProtocolResponseForTest(t, replayMessages, 4)
+	if replayResponse.Error != "" || replayResponse.ReplayResult.Records != 1 {
+		t.Fatalf("unexpected replay response: %#v", replayResponse)
+	}
+
+	if err := encoder.Encode(ArchiveControlProtocolMessage{
+		Version:          ArchiveControlProtocolVersion,
+		Type:             ArchiveControlProtocolRequest,
+		CorrelationID:    5,
+		ControlSessionID: sessionID,
+		Action:           ArchiveControlActionCloseSession,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closeResponse := readArchiveControlProtocolResponseForTest(t, conn, decoder, 5)
+	if closeResponse.Error != "" {
+		t.Fatalf("unexpected close response: %#v", closeResponse)
+	}
+}
+
+func TestArchiveControlProtocolRejectsInvalidSession(t *testing.T) {
+	archive := openTestArchive(t)
+	defer archive.Close()
+
+	server, conn, encoder, decoder := startArchiveControlProtocolForTest(t, archive, ArchiveControlProtocolConfig{})
+	defer server.Close()
+	defer conn.Close()
+
+	sessionID := openArchiveControlProtocolSessionForTest(t, conn, encoder, decoder)
+	if err := encoder.Encode(ArchiveControlProtocolMessage{
+		Version:          ArchiveControlProtocolVersion,
+		Type:             ArchiveControlProtocolRequest,
+		CorrelationID:    2,
+		ControlSessionID: sessionID + 1,
+		Action:           ArchiveControlActionListRecordings,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response := readArchiveControlProtocolResponseForTest(t, conn, decoder, 2)
+	if response.Error == "" {
+		t.Fatalf("expected invalid session error, got %#v", response)
+	}
+}
+
+func startArchiveControlProtocolForTest(t *testing.T, archive *Archive, cfg ArchiveControlProtocolConfig) (*ArchiveControlProtocolServer, net.Conn, *json.Encoder, *json.Decoder) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	server, err := ListenArchiveControlProtocol(ctx, archive, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial(server.Addr().Network(), server.Addr().String())
+	if err != nil {
+		_ = server.Close()
+		t.Fatal(err)
+	}
+	return server, conn, json.NewEncoder(conn), json.NewDecoder(conn)
+}
+
+func openArchiveControlProtocolSessionForTest(t *testing.T, conn net.Conn, encoder *json.Encoder, decoder *json.Decoder) uint64 {
+	t.Helper()
+	if err := encoder.Encode(ArchiveControlProtocolMessage{
+		Version:       ArchiveControlProtocolVersion,
+		Type:          ArchiveControlProtocolRequest,
+		CorrelationID: 1,
+		Action:        ArchiveControlActionOpenSession,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response := readArchiveControlProtocolResponseForTest(t, conn, decoder, 1)
+	if response.Error != "" {
+		t.Fatalf("open session failed: %#v", response)
+	}
+	return response.ControlSessionID
+}
+
+func readArchiveControlProtocolResponseForTest(t *testing.T, conn net.Conn, decoder *json.Decoder, correlationID uint64) ArchiveControlProtocolMessage {
+	t.Helper()
+	for {
+		msg := readArchiveControlProtocolMessageForTest(t, conn, decoder)
+		if msg.Type == ArchiveControlProtocolResponse && msg.CorrelationID == correlationID {
+			return msg
+		}
+	}
+}
+
+func readArchiveControlProtocolMessagesForTest(t *testing.T, conn net.Conn, decoder *json.Decoder, count int) []ArchiveControlProtocolMessage {
+	t.Helper()
+	messages := make([]ArchiveControlProtocolMessage, 0, count)
+	for len(messages) < count {
+		messages = append(messages, readArchiveControlProtocolMessageForTest(t, conn, decoder))
+	}
+	return messages
+}
+
+func findArchiveControlProtocolResponseForTest(t *testing.T, messages []ArchiveControlProtocolMessage, correlationID uint64) ArchiveControlProtocolMessage {
+	t.Helper()
+	for _, msg := range messages {
+		if msg.Type == ArchiveControlProtocolResponse && msg.CorrelationID == correlationID {
+			return msg
+		}
+	}
+	t.Fatalf("response with correlation id %d not found in %#v", correlationID, messages)
+	return ArchiveControlProtocolMessage{}
+}
+
+func findArchiveControlProtocolRecordingEventForTest(t *testing.T, messages []ArchiveControlProtocolMessage, signal ArchiveRecordingSignal) ArchiveControlProtocolMessage {
+	t.Helper()
+	for _, msg := range messages {
+		if msg.Type == ArchiveControlProtocolEvent && msg.Event == ArchiveControlProtocolRecordingEvent &&
+			msg.RecordingEvent != nil && msg.RecordingEvent.Signal == signal {
+			return msg
+		}
+	}
+	t.Fatalf("recording event %s not found in %#v", signal, messages)
+	return ArchiveControlProtocolMessage{}
+}
+
+func findArchiveControlProtocolReplayEventForTest(t *testing.T, messages []ArchiveControlProtocolMessage, correlationID uint64) ArchiveControlProtocolMessage {
+	t.Helper()
+	for _, msg := range messages {
+		if msg.Type == ArchiveControlProtocolEvent && msg.Event == ArchiveControlProtocolReplayMessage && msg.CorrelationID == correlationID {
+			return msg
+		}
+	}
+	t.Fatalf("replay event with correlation id %d not found in %#v", correlationID, messages)
+	return ArchiveControlProtocolMessage{}
+}
+
+func readArchiveControlProtocolRecordingEventForTest(t *testing.T, conn net.Conn, decoder *json.Decoder, signal ArchiveRecordingSignal) ArchiveControlProtocolMessage {
+	t.Helper()
+	for {
+		msg := readArchiveControlProtocolMessageForTest(t, conn, decoder)
+		if msg.Type == ArchiveControlProtocolEvent && msg.Event == ArchiveControlProtocolRecordingEvent &&
+			msg.RecordingEvent != nil && msg.RecordingEvent.Signal == signal {
+			return msg
+		}
+	}
+}
+
+func readArchiveControlProtocolReplayEventForTest(t *testing.T, conn net.Conn, decoder *json.Decoder, correlationID uint64) ArchiveControlProtocolMessage {
+	t.Helper()
+	for {
+		msg := readArchiveControlProtocolMessageForTest(t, conn, decoder)
+		if msg.Type == ArchiveControlProtocolEvent && msg.Event == ArchiveControlProtocolReplayMessage && msg.CorrelationID == correlationID {
+			return msg
+		}
+	}
+}
+
+func readArchiveControlProtocolMessageForTest(t *testing.T, conn net.Conn, decoder *json.Decoder) ArchiveControlProtocolMessage {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var msg ArchiveControlProtocolMessage
+	if err := decoder.Decode(&msg); err != nil {
+		t.Fatal(err)
+	}
+	return msg
 }

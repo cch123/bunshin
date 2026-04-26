@@ -54,6 +54,7 @@ type ClusterConfig struct {
 	Learner            *ClusterLearnerConfig
 	Replication        *ClusterReplicationConfig
 	Election           *ClusterElectionConfig
+	Quorum             *ClusterQuorumConfig
 	Authenticator      ClusterAuthenticator
 	Authorizer         ClusterAuthorizer
 	TimerCheckInterval time.Duration
@@ -73,6 +74,7 @@ type ClusterNode struct {
 	learner            *clusterLearnerState
 	replication        *clusterReplicationState
 	election           *clusterElectionState
+	quorum             *clusterQuorumState
 	authenticator      ClusterAuthenticator
 	authorizer         ClusterAuthorizer
 	timers             map[ClusterTimerID]ClusterTimer
@@ -155,6 +157,7 @@ type ClusterSnapshot struct {
 	Learner          ClusterLearnerStatus
 	Replication      ClusterReplicationStatus
 	Election         ClusterElectionStatus
+	Quorum           ClusterQuorumStatus
 }
 
 type ClusterClient struct {
@@ -180,6 +183,7 @@ func StartClusterNode(ctx context.Context, cfg ClusterConfig) (*ClusterNode, err
 		learner:            newClusterLearnerState(normalized.Learner),
 		replication:        newClusterReplicationState(normalized.Replication),
 		election:           newClusterElectionState(normalized.Election, normalized.AppointedLeaderID),
+		quorum:             newClusterQuorumState(normalized.Quorum),
 		authenticator:      normalized.Authenticator,
 		authorizer:         normalized.Authorizer,
 		timers:             make(map[ClusterTimerID]ClusterTimer),
@@ -233,6 +237,7 @@ func (n *ClusterNode) Snapshot(ctx context.Context) (ClusterSnapshot, error) {
 		Learner:     n.learnerStatusLocked(),
 		Replication: n.replicationStatusLocked(),
 		Election:    n.electionStatusLocked(time.Now().UTC()),
+		Quorum:      n.quorumStatusLocked(),
 	}
 	n.mu.Unlock()
 
@@ -356,7 +361,7 @@ func (n *ClusterNode) submit(ctx context.Context, ingress ClusterIngress, princi
 		return ClusterEgress{}, err
 	}
 
-	entry, err := n.log.Append(ctx, ClusterLogEntry{
+	entry, err := n.appendClusterEntry(ctx, ClusterLogEntry{
 		Type:          ClusterLogEntryIngress,
 		SessionID:     ingress.SessionID,
 		CorrelationID: ingress.CorrelationID,
@@ -700,6 +705,9 @@ func normalizeClusterConfig(cfg ClusterConfig) (ClusterConfig, error) {
 		if cfg.Election != nil {
 			return ClusterConfig{}, invalidConfigf("election config requires appointed-leader mode")
 		}
+		if cfg.Quorum != nil {
+			return ClusterConfig{}, invalidConfigf("quorum config requires appointed-leader mode")
+		}
 		cfg.AppointedLeaderID = cfg.NodeID
 	case ClusterModeAppointedLeader:
 		if cfg.Learner != nil {
@@ -728,12 +736,25 @@ func normalizeClusterConfig(cfg ClusterConfig) (ClusterConfig, error) {
 			}
 			cfg.Replication = &replicationCfg
 		}
+		if cfg.Quorum != nil {
+			if cfg.NodeID != cfg.AppointedLeaderID {
+				return ClusterConfig{}, invalidConfigf("quorum config requires leader role")
+			}
+			quorumCfg, err := normalizeClusterQuorumConfig(cfg.Quorum)
+			if err != nil {
+				return ClusterConfig{}, err
+			}
+			cfg.Quorum = &quorumCfg
+		}
 	case ClusterModeLearner:
 		if cfg.Replication != nil {
 			return ClusterConfig{}, invalidConfigf("replication config requires appointed-leader follower mode")
 		}
 		if cfg.Election != nil {
 			return ClusterConfig{}, invalidConfigf("election config requires appointed-leader mode")
+		}
+		if cfg.Quorum != nil {
+			return ClusterConfig{}, invalidConfigf("quorum config requires appointed-leader mode")
 		}
 		learnerCfg, err := normalizeClusterLearnerConfig(cfg.Learner)
 		if err != nil {

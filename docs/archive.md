@@ -1,6 +1,6 @@
 # Archive
 
-Bunshin includes a local append-only archive for recording and replaying delivered subscription messages. It is process-local and file-backed; external archive protocols and media-driver ownership are still future work.
+Bunshin includes a local append-only archive for recording and replaying stream data. It is process-local and file-backed; external archive protocols and media-driver ownership are still future work.
 
 The storage layout follows Aeron's Archive shape at a high level: an archive directory contains a recording catalog and one or more segment files per recording. The wire format remains Bunshin-native.
 
@@ -19,7 +19,7 @@ defer archive.Close()
 
 ## Recording
 
-Attach an archive to a subscription to record messages after ordered delivery and before the application handler is invoked:
+Attach an archive to a subscription to record the received Bunshin DATA frames after ordered delivery and before the application handler is invoked:
 
 ```go
 sub, err := bunshin.ListenSubscription(bunshin.SubscriptionConfig{
@@ -35,6 +35,8 @@ You can also record manually:
 record, err := archive.Record(msg)
 fmt.Println(record.RecordingID, record.Position, record.NextPosition)
 ```
+
+For lower-level stream capture, `RecordFrame` and `RecordFrames` append encoded Bunshin DATA frames directly. Fragmented frames are stored as separate archive records, and replay reassembles them before invoking the handler.
 
 `StartRecording(streamID, sessionID)` explicitly opens a new active recording. `StopRecording(recordingID)` closes the active recording boundary; the next `Record` call starts a new recording. If you only call `Record`, Bunshin automatically starts the first recording and keeps appending to the active recording.
 
@@ -79,7 +81,19 @@ err = client.TruncateRecording(ctx, descriptor.RecordingID, queried.StartPositio
 err = client.Purge(ctx)
 ```
 
-The control client supports start, stop, list, query, replay, truncate, purge, and integrity scan requests. The current server is an in-process goroutine with a command queue; an external command protocol can be layered on top later.
+The control client supports start, stop, list, query, replay, truncate, purge, integrity scan, and segment lifecycle requests. The in-process server is a goroutine with a command queue.
+
+`ListenArchiveControlProtocol` exposes the same control surface over a Bunshin-native JSON protocol on a `net.Listener`. Clients first send `open_session`, then each request carries a `control_session_id` and `correlation_id`. Responses echo the correlation ID. Replay delivers `replay_message` events before the final replay response, and archive recording lifecycle/progress callbacks are streamed as `recording_event` messages on the same connection.
+
+```go
+server, err := bunshin.ListenArchiveControlProtocol(ctx, archive, bunshin.ArchiveControlProtocolConfig{
+    Network: "tcp",
+    Addr:    "127.0.0.1:40470",
+})
+defer server.Close()
+```
+
+The protocol is JSON and Bunshin-native. It is intentionally not Aeron SBE compatible.
 
 `ArchiveControlConfig.Authorizer` can reject control operations before they touch the archive. The hook receives the request context and action, so an external server can attach authenticated identity to `context.Context` and centralize authorization.
 
@@ -96,7 +110,7 @@ control, err := bunshin.StartArchiveControlServer(archive, bunshin.ArchiveContro
 
 ## Replay
 
-Replay starts from a recording position. A zero `RecordingID` replays all recordings in catalog order. A zero `StreamID` or `SessionID` in the replay config means "all". A zero `Length` is open-ended and replays to the recording stop position. A positive `Length` bounds replay to the archive-position byte range `[FromPosition, FromPosition+Length)`. If the range ends inside a record, replay stops before delivering that partial record.
+Replay starts from a recording position. A zero `RecordingID` replays all recordings in catalog order. A zero `StreamID` or `SessionID` in the replay config means "all". A zero `Length` is open-ended and replays to the recording stop position. A positive `Length` bounds replay to the archive-position byte range `[FromPosition, FromPosition+Length)`. If the range ends inside a record, replay stops before delivering that partial record. If replay starts or ends inside a fragmented raw-frame batch, Bunshin does not deliver the incomplete message.
 
 ```go
 err := archive.Replay(ctx, bunshin.ArchiveReplayConfig{
@@ -137,7 +151,9 @@ Replay merge is based on Bunshin message metadata, not Aeron protocol state. Liv
 
 ## Replication
 
-`ReplicateArchive` copies a stopped recording from one archive to another. The destination imports it as a new recording ID and rewrites segment filenames to that ID. This is a Bunshin-native snapshot replication primitive; it does not implement Aeron's wire protocol or live catch-up replication.
+`ReplicateArchive` copies a stopped recording from one archive to another. The destination imports it as a new recording ID and rewrites segment filenames to that ID.
+
+`ReplicateArchiveLive` follows an active source recording. It first imports the current source snapshot, then subscribes to recording events and copies newly appended archive records until the source recording stops or the context is canceled. The destination archive must not already have an active recording because the replicated recording is active while follow-on replication is running.
 
 ```go
 src, err := bunshin.OpenArchive(bunshin.ArchiveConfig{Path: "/var/lib/bunshin/archive-a"})
@@ -147,9 +163,14 @@ report, err := bunshin.ReplicateArchive(ctx, src, dst, bunshin.ArchiveReplicatio
     RecordingID: descriptor.RecordingID,
 })
 fmt.Println(report.SourceRecordingID, report.DestinationRecordingID, report.Segments)
+
+liveReport, err := bunshin.ReplicateArchiveLive(ctx, src, dst, bunshin.ArchiveLiveReplicationConfig{
+    RecordingID: descriptor.RecordingID,
+})
+fmt.Println(liveReport.Complete, liveReport.StopPosition)
 ```
 
-Only stopped recordings with attached segments can be replicated. Active recordings should be stopped first, or streamed through an application-level live path and replay merge.
+Snapshot replication still requires stopped recordings with attached segments. Live replication accepts an active source recording and stops when the source emits its stop signal. Both replication modes are Bunshin-native; they do not implement Aeron's archive replication wire protocol.
 
 ## Maintenance
 
@@ -209,7 +230,7 @@ Each segment stores a sequence of Bunshin archive records. Each record is a 64-b
 | --- | ---: | --- |
 | 0 | 4 | Magic `BSAR` |
 | 4 | 1 | Archive format version, currently `1` |
-| 5 | 1 | Flags; `1` marks segment padding |
+| 5 | 1 | Flags; `1` marks segment padding, `2` marks a raw Bunshin frame record |
 | 6 | 2 | Header length, currently `64` |
 | 8 | 8 | Total record length |
 | 16 | 4 | Stream ID |
@@ -222,4 +243,4 @@ Each segment stores a sequence of Bunshin archive records. Each record is a 64-b
 | 56 | 4 | Payload length |
 | 60 | 4 | CRC32 over header bytes `0..59` and payload bytes |
 
-The archive persists Bunshin message metadata and payload bytes. It does not persist `Message.Remote`, because replay is local and not tied to the original QUIC peer address.
+The archive persists either Bunshin message metadata and payload bytes or encoded Bunshin DATA frames. It does not persist `Message.Remote`, because replay is local and not tied to the original peer address.

@@ -843,7 +843,7 @@ func (s *Subscription) deliverUDPData(ctx context.Context, remote net.Addr, f fr
 		}
 	}
 
-	payload, responseChannel, msgFrame, ackFrame, ready, err := s.collectUDPData(remote, f)
+	payload, responseChannel, msgFrame, ackFrame, rawFrames, ready, err := s.collectUDPData(remote, f)
 	if err != nil {
 		s.metrics.incProtocolErrors()
 		s.metrics.incFramesDropped(1)
@@ -871,6 +871,7 @@ func (s *Subscription) deliverUDPData(ctx context.Context, remote net.Addr, f fr
 	if err := s.ordered.deliver(ctx, orderedMessage{
 		ctx:                ctx,
 		msg:                msg,
+		rawFrames:          rawFrames,
 		positionTermID:     positionTermID,
 		positionTermOffset: positionTermOffset,
 		hasFramePosition:   hasFramePosition,
@@ -886,20 +887,27 @@ func (s *Subscription) deliverUDPData(ctx context.Context, remote net.Addr, f fr
 	return true, nil
 }
 
-func (s *Subscription) collectUDPData(remote net.Addr, f frame) ([]byte, ResponseChannel, frame, frame, bool, error) {
+func (s *Subscription) collectUDPData(remote net.Addr, f frame) ([]byte, ResponseChannel, frame, frame, [][]byte, bool, error) {
 	if f.fragmentCount <= 1 {
 		responseChannel, payload, err := decodeDataPayload(f)
 		if err != nil {
-			return nil, ResponseChannel{}, frame{}, frame{}, false, err
+			return nil, ResponseChannel{}, frame{}, frame{}, nil, false, err
 		}
-		return cloneBytes(payload), responseChannel, f, f, true, nil
+		var rawFrames [][]byte
+		if s.archive != nil {
+			rawFrames, err = encodeFrameBatch([]frame{f})
+			if err != nil {
+				return nil, ResponseChannel{}, frame{}, frame{}, nil, false, err
+			}
+		}
+		return cloneBytes(payload), responseChannel, f, f, rawFrames, true, nil
 	}
 	if f.flags&frameFlagFragment == 0 {
-		return nil, ResponseChannel{}, frame{}, frame{}, false, errors.New("fragment flag missing")
+		return nil, ResponseChannel{}, frame{}, frame{}, nil, false, errors.New("fragment flag missing")
 	}
 	fragmentCount := int(f.fragmentCount)
 	if int(f.fragmentIndex) >= fragmentCount {
-		return nil, ResponseChannel{}, frame{}, frame{}, false, errors.New("invalid fragment metadata")
+		return nil, ResponseChannel{}, frame{}, frame{}, nil, false, errors.New("invalid fragment metadata")
 	}
 	key := udpFragmentKey{
 		source:    remoteAddrString(remote),
@@ -921,7 +929,7 @@ func (s *Subscription) collectUDPData(remote net.Addr, f frame) ([]byte, Respons
 	}
 	if len(set.frames) != fragmentCount {
 		delete(s.udpFragments, key)
-		return nil, ResponseChannel{}, frame{}, frame{}, false, errors.New("fragment count changed")
+		return nil, ResponseChannel{}, frame{}, frame{}, nil, false, errors.New("fragment count changed")
 	}
 	index := int(f.fragmentIndex)
 	if !set.received[index] {
@@ -930,17 +938,25 @@ func (s *Subscription) collectUDPData(remote net.Addr, f frame) ([]byte, Respons
 		set.count++
 	}
 	if set.count < fragmentCount {
-		return nil, ResponseChannel{}, frame{}, frame{}, false, nil
+		return nil, ResponseChannel{}, frame{}, frame{}, nil, false, nil
 	}
 
 	payload, responseChannel, ackFrame, err := reassembleDataFrames(set.frames)
 	if err != nil {
 		delete(s.udpFragments, key)
-		return nil, ResponseChannel{}, frame{}, frame{}, false, err
+		return nil, ResponseChannel{}, frame{}, frame{}, nil, false, err
+	}
+	var rawFrames [][]byte
+	if s.archive != nil {
+		rawFrames, err = encodeFrameBatch(set.frames)
+		if err != nil {
+			delete(s.udpFragments, key)
+			return nil, ResponseChannel{}, frame{}, frame{}, nil, false, err
+		}
 	}
 	msgFrame := set.frames[0]
 	delete(s.udpFragments, key)
-	return payload, responseChannel, msgFrame, ackFrame, true, nil
+	return payload, responseChannel, msgFrame, ackFrame, rawFrames, true, nil
 }
 
 func (s *Subscription) ackUDP(remote net.Addr, f frame) error {

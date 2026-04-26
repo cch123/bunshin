@@ -8,7 +8,7 @@ The first supported modes are:
 - `appointed-leader`: a configured node ID is leader; non-leader nodes reject local ingress.
 - `learner`: the node does not participate in consensus or accept ingress; it follows a configured master log and snapshots local service state.
 
-Network transport for member replication and rolling upgrades are future layers above this core.
+Network transport for member replication and rolling upgrades are future layers above this core. Quorum commit gating can already be enabled over `ClusterLog` implementations, including local, archive-backed, or future remote-log adapters.
 
 ## Node
 
@@ -24,6 +24,8 @@ defer node.Close(ctx)
 ```
 
 `ClusterConfig.Log` can provide a durable implementation. If unset, Bunshin uses `NewInMemoryClusterLog`, which is useful for tests and local development. `ClusterConfig.SnapshotStore` enables snapshot-based recovery.
+
+For archive-backed durability, create a normal Bunshin `Archive` and wrap it with `NewArchiveClusterLog` and `NewArchiveClusterSnapshotStore`. Both wrappers use Bunshin-native archive records, so cluster log entries and snapshots share the same segment/catalog tooling as stream recordings.
 
 ## Ingress And Egress
 
@@ -72,6 +74,41 @@ type ClusterLog interface {
 ```
 
 The log assigns monotonically increasing positions. On node start, existing entries are replayed into the service with `ClusterMessage.Replay = true`, so service state can be rebuilt deterministically from the log.
+
+```go
+archive, err := bunshin.OpenArchive(bunshin.ArchiveConfig{Path: "/var/lib/bunshin/cluster-archive"})
+log, err := bunshin.NewArchiveClusterLog(archive)
+store, err := bunshin.NewArchiveClusterSnapshotStore(archive)
+
+node, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    Log:           log,
+    SnapshotStore: store,
+    Service:       service,
+})
+```
+
+## Quorum Commit
+
+Appointed leaders can optionally gate service delivery on durable majority recording. Set `ClusterConfig.Quorum` with the other member logs. The leader preassigns the next log position, appends the entry to member logs, and only appends locally and invokes the service after the configured majority has acknowledged the exact same entry.
+
+```go
+leader, err := bunshin.StartClusterNode(ctx, bunshin.ClusterConfig{
+    NodeID:            1,
+    Mode:              bunshin.ClusterModeAppointedLeader,
+    AppointedLeaderID: 1,
+    Log:               leaderLog,
+    Service:           service,
+    Quorum: &bunshin.ClusterQuorumConfig{
+        MemberLogs: []bunshin.ClusterLog{followerOneLog, followerTwoLog},
+    },
+})
+```
+
+`RequiredAck` defaults to a majority of the local leader plus configured member logs. It can be raised but not lowered below majority. Quorum is valid only on the appointed leader; single-node, follower, and learner modes reject it.
+
+If the leader cannot reach quorum, append returns `ErrClusterQuorumUnavailable`, the local leader log is not advanced, and the service callback is not invoked. `ClusterSnapshot.Quorum`, `ClusterDescription.Quorum`, and validation reports expose the latest commit position, ack count, and failure string.
+
+Existing matching entries in a member log count as acknowledgements. This makes repeated commit attempts idempotent after a member accepted the entry but the leader did not complete the previous commit. Remote member transport and quorum-aware failover/catch-up are still future layers above this `ClusterLog` boundary.
 
 ## Heartbeats And Election
 
@@ -215,7 +252,7 @@ type ClusterSnapshotService interface {
 }
 ```
 
-`ClusterNode.TakeSnapshot` asks the service to serialize deterministic state at the current log position and stores it in `ClusterConfig.SnapshotStore`. Bunshin also records pending cluster timers in the snapshot metadata.
+`ClusterNode.TakeSnapshot` asks the service to serialize deterministic state at the current log position and stores it in `ClusterConfig.SnapshotStore`. Bunshin also records pending cluster timers in the snapshot metadata. `NewArchiveClusterSnapshotStore` persists these snapshots as archive records and loads the latest snapshot by cluster log position.
 
 ```go
 store := bunshin.NewInMemoryClusterSnapshotStore()
@@ -286,4 +323,4 @@ type ClusterService interface {
 
 ## Scope
 
-The current cluster layer provides the local service container, in-process ingress/egress protocol, authentication and authorization hooks, appointed-leader gating, heartbeat-based local election, replayable replicated-log abstraction, log-backed timers and service messages, follower log catch-up, backup and standby replication, membership-change and rolling-upgrade planning, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide remote member communication, quorum replication, or automated backup promotion.
+The current cluster layer provides the local service container, in-process ingress/egress protocol, authentication and authorization hooks, appointed-leader gating, quorum commit gating over `ClusterLog`, heartbeat-based local election, replayable replicated-log abstraction, archive-backed log and snapshot storage, log-backed timers and service messages, follower log catch-up, backup and standby replication, membership-change and rolling-upgrade planning, snapshot recovery hooks, local control operations, and optional learner nodes. It does not yet provide remote member communication, quorum-aware failover/catch-up orchestration, or automated backup promotion.

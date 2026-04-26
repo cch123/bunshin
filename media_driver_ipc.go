@@ -446,8 +446,9 @@ func (s *DriverIPCServer) pumpSubscription(ctx context.Context, id DriverResourc
 	pollCtx, cancel := context.WithTimeout(ctx, defaultDriverIPCSubscriptionPumpWindow)
 	defer cancel()
 
-	written := 0
-	fallback := 0
+	var written atomic.Int64
+	var fallback atomic.Int64
+	var writeErrMu sync.Mutex
 	var writeErr error
 	_, err = subscription.pollDriverOwned(pollCtx, 1, limit, func(_ context.Context, msg Message) error {
 		ipcMessage := driverIPCMessageFromMessage(msg)
@@ -457,18 +458,23 @@ func (s *DriverIPCServer) pumpSubscription(ctx context.Context, id DriverResourc
 					subscription.subscription.metrics.incBackPressureEvents()
 				}
 				s.enqueueSubscriptionFallback(id, []DriverIPCMessage{ipcMessage})
-				fallback++
+				fallback.Add(1)
 				return nil
 			}
+			writeErrMu.Lock()
 			writeErr = err
+			writeErrMu.Unlock()
 			return err
 		}
-		written++
+		written.Add(1)
 		return nil
 	})
-	work := written + fallback
-	if writeErr != nil {
-		return work, writeErr
+	work := int(written.Load() + fallback.Load())
+	writeErrMu.Lock()
+	recordedWriteErr := writeErr
+	writeErrMu.Unlock()
+	if recordedWriteErr != nil {
+		return work, recordedWriteErr
 	}
 	if err != nil {
 		return work, nil

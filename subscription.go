@@ -434,10 +434,22 @@ func (s *Subscription) deliverQUICData(ctx context.Context, remote net.Addr, str
 		Remote:          remote,
 		ResponseChannel: responseChannel,
 	}
+	var rawFrames [][]byte
+	if s.archive != nil {
+		rawFrames, err = encodeFrameBatch(frames)
+		if err != nil {
+			s.metrics.incReceiveErrors()
+			s.metrics.incProtocolErrors()
+			s.metrics.incFramesDropped(len(frames))
+			_ = s.writeError(stream, first.streamID, first.sessionID, first.seq, protocolErrorMalformedFrame, err.Error())
+			return false, err
+		}
+	}
 	positionTermID, positionTermOffset, hasFramePosition := framePosition(ackFrame)
 	if err := s.ordered.deliver(ctx, orderedMessage{
 		ctx:                ctx,
 		msg:                msg,
+		rawFrames:          rawFrames,
 		positionTermID:     positionTermID,
 		positionTermOffset: positionTermOffset,
 		hasFramePosition:   hasFramePosition,
@@ -464,7 +476,19 @@ func (s *Subscription) handleMessage(ctx context.Context, item orderedMessage, h
 		msg.Image.observe(msg.Position, msg.Sequence)
 	}
 	if s.archive != nil {
-		record, err := s.archive.Record(msg)
+		var (
+			record ArchiveRecord
+			err    error
+		)
+		if len(item.rawFrames) > 0 {
+			records, recordErr := s.archive.RecordFrames(item.rawFrames)
+			err = recordErr
+			if len(records) > 0 {
+				record = records[0]
+			}
+		} else {
+			record, err = s.archive.Record(msg)
+		}
 		if err != nil {
 			s.metrics.incReceiveErrors()
 			s.log(ctx, LogLevelError, "archive", "archive record failed", map[string]any{

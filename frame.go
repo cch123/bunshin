@@ -328,3 +328,15 @@ func decodeFramesWithPayload(buf []byte, copyPayload bool) ([]frame, error) {
 	}
 	return frames, nil
 }
+
+func encodeFrameBatch(frames []frame) ([][]byte, error) {
+	encoded := make([][]byte, 0, len(frames))
+	for _, f := range frames {
+		packet, err := encodeFrame(f)
+		if err != nil {
+			return nil, err
+		}
+		encoded = append(encoded, packet)
+	}
+	return encoded, nil
+}

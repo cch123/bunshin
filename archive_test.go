@@ -1,6 +1,7 @@
 package bunshin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -127,6 +128,104 @@ func TestArchiveRecordReplayAndFilter(t *testing.T) {
 	}
 }
 
+func TestArchiveRecordFramesReplaysReassembledMessages(t *testing.T) {
+	archive := openTestArchive(t)
+	defer archive.Close()
+
+	firstFrame, err := encodeFrame(frame{
+		typ:           frameData,
+		flags:         frameFlagFragment,
+		streamID:      12,
+		sessionID:     34,
+		termID:        3,
+		termOffset:    64,
+		seq:           7,
+		reserved:      99,
+		fragmentIndex: 0,
+		fragmentCount: 2,
+		payload:       []byte("raw-"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondFrame, err := encodeFrame(frame{
+		typ:           frameData,
+		flags:         frameFlagFragment,
+		streamID:      12,
+		sessionID:     34,
+		termID:        3,
+		termOffset:    128,
+		seq:           7,
+		reserved:      99,
+		fragmentIndex: 1,
+		fragmentCount: 2,
+		payload:       []byte("frames"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := archive.RecordFrames([][]byte{firstFrame, secondFrame})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || !bytes.Equal(records[0].RawFrame, firstFrame) || !bytes.Equal(records[1].RawFrame, secondFrame) {
+		t.Fatalf("unexpected raw frame records: %#v", records)
+	}
+	if records[0].PayloadLength != len(firstFrame) || records[1].PayloadLength != len(secondFrame) {
+		t.Fatalf("unexpected raw payload lengths: %#v", records)
+	}
+
+	report, err := archive.IntegrityScan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Records != 2 {
+		t.Fatalf("raw frame record count = %d, want 2", report.Records)
+	}
+
+	var replayed []Message
+	err = archive.Replay(context.Background(), ArchiveReplayConfig{RecordingID: records[0].RecordingID}, func(_ context.Context, msg Message) error {
+		replayed = append(replayed, msg)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 1 {
+		t.Fatalf("replayed messages = %d, want 1: %#v", len(replayed), replayed)
+	}
+	msg := replayed[0]
+	if msg.StreamID != 12 || msg.SessionID != 34 || msg.TermID != 3 || msg.TermOffset != 64 ||
+		msg.Sequence != 7 || msg.ReservedValue != 99 || string(msg.Payload) != "raw-frames" {
+		t.Fatalf("unexpected replayed raw frame message: %#v", msg)
+	}
+
+	replayed = nil
+	err = archive.Replay(context.Background(), ArchiveReplayConfig{
+		RecordingID:  records[0].RecordingID,
+		FromPosition: records[1].Position,
+	}, func(_ context.Context, msg Message) error {
+		replayed = append(replayed, msg)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 0 {
+		t.Fatalf("partial raw frame replay delivered a message: %#v", replayed)
+	}
+}
+
+func TestArchiveRecordFrameRejectsMalformedFrame(t *testing.T) {
+	archive := openTestArchive(t)
+	defer archive.Close()
+
+	if _, err := archive.RecordFrame([]byte("bad frame")); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("RecordFrame() err = %v, want %v", err, ErrInvalidConfig)
+	}
+}
+
 func TestSubscriptionRecordsLiveMessagesToArchive(t *testing.T) {
 	archive := openTestArchive(t)
 	defer archive.Close()
@@ -185,6 +284,20 @@ func TestSubscriptionRecordsLiveMessagesToArchive(t *testing.T) {
 	}
 	if len(replayed) != 1 || replayed[0].StreamID != 111 || replayed[0].SessionID != 212 || string(replayed[0].Payload) != "record me" {
 		t.Fatalf("unexpected archive replay: %#v", replayed)
+	}
+	recordings, err := archive.ListRecordings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recordings) != 1 {
+		t.Fatalf("recordings = %d, want 1", len(recordings))
+	}
+	entry, err := archive.readArchiveEntry(recordings[0], recordings[0].StartPosition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !entry.rawFrame || len(entry.record.RawFrame) == 0 {
+		t.Fatalf("subscription archive entry was not recorded as raw frame: %#v", entry.record)
 	}
 }
 

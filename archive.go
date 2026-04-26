@@ -20,6 +20,7 @@ const (
 	archiveHeaderLen                  = 64
 	archiveMaxPayload                 = uint64(^uint32(0))
 	archiveRecordFlagPadding    uint8 = 1
+	archiveRecordFlagRawFrame   uint8 = 1 << 1
 	archiveCatalogFile                = "catalog.json"
 	archiveDetachedSegmentExt         = ".detached"
 	defaultArchiveSegmentLength       = 64 * 1024 * 1024
@@ -43,17 +44,19 @@ type ArchiveConfig struct {
 }
 
 type Archive struct {
-	mu                       sync.Mutex
-	dir                      string
-	catalogPath              string
-	sync                     bool
-	segmentLength            int64
-	recordingProgressHandler ArchiveRecordingEventHandler
-	recordingSignalHandler   ArchiveRecordingEventHandler
-	activeRecordingID        int64
-	extensionSignalPending   bool
-	closed                   bool
-	catalog                  archiveCatalog
+	mu                        sync.Mutex
+	dir                       string
+	catalogPath               string
+	sync                      bool
+	segmentLength             int64
+	recordingProgressHandler  ArchiveRecordingEventHandler
+	recordingSignalHandler    ArchiveRecordingEventHandler
+	recordingEventSubscribers map[uint64]chan ArchiveRecordingEvent
+	nextRecordingSubscriberID uint64
+	activeRecordingID         int64
+	extensionSignalPending    bool
+	closed                    bool
+	catalog                   archiveCatalog
 }
 
 type ArchiveRecordingSignal string
@@ -96,12 +99,14 @@ type ArchiveRecordingDescriptor struct {
 }
 
 type ArchiveRecord struct {
-	RecordingID  int64
-	Position     int64
-	NextPosition int64
-	SegmentBase  int64
-	RecordedAt   time.Time
-	Message      Message
+	RecordingID   int64
+	Position      int64
+	NextPosition  int64
+	SegmentBase   int64
+	RecordedAt    time.Time
+	Message       Message
+	RawFrame      []byte
+	PayloadLength int
 }
 
 type ArchiveReplayConfig struct {
@@ -146,8 +151,20 @@ type archiveCatalog struct {
 }
 
 type archiveEntry struct {
-	record  ArchiveRecord
-	padding bool
+	record   ArchiveRecord
+	padding  bool
+	rawFrame bool
+	frame    frame
+}
+
+type archivePendingRecord struct {
+	packet        []byte
+	message       Message
+	rawFrame      []byte
+	streamID      uint32
+	sessionID     uint32
+	payloadLength int
+	recordedAt    time.Time
 }
 
 func OpenArchive(cfg ArchiveConfig) (*Archive, error) {
@@ -204,7 +221,47 @@ func (a *Archive) Close() error {
 		return nil
 	}
 	a.closed = true
+	for id, subscriber := range a.recordingEventSubscribers {
+		delete(a.recordingEventSubscribers, id)
+		close(subscriber)
+	}
 	return nil
+}
+
+func (a *Archive) SubscribeRecordingEvents(buffer int) (<-chan ArchiveRecordingEvent, func(), error) {
+	if a == nil {
+		return nil, nil, ErrArchiveClosed
+	}
+	if buffer < 0 {
+		return nil, nil, invalidConfigf("invalid archive recording event buffer: %d", buffer)
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.closed {
+		return nil, nil, ErrArchiveClosed
+	}
+	if a.recordingEventSubscribers == nil {
+		a.recordingEventSubscribers = make(map[uint64]chan ArchiveRecordingEvent)
+	}
+	a.nextRecordingSubscriberID++
+	id := a.nextRecordingSubscriberID
+	ch := make(chan ArchiveRecordingEvent, buffer)
+	a.recordingEventSubscribers[id] = ch
+
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if subscriber, ok := a.recordingEventSubscribers[id]; ok {
+				delete(a.recordingEventSubscribers, id)
+				close(subscriber)
+			}
+		})
+	}
+	return ch, unsubscribe, nil
 }
 
 func (a *Archive) StartRecording(streamID, sessionID uint32) (ArchiveRecordingDescriptor, error) {
@@ -279,63 +336,125 @@ func (a *Archive) Record(msg Message) (ArchiveRecord, error) {
 	}
 
 	recordedAt := time.Now().UTC()
-	packet := encodeArchiveRecord(msg, recordedAt)
+	records, err := a.recordPending([]archivePendingRecord{{
+		packet:        encodeArchiveRecord(msg, recordedAt),
+		message:       cloneMessage(msg),
+		streamID:      msg.StreamID,
+		sessionID:     msg.SessionID,
+		payloadLength: len(msg.Payload),
+		recordedAt:    recordedAt,
+	}})
+	if err != nil {
+		return ArchiveRecord{}, err
+	}
+	return records[0], nil
+}
+
+func (a *Archive) RecordFrame(rawFrame []byte) (ArchiveRecord, error) {
+	records, err := a.RecordFrames([][]byte{rawFrame})
+	if err != nil {
+		return ArchiveRecord{}, err
+	}
+	return records[0], nil
+}
+
+func (a *Archive) RecordFrames(rawFrames [][]byte) ([]ArchiveRecord, error) {
+	if len(rawFrames) == 0 {
+		return nil, invalidConfigf("archive raw frame batch is empty")
+	}
+	recordedAt := time.Now().UTC()
+	pending := make([]archivePendingRecord, 0, len(rawFrames))
+	for _, rawFrame := range rawFrames {
+		normalized, f, err := normalizeArchiveRawFrame(rawFrame)
+		if err != nil {
+			return nil, err
+		}
+		pending = append(pending, archivePendingRecord{
+			packet:        encodeArchiveRawFrame(normalized, f, recordedAt),
+			message:       archiveMessageFromFrameHeader(f),
+			rawFrame:      normalized,
+			streamID:      f.streamID,
+			sessionID:     f.sessionID,
+			payloadLength: len(normalized),
+			recordedAt:    recordedAt,
+		})
+	}
+	return a.recordPending(pending)
+}
+
+func (a *Archive) recordPending(pending []archivePendingRecord) ([]ArchiveRecord, error) {
+	if len(pending) == 0 {
+		return nil, invalidConfigf("archive record batch is empty")
+	}
 
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()
-		return ArchiveRecord{}, ErrArchiveClosed
+		return nil, ErrArchiveClosed
 	}
-	index, created, err := a.ensureRecordingLocked(msg, recordedAt)
+	index, created, err := a.ensureRecordingForStreamLocked(pending[0].streamID, pending[0].sessionID, pending[0].recordedAt)
 	if err != nil {
 		a.mu.Unlock()
-		return ArchiveRecord{}, err
+		return nil, err
 	}
 	desc := &a.catalog.Recordings[index]
-	position := desc.StopPosition
-	position, err = a.padSegmentIfNeededLocked(desc, position, int64(len(packet)))
-	if err != nil {
-		a.mu.Unlock()
-		return ArchiveRecord{}, err
+	for _, pendingRecord := range pending {
+		if int64(len(pendingRecord.packet)) > desc.SegmentLength {
+			a.mu.Unlock()
+			return nil, fmt.Errorf("%w: record length %d exceeds segment length %d", ErrInvalidConfig, len(pendingRecord.packet), desc.SegmentLength)
+		}
 	}
+	records := make([]ArchiveRecord, 0, len(pending))
+	for _, pendingRecord := range pending {
+		position := desc.StopPosition
+		position, err = a.padSegmentIfNeededLocked(desc, position, int64(len(pendingRecord.packet)))
+		if err != nil {
+			a.mu.Unlock()
+			return nil, err
+		}
 
-	segmentBase := archiveSegmentBase(position, desc.SegmentLength)
-	segmentOffset := position - segmentBase
-	if err := a.writeSegmentLocked(desc.RecordingID, segmentBase, segmentOffset, packet); err != nil {
-		a.mu.Unlock()
-		return ArchiveRecord{}, err
+		segmentBase := archiveSegmentBase(position, desc.SegmentLength)
+		segmentOffset := position - segmentBase
+		if err := a.writeSegmentLocked(desc.RecordingID, segmentBase, segmentOffset, pendingRecord.packet); err != nil {
+			a.mu.Unlock()
+			return nil, err
+		}
+
+		nextPosition := position + int64(len(pendingRecord.packet))
+		desc.StopPosition = nextPosition
+		desc.UpdatedAt = pendingRecord.recordedAt
+		a.updateDescriptorStreamSession(desc, pendingRecord.streamID, pendingRecord.sessionID)
+		records = append(records, ArchiveRecord{
+			RecordingID:   desc.RecordingID,
+			Position:      position,
+			NextPosition:  nextPosition,
+			SegmentBase:   segmentBase,
+			RecordedAt:    pendingRecord.recordedAt,
+			Message:       cloneMessage(pendingRecord.message),
+			RawFrame:      cloneBytes(pendingRecord.rawFrame),
+			PayloadLength: pendingRecord.payloadLength,
+		})
 	}
-
-	nextPosition := position + int64(len(packet))
-	desc.StopPosition = nextPosition
-	desc.UpdatedAt = recordedAt
-	a.updateDescriptorStreamSession(desc, msg)
 	if err := a.saveCatalogLocked(); err != nil {
 		a.mu.Unlock()
-		return ArchiveRecord{}, err
+		return nil, err
 	}
 
-	record := ArchiveRecord{
-		RecordingID:  desc.RecordingID,
-		Position:     position,
-		NextPosition: nextPosition,
-		SegmentBase:  segmentBase,
-		RecordedAt:   recordedAt,
-		Message:      cloneMessage(msg),
-	}
 	descriptor := *desc
-	events := make([]ArchiveRecordingEvent, 0, 2)
+	events := make([]ArchiveRecordingEvent, 0, len(records)+1)
 	if created {
-		events = append(events, archiveRecordingEvent(ArchiveRecordingSignalStart, descriptor, record))
+		events = append(events, archiveRecordingEvent(ArchiveRecordingSignalStart, descriptor, records[0]))
 	} else if a.extensionSignalPending {
 		a.extensionSignalPending = false
-		events = append(events, archiveRecordingEvent(ArchiveRecordingSignalExtend, descriptor, record))
+		events = append(events, archiveRecordingEvent(ArchiveRecordingSignalExtend, descriptor, records[0]))
 	}
-	events = append(events, archiveRecordingEvent(ArchiveRecordingSignalProgress, descriptor, record))
+	for _, record := range records {
+		events = append(events, archiveRecordingEvent(ArchiveRecordingSignalProgress, descriptor, record))
+	}
 	a.mu.Unlock()
 
 	a.emitRecordingEvents(events)
-	return record, nil
+	return records, nil
 }
 
 func (a *Archive) RecordingHandler(next Handler) Handler {
@@ -369,6 +488,7 @@ func (a *Archive) Replay(ctx context.Context, cfg ArchiveReplayConfig, handler H
 		return err
 	}
 	for _, desc := range recordings {
+		rawReplay := newArchiveRawReplay()
 		if cfg.FromPosition > desc.StopPosition {
 			return fmt.Errorf("%w: %d", ErrArchivePosition, cfg.FromPosition)
 		}
@@ -392,6 +512,19 @@ func (a *Archive) Replay(ctx context.Context, cfg ArchiveReplayConfig, handler H
 			if entry.padding || !archiveReplayMatch(cfg, entry.record.Message) {
 				continue
 			}
+			if entry.rawFrame {
+				msg, ready, err := rawReplay.observe(entry.frame)
+				if err != nil {
+					return err
+				}
+				if !ready || !archiveReplayMatch(cfg, msg) {
+					continue
+				}
+				if err := handler(ctx, msg); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := handler(ctx, entry.record.Message); err != nil {
 				return err
 			}
@@ -405,6 +538,88 @@ func archiveReplayLimit(cfg ArchiveReplayConfig, desc ArchiveRecordingDescriptor
 		return desc.StopPosition
 	}
 	return min(desc.StopPosition, cfg.FromPosition+cfg.Length)
+}
+
+type archiveRawReplay struct {
+	pending map[archiveRawFrameKey]*archiveRawFrameSet
+}
+
+type archiveRawFrameKey struct {
+	streamID  uint32
+	sessionID uint32
+	seq       uint64
+	reserved  uint64
+}
+
+type archiveRawFrameSet struct {
+	frames   []frame
+	received []bool
+	count    int
+}
+
+func newArchiveRawReplay() *archiveRawReplay {
+	return &archiveRawReplay{pending: make(map[archiveRawFrameKey]*archiveRawFrameSet)}
+}
+
+func (r *archiveRawReplay) observe(f frame) (Message, bool, error) {
+	if f.typ != frameData {
+		return Message{}, false, nil
+	}
+	if f.fragmentCount <= 1 {
+		responseChannel, payload, err := decodeDataPayload(f)
+		if err != nil {
+			return Message{}, false, err
+		}
+		msg := archiveMessageFromFrameHeader(f)
+		msg.Payload = cloneBytes(payload)
+		msg.ResponseChannel = responseChannel
+		return msg, true, nil
+	}
+	if f.flags&frameFlagFragment == 0 {
+		return Message{}, false, errors.New("fragment flag missing")
+	}
+	fragmentCount := int(f.fragmentCount)
+	if int(f.fragmentIndex) >= fragmentCount {
+		return Message{}, false, errors.New("invalid fragment metadata")
+	}
+	key := archiveRawFrameKey{
+		streamID:  f.streamID,
+		sessionID: f.sessionID,
+		seq:       f.seq,
+		reserved:  f.reserved,
+	}
+	set := r.pending[key]
+	if set == nil {
+		set = &archiveRawFrameSet{
+			frames:   make([]frame, fragmentCount),
+			received: make([]bool, fragmentCount),
+		}
+		r.pending[key] = set
+	}
+	if len(set.frames) != fragmentCount {
+		delete(r.pending, key)
+		return Message{}, false, errors.New("fragment count changed")
+	}
+	index := int(f.fragmentIndex)
+	if !set.received[index] {
+		set.frames[index] = cloneUDPFrame(f)
+		set.received[index] = true
+		set.count++
+	}
+	if set.count < fragmentCount {
+		return Message{}, false, nil
+	}
+
+	payload, responseChannel, _, err := reassembleDataFrames(set.frames)
+	if err != nil {
+		delete(r.pending, key)
+		return Message{}, false, err
+	}
+	msg := archiveMessageFromFrameHeader(set.frames[0])
+	msg.Payload = payload
+	msg.ResponseChannel = responseChannel
+	delete(r.pending, key)
+	return msg, true, nil
 }
 
 func (a *Archive) IntegrityScan() (ArchiveIntegrityReport, error) {
@@ -783,6 +998,10 @@ func (a *Archive) saveCatalogLocked() error {
 }
 
 func (a *Archive) ensureRecordingLocked(msg Message, now time.Time) (int, bool, error) {
+	return a.ensureRecordingForStreamLocked(msg.StreamID, msg.SessionID, now)
+}
+
+func (a *Archive) ensureRecordingForStreamLocked(streamID, sessionID uint32, now time.Time) (int, bool, error) {
 	if a.activeRecordingID != 0 {
 		index, err := a.recordingIndexLocked(a.activeRecordingID)
 		if err != nil {
@@ -790,7 +1009,7 @@ func (a *Archive) ensureRecordingLocked(msg Message, now time.Time) (int, bool, 
 		}
 		return index, false, nil
 	}
-	index := a.createRecordingLocked(msg.StreamID, msg.SessionID, now)
+	index := a.createRecordingLocked(streamID, sessionID, now)
 	return index, true, nil
 }
 
@@ -815,11 +1034,11 @@ func (a *Archive) createRecordingLocked(streamID, sessionID uint32, now time.Tim
 	return len(a.catalog.Recordings) - 1
 }
 
-func (a *Archive) updateDescriptorStreamSession(desc *ArchiveRecordingDescriptor, msg Message) {
-	if desc.StreamID != msg.StreamID {
+func (a *Archive) updateDescriptorStreamSession(desc *ArchiveRecordingDescriptor, streamID, sessionID uint32) {
+	if desc.StreamID != streamID {
 		desc.StreamID = 0
 	}
-	if desc.SessionID != msg.SessionID {
+	if desc.SessionID != sessionID {
 		desc.SessionID = 0
 	}
 }
@@ -1040,9 +1259,24 @@ func (a *Archive) emitRecordingEvents(events []ArchiveRecordingEvent) {
 			a.recordingSignalHandler(event)
 		}
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for _, event := range events {
+		for _, subscriber := range a.recordingEventSubscribers {
+			select {
+			case subscriber <- event:
+			default:
+			}
+		}
+	}
 }
 
 func archiveRecordingEvent(signal ArchiveRecordingSignal, descriptor ArchiveRecordingDescriptor, record ArchiveRecord) ArchiveRecordingEvent {
+	payloadLength := record.PayloadLength
+	if payloadLength == 0 {
+		payloadLength = len(record.Message.Payload)
+	}
 	return ArchiveRecordingEvent{
 		Signal:        signal,
 		RecordingID:   descriptor.RecordingID,
@@ -1052,7 +1286,7 @@ func archiveRecordingEvent(signal ArchiveRecordingSignal, descriptor ArchiveReco
 		StreamID:      record.Message.StreamID,
 		SessionID:     record.Message.SessionID,
 		Sequence:      record.Message.Sequence,
-		PayloadLength: len(record.Message.Payload),
+		PayloadLength: payloadLength,
 		Descriptor:    descriptor,
 		RecordedAt:    record.RecordedAt,
 	}
@@ -1085,6 +1319,37 @@ func validateArchiveSegmentBase(desc ArchiveRecordingDescriptor, segmentBase int
 	return nil
 }
 
+func normalizeArchiveRawFrame(rawFrame []byte) ([]byte, frame, error) {
+	if len(rawFrame) == 0 {
+		return nil, frame{}, invalidConfigf("archive raw frame is empty")
+	}
+	if uint64(len(rawFrame)) > archiveMaxPayload {
+		return nil, frame{}, fmt.Errorf("%w: raw frame too large: %d bytes", ErrInvalidConfig, len(rawFrame))
+	}
+	frames, err := decodeFrames(rawFrame)
+	if err != nil {
+		return nil, frame{}, fmt.Errorf("%w: invalid raw frame: %w", ErrInvalidConfig, err)
+	}
+	if len(frames) != 1 {
+		return nil, frame{}, fmt.Errorf("%w: raw frame record must contain exactly one frame: %d", ErrInvalidConfig, len(frames))
+	}
+	if frames[0].typ != frameData {
+		return nil, frame{}, fmt.Errorf("%w: raw archive frame must be DATA", ErrInvalidConfig)
+	}
+	return cloneBytes(rawFrame), frames[0], nil
+}
+
+func archiveMessageFromFrameHeader(f frame) Message {
+	return Message{
+		StreamID:      f.streamID,
+		SessionID:     f.sessionID,
+		TermID:        f.termID,
+		TermOffset:    f.termOffset,
+		Sequence:      f.seq,
+		ReservedValue: f.reserved,
+	}
+}
+
 func encodeArchiveRecord(msg Message, recordedAt time.Time) []byte {
 	payload := append([]byte(nil), msg.Payload...)
 	recordLen := archiveHeaderLen + len(payload)
@@ -1100,6 +1365,29 @@ func encodeArchiveRecord(msg Message, recordedAt time.Time) []byte {
 	frameByteOrder.PutUint32(buf[28:32], uint32(msg.TermOffset))
 	frameByteOrder.PutUint64(buf[32:40], msg.Sequence)
 	frameByteOrder.PutUint64(buf[40:48], msg.ReservedValue)
+	frameByteOrder.PutUint64(buf[48:56], uint64(recordedAt.UnixNano()))
+	frameByteOrder.PutUint32(buf[56:60], uint32(len(payload)))
+	copy(buf[archiveHeaderLen:], payload)
+	frameByteOrder.PutUint32(buf[60:64], archiveRecordCRC(buf))
+	return buf
+}
+
+func encodeArchiveRawFrame(rawFrame []byte, f frame, recordedAt time.Time) []byte {
+	payload := cloneBytes(rawFrame)
+	recordLen := archiveHeaderLen + len(payload)
+	buf := make([]byte, recordLen)
+
+	copy(buf[0:4], archiveMagic)
+	buf[4] = archiveVersion
+	buf[5] = archiveRecordFlagRawFrame
+	frameByteOrder.PutUint16(buf[6:8], uint16(archiveHeaderLen))
+	frameByteOrder.PutUint64(buf[8:16], uint64(recordLen))
+	frameByteOrder.PutUint32(buf[16:20], f.streamID)
+	frameByteOrder.PutUint32(buf[20:24], f.sessionID)
+	frameByteOrder.PutUint32(buf[24:28], uint32(f.termID))
+	frameByteOrder.PutUint32(buf[28:32], uint32(f.termOffset))
+	frameByteOrder.PutUint64(buf[32:40], f.seq)
+	frameByteOrder.PutUint64(buf[40:48], f.reserved)
 	frameByteOrder.PutUint64(buf[48:56], uint64(recordedAt.UnixNano()))
 	frameByteOrder.PutUint32(buf[56:60], uint32(len(payload)))
 	copy(buf[archiveHeaderLen:], payload)
@@ -1141,6 +1429,12 @@ func readArchiveEntryAt(reader io.ReaderAt, recordingID, segmentBase, segmentOff
 		return archiveEntry{}, fmt.Errorf("%w at position %d: invalid header length %d", ErrArchiveCorrupt, position, headerLen)
 	}
 	flags := header[5]
+	if flags&^(archiveRecordFlagPadding|archiveRecordFlagRawFrame) != 0 {
+		return archiveEntry{}, fmt.Errorf("%w at position %d: unsupported flags %d", ErrArchiveCorrupt, position, flags)
+	}
+	if flags&archiveRecordFlagPadding != 0 && flags&archiveRecordFlagRawFrame != 0 {
+		return archiveEntry{}, fmt.Errorf("%w at position %d: invalid flags %d", ErrArchiveCorrupt, position, flags)
+	}
 	recordLen := int64(frameByteOrder.Uint64(header[8:16]))
 	payloadLen := int64(frameByteOrder.Uint32(header[56:60]))
 	if recordLen < archiveHeaderLen || segmentOffset+recordLen > segmentLimit {
@@ -1168,14 +1462,28 @@ func readArchiveEntryAt(reader io.ReaderAt, recordingID, segmentBase, segmentOff
 	}
 
 	record := ArchiveRecord{
-		RecordingID:  recordingID,
-		Position:     position,
-		NextPosition: position + recordLen,
-		SegmentBase:  segmentBase,
-		RecordedAt:   time.Unix(0, int64(frameByteOrder.Uint64(header[48:56]))).UTC(),
+		RecordingID:   recordingID,
+		Position:      position,
+		NextPosition:  position + recordLen,
+		SegmentBase:   segmentBase,
+		RecordedAt:    time.Unix(0, int64(frameByteOrder.Uint64(header[48:56]))).UTC(),
+		PayloadLength: int(payloadLen),
 	}
 	if flags&archiveRecordFlagPadding != 0 {
 		return archiveEntry{record: record, padding: true}, nil
+	}
+	if flags&archiveRecordFlagRawFrame != 0 {
+		frames, err := decodeFrames(body)
+		if err != nil {
+			return archiveEntry{}, fmt.Errorf("%w at position %d: invalid raw frame: %w", ErrArchiveCorrupt, position, err)
+		}
+		if len(frames) != 1 {
+			return archiveEntry{}, fmt.Errorf("%w at position %d: raw archive record contains %d frames", ErrArchiveCorrupt, position, len(frames))
+		}
+		f := frames[0]
+		record.Message = archiveMessageFromFrameHeader(f)
+		record.RawFrame = cloneBytes(body)
+		return archiveEntry{record: record, rawFrame: true, frame: f}, nil
 	}
 	record.Message = Message{
 		StreamID:      frameByteOrder.Uint32(header[16:20]),

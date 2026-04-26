@@ -21,6 +21,7 @@ type orderedState struct {
 type orderedMessage struct {
 	ctx                context.Context
 	msg                Message
+	rawFrames          [][]byte
 	position           int64
 	positionTermID     int32
 	positionTermOffset int
