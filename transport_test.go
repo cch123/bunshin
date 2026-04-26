@@ -967,13 +967,13 @@ func TestUDPPublicationSubscription(t *testing.T) {
 
 	pubSnapshot := pubMetrics.Snapshot()
 	if pubSnapshot.ConnectionsOpened != 1 || pubSnapshot.MessagesSent != 1 || pubSnapshot.BytesSent != uint64(len("udp payload")) ||
-		pubSnapshot.AcksReceived != 1 || pubSnapshot.FramesSent != 1 || pubSnapshot.FramesReceived != 2 ||
+		pubSnapshot.AcksReceived != 1 || pubSnapshot.FramesSent != 2 || pubSnapshot.FramesReceived != 3 ||
 		pubSnapshot.FramesDropped != 0 || pubSnapshot.SendErrors != 0 {
 		t.Fatalf("unexpected udp publication metrics: %#v", pubSnapshot)
 	}
 	subSnapshot := subMetrics.Snapshot()
 	if subSnapshot.ConnectionsAccepted != 1 || subSnapshot.MessagesReceived != 1 || subSnapshot.BytesReceived != uint64(len("udp payload")) ||
-		subSnapshot.AcksSent != 1 || subSnapshot.FramesSent != 2 || subSnapshot.FramesReceived != 1 ||
+		subSnapshot.AcksSent != 1 || subSnapshot.FramesSent != 3 || subSnapshot.FramesReceived != 2 ||
 		subSnapshot.FramesDropped != 0 || subSnapshot.ReceiveErrors != 0 {
 		t.Fatalf("unexpected udp subscription metrics: %#v", subSnapshot)
 	}
@@ -1205,12 +1205,12 @@ func TestUDPPublicationSubscriptionFragmentsLargePayload(t *testing.T) {
 
 	pubSnapshot := pubMetrics.Snapshot()
 	if pubSnapshot.MessagesSent != 1 || pubSnapshot.BytesSent != uint64(len(payload)) ||
-		pubSnapshot.AcksReceived != 1 || pubSnapshot.FramesSent != 4 || pubSnapshot.FramesReceived != 2 {
+		pubSnapshot.AcksReceived != 1 || pubSnapshot.FramesSent != 5 || pubSnapshot.FramesReceived != 3 {
 		t.Fatalf("unexpected udp publication metrics: %#v", pubSnapshot)
 	}
 	subSnapshot := subMetrics.Snapshot()
 	if subSnapshot.ConnectionsAccepted != 1 || subSnapshot.MessagesReceived != 1 || subSnapshot.BytesReceived != uint64(len(payload)) ||
-		subSnapshot.AcksSent != 1 || subSnapshot.FramesSent != 2 || subSnapshot.FramesReceived != 4 {
+		subSnapshot.AcksSent != 1 || subSnapshot.FramesSent != 3 || subSnapshot.FramesReceived != 5 {
 		t.Fatalf("unexpected udp subscription metrics: %#v", subSnapshot)
 	}
 }
@@ -1530,6 +1530,16 @@ func TestUDPPublicationDynamicDestinations(t *testing.T) {
 	}
 	expectPayload(t, ctx, receivedA, "both")
 	expectPayload(t, ctx, receivedB, "both")
+	statuses := pub.DestinationStatuses()
+	if len(statuses) != 2 {
+		t.Fatalf("destination statuses = %#v, want two", statuses)
+	}
+	for _, status := range statuses {
+		if !status.Active || status.Remote == "" || status.LastSequence != 1 ||
+			status.LastSetupAt.IsZero() || status.LastStatusAt.IsZero() || status.LastAckAt.IsZero() || status.LastRTT <= 0 {
+			t.Fatalf("unexpected active destination status: %#v", status)
+		}
+	}
 
 	if err := pub.RemoveDestination(subA.LocalAddr().String()); err != nil {
 		t.Fatal(err)
@@ -1537,6 +1547,10 @@ func TestUDPPublicationDynamicDestinations(t *testing.T) {
 	destinations = pub.Destinations()
 	if len(destinations) != 1 || destinations[0] != subB.LocalAddr().String() {
 		t.Fatalf("destinations after remove = %#v, want %s", destinations, subB.LocalAddr().String())
+	}
+	statuses = pub.DestinationStatuses()
+	if len(statuses) != 1 || statuses[0].Remote != subB.LocalAddr().String() {
+		t.Fatalf("destination statuses after remove = %#v, want %s", statuses, subB.LocalAddr().String())
 	}
 	if err := pub.Send(ctx, []byte("only-b")); err != nil {
 		t.Fatal(err)
@@ -1551,6 +1565,103 @@ func TestUDPPublicationDynamicDestinations(t *testing.T) {
 	snapshot := pubMetrics.Snapshot()
 	if snapshot.MessagesSent != 2 || snapshot.AcksReceived != 3 {
 		t.Fatalf("unexpected publication metrics: %#v", snapshot)
+	}
+}
+
+func TestUDPDestinationStatusUsesReceiverTimeout(t *testing.T) {
+	base := time.Unix(10, 0)
+	destination := &udpDestination{
+		endpoint:       "127.0.0.1:40456",
+		lastFeedbackAt: base,
+		lastSequence:   7,
+	}
+	active := destination.status(base.Add(time.Second), 2*time.Second)
+	if !active.Active || active.LastSequence != 7 {
+		t.Fatalf("destination should be active: %#v", active)
+	}
+	inactive := destination.status(base.Add(3*time.Second), 2*time.Second)
+	if inactive.Active {
+		t.Fatalf("destination should be inactive after timeout: %#v", inactive)
+	}
+}
+
+func TestUDPDestinationSetupLifecycle(t *testing.T) {
+	base := time.Unix(10, 0)
+	destination := &udpDestination{}
+	if !destination.needsSetup(base, 2*time.Second) {
+		t.Fatal("destination should require initial setup")
+	}
+	destination.lastSetupAt = base
+	destination.lastFeedbackAt = base
+	if destination.needsSetup(base.Add(time.Second), 2*time.Second) {
+		t.Fatal("destination should not require setup while feedback is fresh")
+	}
+	if !destination.needsSetup(base.Add(3*time.Second), 2*time.Second) {
+		t.Fatal("destination should require setup after receiver timeout")
+	}
+}
+
+func TestUDPPublicationRefreshesSetupAfterReceiverTimeout(t *testing.T) {
+	sub, err := ListenSubscription(SubscriptionConfig{
+		Transport: TransportUDP,
+		StreamID:  140,
+		LocalAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	received := make(chan string, 3)
+	go func() {
+		_ = sub.Serve(ctx, func(_ context.Context, msg Message) error {
+			received <- string(msg.Payload)
+			return nil
+		})
+	}()
+
+	pub, err := DialPublication(PublicationConfig{
+		Transport:          TransportUDP,
+		StreamID:           140,
+		SessionID:          240,
+		RemoteAddr:         sub.LocalAddr().String(),
+		UDPReceiverTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	if err := pub.Send(ctx, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ctx, received, "one")
+	statuses := pub.DestinationStatuses()
+	if len(statuses) != 1 || statuses[0].LastSetupAt.IsZero() {
+		t.Fatalf("destination statuses after first send = %#v, want setup time", statuses)
+	}
+	firstSetup := statuses[0].LastSetupAt
+
+	if err := pub.Send(ctx, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ctx, received, "two")
+	statuses = pub.DestinationStatuses()
+	if len(statuses) != 1 || !statuses[0].LastSetupAt.Equal(firstSetup) {
+		t.Fatalf("destination setup refreshed early: first=%s statuses=%#v", firstSetup, statuses)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if err := pub.Send(ctx, []byte("three")); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ctx, received, "three")
+	statuses = pub.DestinationStatuses()
+	if len(statuses) != 1 || !statuses[0].LastSetupAt.After(firstSetup) {
+		t.Fatalf("destination setup did not refresh after timeout: first=%s statuses=%#v", firstSetup, statuses)
 	}
 }
 

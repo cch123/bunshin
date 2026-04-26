@@ -26,6 +26,7 @@ func TestPublicAPIContract(t *testing.T) {
 		NewDefaultBackoffIdleStrategy,
 		NewBackoffIdleStrategy,
 		NewMinMulticastFlowControl,
+		NewPreferredMulticastFlowControl,
 		ParseChannelURI,
 	}
 	configs := []any{

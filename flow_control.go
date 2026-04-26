@@ -55,6 +55,15 @@ type MinMulticastFlowControl struct {
 	receivers map[string]flowControlReceiver
 }
 
+type PreferredMulticastFlowControl struct {
+	ReceiverTimeout      time.Duration
+	PreferredReceiverIDs []string
+
+	mu        sync.Mutex
+	receivers map[string]flowControlReceiver
+	preferred map[string]struct{}
+}
+
 type flowControlReceiver struct {
 	rightEdge int64
 	seenAt    time.Time
@@ -68,6 +77,25 @@ func NewMinMulticastFlowControl(timeout time.Duration) *MinMulticastFlowControl 
 		ReceiverTimeout: timeout,
 		receivers:       make(map[string]flowControlReceiver),
 	}
+}
+
+func NewPreferredMulticastFlowControl(timeout time.Duration, preferredReceiverIDs ...string) *PreferredMulticastFlowControl {
+	if timeout <= 0 {
+		timeout = defaultFlowControlReceiverTimeout
+	}
+	flow := &PreferredMulticastFlowControl{
+		ReceiverTimeout:      timeout,
+		PreferredReceiverIDs: append([]string(nil), preferredReceiverIDs...),
+		receivers:            make(map[string]flowControlReceiver),
+		preferred:            make(map[string]struct{}, len(preferredReceiverIDs)),
+	}
+	for _, receiverID := range preferredReceiverIDs {
+		if receiverID == "" {
+			continue
+		}
+		flow.preferred[receiverID] = struct{}{}
+	}
+	return flow
 }
 
 func (f *MinMulticastFlowControl) InitialLimit(termBufferLength int) int64 {
@@ -116,6 +144,95 @@ func (f *MinMulticastFlowControl) minRightEdge(senderLimit int64) int64 {
 	minRightEdge := int64(0)
 	first := true
 	for _, receiver := range f.receivers {
+		if first || receiver.rightEdge < minRightEdge {
+			minRightEdge = receiver.rightEdge
+			first = false
+		}
+	}
+	return minRightEdge
+}
+
+func (f *PreferredMulticastFlowControl) InitialLimit(termBufferLength int) int64 {
+	return int64(termBufferLength)
+}
+
+func (f *PreferredMulticastFlowControl) OnStatus(status FlowControlStatus, senderLimit int64) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.ensure()
+	f.receivers[status.ReceiverID] = flowControlReceiver{
+		rightEdge: receiverRightEdge(status),
+		seenAt:    status.ObservedAt,
+	}
+	return f.limitLocked(senderLimit)
+}
+
+func (f *PreferredMulticastFlowControl) OnIdle(now time.Time, senderLimit, _ int64) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.ensure()
+	for receiverID, receiver := range f.receivers {
+		if now.Sub(receiver.seenAt) > f.ReceiverTimeout {
+			delete(f.receivers, receiverID)
+		}
+	}
+	return f.limitLocked(senderLimit)
+}
+
+func (f *PreferredMulticastFlowControl) ensure() {
+	if f.receivers == nil {
+		f.receivers = make(map[string]flowControlReceiver)
+	}
+	if f.preferred == nil {
+		f.preferred = make(map[string]struct{}, len(f.PreferredReceiverIDs))
+		for _, receiverID := range f.PreferredReceiverIDs {
+			if receiverID == "" {
+				continue
+			}
+			f.preferred[receiverID] = struct{}{}
+		}
+	}
+	if f.ReceiverTimeout <= 0 {
+		f.ReceiverTimeout = defaultFlowControlReceiverTimeout
+	}
+}
+
+func (f *PreferredMulticastFlowControl) limitLocked(senderLimit int64) int64 {
+	if len(f.receivers) == 0 {
+		return senderLimit
+	}
+
+	preferredRightEdge, ok := minPreferredReceiverRightEdge(f.receivers, f.preferred)
+	if ok {
+		return preferredRightEdge
+	}
+	return minReceiverRightEdge(f.receivers)
+}
+
+func minPreferredReceiverRightEdge(receivers map[string]flowControlReceiver, preferred map[string]struct{}) (int64, bool) {
+	if len(preferred) == 0 {
+		return 0, false
+	}
+	var minRightEdge int64
+	first := true
+	for receiverID, receiver := range receivers {
+		if _, ok := preferred[receiverID]; !ok {
+			continue
+		}
+		if first || receiver.rightEdge < minRightEdge {
+			minRightEdge = receiver.rightEdge
+			first = false
+		}
+	}
+	return minRightEdge, !first
+}
+
+func minReceiverRightEdge(receivers map[string]flowControlReceiver) int64 {
+	var minRightEdge int64
+	first := true
+	for _, receiver := range receivers {
 		if first || receiver.rightEdge < minRightEdge {
 			minRightEdge = receiver.rightEdge
 			first = false

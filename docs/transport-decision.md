@@ -27,12 +27,12 @@ For an Aeron-like goal, the evaluation must also consider:
 - The hand-written UDP ACK/retransmit implementation has been replaced by QUIC streams.
 - Reliability, retransmission, flow control, congestion control, and TLS are owned by `quic-go`.
 - Bunshin's ACK frame now confirms application-level handling over a reliable QUIC stream rather than packet-level delivery.
-- `TransportUDP` sends Bunshin DATA frames directly as UDP datagrams to one or more unicast or multicast destinations and waits for receiver STATUS plus application-level ACK or ERROR frames. It shares the publication/subscription API, term metadata, flow-control strategy hook, fragmentation, reassembly, ordered delivery, loss observation, NAK repair, RTT metrics, transport feedback hooks, and metrics path.
+- `TransportUDP` performs a Bunshin HELLO setup handshake per destination, then sends Bunshin DATA frames as UDP datagrams to one or more unicast or multicast destinations and waits for receiver STATUS plus application-level ACK or ERROR frames. It shares the publication/subscription API, term metadata, flow-control strategy hook, fragmentation, reassembly, ordered delivery, loss observation, NAK repair, destination liveness snapshots, RTT metrics, transport feedback hooks, and metrics path.
 - UDP does not yet provide full congestion control or transport-level security.
 - Bunshin does not perform a mandatory payload CRC32 on top of QUIC. Like Aeron, it exposes an application-defined reserved value that can carry a checksum or timestamp when needed.
 - Bunshin frame fields use little-endian byte order to align with Aeron's data-header convention.
 - Publications apply a bounded send window before appending to the term log. If the window is exhausted, `Send` waits for ACK capacity until its context is done and records a back-pressure event.
-- Flow control is strategy-driven. The default unicast strategy uses the maximum receiver right edge; multicast-oriented max and min strategies are available for future multi-receiver transports.
+- Flow control is strategy-driven. The default unicast strategy uses the maximum receiver right edge; multicast-oriented max, min, and preferred-receiver strategies are available for multi-receiver transports.
 - Idle strategies are available as reusable primitives for low-latency polling loops: no-op, busy-spin, yield, fixed sleep, and capped backoff.
 - Subscriptions report sequence gaps per stream/session/source for diagnostics. QUIC still owns transport-level retransmission.
 - Subscriptions buffer out-of-order messages and invoke handlers in sequence order per stream/session/source. Application-level ACKs are withheld until delivery.

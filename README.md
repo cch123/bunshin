@@ -8,7 +8,7 @@ The first cut focuses on a narrow, testable slice:
 
 - QUIC-backed publication/subscription with an optional Bunshin-native UDP backend.
 - Binary frame header with stream, session, term, sequence, and payload fields.
-- Reliable send over `quic-go` streams with application-level ACK frames; UDP sends Bunshin frames directly to unicast, multi-destination, or multicast destinations and uses receiver STATUS, NAK repair, and application-level ACK/ERROR responses.
+- Reliable send over `quic-go` streams with application-level ACK frames; UDP sends Bunshin frames to unicast, multi-destination, or multicast destinations with HELLO setup, receiver STATUS, NAK repair, RTT feedback, and application-level ACK/ERROR responses.
 - Publication back pressure through a bounded in-flight send window.
 - Publication `Offer` and vectored offer APIs returning stable accepted/back-pressured/closed status values plus stream position on success.
 - Publication claim/commit API for writing one message into a claimed buffer before offering it.
@@ -17,7 +17,7 @@ The first cut focuses on a narrow, testable slice:
 - Controlled subscription polling actions for continue, break, abort, and commit-style receive loops.
 - Subscription images for source/session identity, position tracking, and availability callbacks.
 - Subscription lag reports based on image observed/current position.
-- Configurable unicast/max-multicast/min-multicast flow control strategies.
+- Configurable unicast/max-multicast/min-multicast/preferred-receiver flow control strategies.
 - Protocol-level response channels for request/response flows without embedding reply addresses in application payloads.
 - Local spy subscriptions for observing outbound publications inside the same process without network loopback.
 - Idle strategy primitives for low-latency polling loops.

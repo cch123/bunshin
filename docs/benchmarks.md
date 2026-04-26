@@ -100,4 +100,4 @@ These report `gc-cycles`, `heap-delta-bytes`, and `total-alloc-bytes` in additio
 
 ## Aeron Reference Note
 
-Aeron handles loss recovery through its media-driver protocol, including receiver status, NAKs, and retransmit behavior. Bunshin currently delegates recovery to QUIC, so this harness injects loss below `quic-go` and measures the resulting application-level send/ACK behavior instead of implementing Aeron-style NAK repair directly.
+Aeron handles loss recovery through its media-driver protocol, including receiver status, NAKs, and retransmit behavior. Bunshin's default QUIC path delegates recovery to QUIC, while the explicit UDP backend has Bunshin-native NAK repair. This harness injects loss below `quic-go` and measures the resulting application-level send/ACK behavior for the default transport.

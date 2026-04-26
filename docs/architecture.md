@@ -49,7 +49,7 @@ flowchart LR
     Sub --> Loss
 ```
 
-QUIC is the default reliable transport. UDP is explicit and supports Bunshin-native status frames, NAK repair, multicast, multi-destination sends, dynamic destinations, local spy observations, and name re-resolution.
+QUIC is the default reliable transport. UDP is explicit and supports Bunshin-native HELLO setup, status frames, NAK repair, RTT feedback, multicast, multi-destination sends, dynamic destinations, local spy observations, and name re-resolution.
 
 ## Archive
 

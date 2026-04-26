@@ -42,9 +42,21 @@ type udpPendingDestination struct {
 	multicast bool
 }
 
+type udpDestinationSnapshot struct {
+	id   string
+	addr net.Addr
+}
+
 type udpDestination struct {
-	endpoint string
-	addr     net.Addr
+	endpoint            string
+	addr                net.Addr
+	lastSetupAt         time.Time
+	lastStatusAt        time.Time
+	lastAckAt           time.Time
+	lastFeedbackAt      time.Time
+	lastSequence        uint64
+	lastRTT             time.Duration
+	retransmittedFrames int
 }
 
 func listenUDPTransport(localAddr, remoteAddr, multicastInterface string, packetConn net.PacketConn) (net.PacketConn, net.Addr, error) {
@@ -309,6 +321,20 @@ func (p *Publication) udpDestinationSnapshot() []net.Addr {
 	return destinations
 }
 
+func (p *Publication) udpDestinationSendSnapshot() []udpDestinationSnapshot {
+	destinations := make([]udpDestinationSnapshot, 0, len(p.udpDestinationOrder))
+	for _, key := range p.udpDestinationOrder {
+		destination := p.udpDestinations[key]
+		if destination != nil && destination.addr != nil {
+			destinations = append(destinations, udpDestinationSnapshot{
+				id:   key,
+				addr: destination.addr,
+			})
+		}
+	}
+	return destinations
+}
+
 func (p *Publication) DestinationEndpoints() []string {
 	if p == nil || p.transportMode != TransportUDP {
 		return nil
@@ -323,6 +349,25 @@ func (p *Publication) DestinationEndpoints() []string {
 		}
 	}
 	return endpoints
+}
+
+func (p *Publication) DestinationStatuses() []UDPDestinationStatus {
+	if p == nil || p.transportMode != TransportUDP {
+		return nil
+	}
+	p.udpMu.Lock()
+	defer p.udpMu.Unlock()
+
+	now := time.Now()
+	statuses := make([]UDPDestinationStatus, 0, len(p.udpDestinationOrder))
+	for _, key := range p.udpDestinationOrder {
+		destination := p.udpDestinations[key]
+		if destination == nil {
+			continue
+		}
+		statuses = append(statuses, destination.status(now, p.udpReceiverTimeout))
+	}
+	return statuses
 }
 
 func (p *Publication) ReResolveDestinations() error {
@@ -418,11 +463,19 @@ func (p *Publication) offerUDP(ctx context.Context, payload []byte, waitForWindo
 		p.metrics.incSendErrors()
 		return publicationOfferError(OfferFailed, err)
 	}
-	destinations := p.udpDestinationSnapshot()
-	if len(destinations) == 0 {
+	destinationSnapshot := p.udpDestinationSendSnapshot()
+	if len(destinationSnapshot) == 0 {
 		err := fmt.Errorf("%w: UDP publication has no destinations", ErrInvalidConfig)
 		p.metrics.incSendErrors()
 		return publicationOfferError(OfferFailed, err)
+	}
+	if err := p.ensureUDPSetupLocked(ctx, destinationSnapshot, time.Now()); err != nil {
+		p.metrics.incSendErrors()
+		return publicationOfferError(OfferFailed, err)
+	}
+	destinations := make([]net.Addr, 0, len(destinationSnapshot))
+	for _, destination := range destinationSnapshot {
+		destinations = append(destinations, destination.addr)
 	}
 
 	firstPayloadOverhead, err := responseChannelPayloadOverhead(p.responseChannel)
@@ -504,6 +557,89 @@ func (p *Publication) offerUDP(ctx context.Context, payload []byte, waitForWindo
 	return PublicationOfferResult{Status: OfferAccepted, Position: appendResult.Position}
 }
 
+func (p *Publication) ensureUDPSetupLocked(ctx context.Context, destinations []udpDestinationSnapshot, now time.Time) error {
+	pending := make(map[string]udpPendingDestination, len(destinations))
+	for _, snapshot := range destinations {
+		destination := p.udpDestinations[snapshot.id]
+		if destination == nil || snapshot.addr == nil || !destination.needsSetup(now, p.udpReceiverTimeout) {
+			continue
+		}
+		pending[snapshot.id] = udpPendingDestination{
+			addr:      snapshot.addr,
+			multicast: isMulticastUDPAddr(snapshot.addr),
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	packet, err := encodeFrame(frame{
+		typ: frameHello,
+		payload: encodeHelloPayload(helloPayload{
+			minVersion: frameVersion,
+			maxVersion: frameVersion,
+		}),
+	})
+	if err != nil {
+		return err
+	}
+	for _, destination := range pending {
+		if _, err := p.udpConn.WriteTo(packet, destination.addr); err != nil {
+			return err
+		}
+		p.metrics.incFramesSent(1)
+	}
+
+	buf := make([]byte, maxFrameSize)
+	for {
+		if len(pending) == 0 {
+			return nil
+		}
+		if err := p.udpConn.SetReadDeadline(udpDeadline(ctx)); err != nil {
+			return err
+		}
+		n, remote, err := p.udpConn.ReadFrom(buf)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return err
+		}
+		pendingID := pendingDestinationForRemote(pending, remote)
+		if pendingID == "" {
+			continue
+		}
+		f, err := decodeFrame(buf[:n])
+		if err != nil {
+			p.metrics.incFramesDropped(1)
+			p.metrics.incProtocolErrors()
+			continue
+		}
+		p.metrics.incFramesReceived(1)
+		switch f.typ {
+		case frameHello:
+			hello, err := decodeHelloPayload(f.payload)
+			if err != nil {
+				p.metrics.incFramesDropped(1)
+				p.metrics.incProtocolErrors()
+				return err
+			}
+			if hello.minVersion > frameVersion || hello.maxVersion < frameVersion {
+				p.metrics.incFramesDropped(1)
+				p.metrics.incProtocolErrors()
+				return &ProtocolError{Code: uint16(protocolErrorUnsupportedVersion), Message: "peer does not support protocol version"}
+			}
+			p.recordUDPDestinationSetupLocked(pendingID, remote, time.Now())
+			delete(pending, pendingID)
+		case frameError:
+			p.metrics.incProtocolErrors()
+			return decodeProtocolError(f.payload)
+		default:
+			p.metrics.incFramesDropped(1)
+		}
+	}
+}
+
 func (p *Publication) readUDPResponses(ctx context.Context, appendResult termAppend, seq uint64, destinations []net.Addr, sentAt time.Time) (int, error) {
 	buf := make([]byte, maxFrameSize)
 	pending := make(map[string]udpPendingDestination, len(destinations))
@@ -530,10 +666,7 @@ func (p *Publication) readUDPResponses(ctx context.Context, appendResult termApp
 			return acks, err
 		}
 		remoteID := remoteAddrString(remote)
-		pendingID := remoteID
-		if _, ok := pending[pendingID]; !ok {
-			pendingID = pendingMulticastDestinationForRemote(pending, remote)
-		}
+		pendingID := pendingDestinationForRemote(pending, remote)
 		if pendingID == "" {
 			continue
 		}
@@ -559,7 +692,8 @@ func (p *Publication) readUDPResponses(ctx context.Context, appendResult termApp
 				p.metrics.incProtocolErrors()
 				return acks, err
 			}
-			statusApplied[remoteID] = true
+			p.recordUDPDestinationStatusLocked(pendingID, remote, seq, time.Now())
+			statusApplied[pendingID] = true
 			continue
 		case frameAck:
 			if f.streamID != p.streamID || f.sessionID != p.sessionID {
@@ -576,7 +710,7 @@ func (p *Publication) readUDPResponses(ctx context.Context, appendResult termApp
 				p.metrics.incProtocolErrors()
 				continue
 			}
-			if !statusApplied[remoteID] {
+			if !statusApplied[pendingID] {
 				if err := p.updateFlowControlStatus(FlowControlStatus{
 					ReceiverID:   remoteID,
 					Position:     appendResult.Position,
@@ -586,13 +720,15 @@ func (p *Publication) readUDPResponses(ctx context.Context, appendResult termApp
 					return acks, err
 				}
 			}
+			rtt := time.Since(sentAt)
+			p.recordUDPDestinationAckLocked(pendingID, remote, seq, rtt, time.Now())
 			delete(pending, pendingID)
 			acks++
 			p.observeTransportFeedback(TransportFeedback{
 				Transport: TransportUDP,
 				Remote:    remoteID,
 				Sequence:  seq,
-				RTT:       time.Since(sentAt),
+				RTT:       rtt,
 			})
 			continue
 		case frameError:
@@ -625,6 +761,22 @@ func (p *Publication) readUDPResponses(ctx context.Context, appendResult termApp
 			continue
 		}
 	}
+}
+
+func pendingDestinationForRemote(pending map[string]udpPendingDestination, remote net.Addr) string {
+	remoteID := remoteAddrString(remote)
+	if _, ok := pending[remoteID]; ok {
+		return remoteID
+	}
+	for id, destination := range pending {
+		if destination.multicast {
+			continue
+		}
+		if remoteAddrString(destination.addr) == remoteID {
+			return id
+		}
+	}
+	return pendingMulticastDestinationForRemote(pending, remote)
 }
 
 func pendingMulticastDestinationForRemote(pending map[string]udpPendingDestination, remote net.Addr) string {
@@ -728,6 +880,7 @@ func (p *Publication) applyUDPNak(remote net.Addr, f frame) error {
 		if err := p.writeUDPDatagrams(remote, entry.datagrams); err != nil {
 			return err
 		}
+		p.recordUDPDestinationRetransmitLocked("", remote, seq, len(entry.datagrams), time.Now())
 		p.metrics.incRetransmits(len(entry.datagrams))
 		p.observeTransportFeedback(TransportFeedback{
 			Transport:           TransportUDP,
@@ -737,6 +890,102 @@ func (p *Publication) applyUDPNak(remote net.Addr, f frame) error {
 		})
 	}
 	return nil
+}
+
+func (p *Publication) recordUDPDestinationSetupLocked(destinationID string, remote net.Addr, now time.Time) {
+	destination := p.udpDestinationForFeedbackLocked(destinationID, remote)
+	if destination == nil {
+		return
+	}
+	destination.lastSetupAt = now
+	destination.lastFeedbackAt = now
+}
+
+func (p *Publication) recordUDPDestinationStatusLocked(destinationID string, remote net.Addr, seq uint64, now time.Time) {
+	destination := p.udpDestinationForFeedbackLocked(destinationID, remote)
+	if destination == nil {
+		return
+	}
+	destination.lastStatusAt = now
+	destination.lastFeedbackAt = now
+	destination.lastSequence = seq
+}
+
+func (p *Publication) recordUDPDestinationAckLocked(destinationID string, remote net.Addr, seq uint64, rtt time.Duration, now time.Time) {
+	destination := p.udpDestinationForFeedbackLocked(destinationID, remote)
+	if destination == nil {
+		return
+	}
+	destination.lastAckAt = now
+	destination.lastFeedbackAt = now
+	destination.lastSequence = seq
+	destination.lastRTT = rtt
+}
+
+func (p *Publication) recordUDPDestinationRetransmitLocked(destinationID string, remote net.Addr, seq uint64, frames int, now time.Time) {
+	destination := p.udpDestinationForFeedbackLocked(destinationID, remote)
+	if destination == nil {
+		return
+	}
+	destination.lastFeedbackAt = now
+	destination.lastSequence = seq
+	destination.retransmittedFrames += frames
+}
+
+func (p *Publication) udpDestinationForFeedbackLocked(destinationID string, remote net.Addr) *udpDestination {
+	if destinationID != "" {
+		if destination := p.udpDestinations[destinationID]; destination != nil {
+			return destination
+		}
+	}
+	remoteID := remoteAddrString(remote)
+	for _, destination := range p.udpDestinations {
+		if destination != nil && remoteAddrString(destination.addr) == remoteID {
+			return destination
+		}
+	}
+	return nil
+}
+
+func (d *udpDestination) needsSetup(now time.Time, receiverTimeout time.Duration) bool {
+	if receiverTimeout <= 0 {
+		receiverTimeout = defaultFlowControlReceiverTimeout
+	}
+	if d.lastSetupAt.IsZero() {
+		return true
+	}
+	lastFeedbackAt := d.lastFeedbackAt
+	if lastFeedbackAt.IsZero() {
+		lastFeedbackAt = d.lastSetupAt
+	}
+	return now.Sub(lastFeedbackAt) > receiverTimeout
+}
+
+func (d *udpDestination) status(now time.Time, receiverTimeout time.Duration) UDPDestinationStatus {
+	if receiverTimeout <= 0 {
+		receiverTimeout = defaultFlowControlReceiverTimeout
+	}
+	lastFeedbackAt := d.lastFeedbackAt
+	if lastFeedbackAt.IsZero() {
+		if d.lastAckAt.After(d.lastStatusAt) {
+			lastFeedbackAt = d.lastAckAt
+		} else {
+			lastFeedbackAt = d.lastStatusAt
+		}
+	}
+	active := !lastFeedbackAt.IsZero() && now.Sub(lastFeedbackAt) <= receiverTimeout
+	return UDPDestinationStatus{
+		Endpoint:            d.endpoint,
+		Remote:              remoteAddrString(d.addr),
+		Active:              active,
+		LastSetupAt:         d.lastSetupAt,
+		LastStatusAt:        d.lastStatusAt,
+		LastAckAt:           d.lastAckAt,
+		LastFeedbackAt:      lastFeedbackAt,
+		LastSequence:        d.lastSequence,
+		LastRTT:             d.lastRTT,
+		RetransmittedFrames: d.retransmittedFrames,
+	}
 }
 
 func (s *Subscription) serveUDP(ctx context.Context, handler Handler) error {

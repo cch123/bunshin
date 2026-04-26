@@ -50,6 +50,19 @@ type TransportFeedback struct {
 
 type TransportFeedbackHandler func(TransportFeedback)
 
+type UDPDestinationStatus struct {
+	Endpoint            string        `json:"endpoint"`
+	Remote              string        `json:"remote"`
+	Active              bool          `json:"active"`
+	LastSetupAt         time.Time     `json:"last_setup_at,omitempty"`
+	LastStatusAt        time.Time     `json:"last_status_at,omitempty"`
+	LastAckAt           time.Time     `json:"last_ack_at,omitempty"`
+	LastFeedbackAt      time.Time     `json:"last_feedback_at,omitempty"`
+	LastSequence        uint64        `json:"last_sequence,omitempty"`
+	LastRTT             time.Duration `json:"last_rtt,omitempty"`
+	RetransmittedFrames int           `json:"retransmitted_frames,omitempty"`
+}
+
 type PublicationConfig struct {
 	Transport                 TransportMode
 	StreamID                  uint32
@@ -58,6 +71,7 @@ type PublicationConfig struct {
 	UDPDestinations           []string
 	UDPMulticastInterface     string
 	UDPNameResolutionInterval time.Duration
+	UDPReceiverTimeout        time.Duration
 	MaxPayloadBytes           int
 	MTUBytes                  int
 	UDPRetransmitBufferBytes  int
@@ -95,6 +109,7 @@ type Publication struct {
 	udpMulticastInterface     string
 	udpNameResolutionInterval time.Duration
 	udpNextNameResolution     time.Time
+	udpReceiverTimeout        time.Duration
 	udpMu                     sync.Mutex
 	udpRetransmit             map[uint64]udpRetransmitEntry
 	udpRetransmitOrder        []uint64
@@ -173,6 +188,7 @@ func DialPublication(cfg PublicationConfig) (*Publication, error) {
 			udpDestinationOrder:       destinationOrder,
 			udpMulticastInterface:     cfg.UDPMulticastInterface,
 			udpNameResolutionInterval: cfg.UDPNameResolutionInterval,
+			udpReceiverTimeout:        cfg.UDPReceiverTimeout,
 			udpRetransmit:             make(map[uint64]udpRetransmitEntry),
 			udpRetransmitLimit:        cfg.UDPRetransmitBufferBytes,
 			metrics:                   cfg.Metrics,

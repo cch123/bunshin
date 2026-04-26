@@ -60,3 +60,49 @@ func TestMinMulticastFlowControlUsesSlowestTrackedReceiver(t *testing.T) {
 		t.Fatalf("limit after receiver timeout = %d, want 100", limit)
 	}
 }
+
+func TestPreferredMulticastFlowControlUsesPreferredReceivers(t *testing.T) {
+	now := time.Unix(1, 0)
+	flow := NewPreferredMulticastFlowControl(time.Second, "preferred")
+
+	limit := flow.OnStatus(FlowControlStatus{
+		ReceiverID:   "ordinary",
+		Position:     100,
+		WindowLength: 50,
+		ObservedAt:   now,
+	}, 64)
+	if limit != 150 {
+		t.Fatalf("limit after ordinary receiver = %d, want 150", limit)
+	}
+	limit = flow.OnStatus(FlowControlStatus{
+		ReceiverID:   "preferred",
+		Position:     80,
+		WindowLength: 20,
+		ObservedAt:   now,
+	}, limit)
+	if limit != 100 {
+		t.Fatalf("limit after preferred receiver = %d, want 100", limit)
+	}
+	limit = flow.OnStatus(FlowControlStatus{
+		ReceiverID:   "ordinary",
+		Position:     40,
+		WindowLength: 10,
+		ObservedAt:   now,
+	}, limit)
+	if limit != 100 {
+		t.Fatalf("preferred receiver did not retain priority: limit=%d want 100", limit)
+	}
+	limit = flow.OnIdle(now.Add(2*time.Second), limit, 150)
+	if limit != 100 {
+		t.Fatalf("limit after preferred timeout = %d, want 100", limit)
+	}
+	limit = flow.OnStatus(FlowControlStatus{
+		ReceiverID:   "ordinary",
+		Position:     60,
+		WindowLength: 10,
+		ObservedAt:   now.Add(3 * time.Second),
+	}, limit)
+	if limit != 70 {
+		t.Fatalf("limit after preferred receiver timed out = %d, want 70", limit)
+	}
+}

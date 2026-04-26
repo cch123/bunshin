@@ -65,6 +65,9 @@ func TestPublicationConfigNormalizeUDPDefaults(t *testing.T) {
 	if cfg.UDPRetransmitBufferBytes != defaultUDPRetransmitBufferBytes {
 		t.Fatalf("udp retransmit buffer = %d, want %d", cfg.UDPRetransmitBufferBytes, defaultUDPRetransmitBufferBytes)
 	}
+	if cfg.UDPReceiverTimeout != defaultFlowControlReceiverTimeout {
+		t.Fatalf("udp receiver timeout = %s, want %s", cfg.UDPReceiverTimeout, defaultFlowControlReceiverTimeout)
+	}
 }
 
 func TestPublicationConfigNormalizeResponseChannel(t *testing.T) {
@@ -117,6 +120,7 @@ func TestPublicationConfigValidateRejectsInvalidValues(t *testing.T) {
 		{name: "negative retransmit", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", RetransmitEvery: -time.Nanosecond}},
 		{name: "negative udp retransmit buffer", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", UDPRetransmitBufferBytes: -1}},
 		{name: "negative udp name resolution interval", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", UDPNameResolutionInterval: -time.Nanosecond}},
+		{name: "negative udp receiver timeout", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", UDPReceiverTimeout: -time.Nanosecond}},
 		{name: "small mtu", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MTUBytes: headerLen}},
 		{name: "large mtu", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MTUBytes: maxFrameSize + 1}},
 		{name: "negative max payload", cfg: PublicationConfig{RemoteAddr: "127.0.0.1:1", MaxPayloadBytes: -1}},

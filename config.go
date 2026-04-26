@@ -53,6 +53,9 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 	if cfg.UDPNameResolutionInterval < 0 {
 		return normalizedPublicationConfig{}, invalidConfigf("invalid UDP name resolution interval: %s", cfg.UDPNameResolutionInterval)
 	}
+	if cfg.UDPReceiverTimeout < 0 {
+		return normalizedPublicationConfig{}, invalidConfigf("invalid UDP receiver timeout: %s", cfg.UDPReceiverTimeout)
+	}
 	if cfg.StreamID == 0 {
 		cfg.StreamID = defaultStreamID
 	}
@@ -64,6 +67,9 @@ func normalizePublicationConfig(cfg PublicationConfig) (normalizedPublicationCon
 	}
 	if cfg.UDPRetransmitBufferBytes == 0 && cfg.Transport == TransportUDP {
 		cfg.UDPRetransmitBufferBytes = defaultUDPRetransmitBufferBytes
+	}
+	if cfg.UDPReceiverTimeout == 0 && cfg.Transport == TransportUDP {
+		cfg.UDPReceiverTimeout = defaultFlowControlReceiverTimeout
 	}
 	if cfg.MTUBytes == 0 {
 		cfg.MTUBytes = maxFrameSize

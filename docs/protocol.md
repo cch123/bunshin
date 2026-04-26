@@ -174,15 +174,17 @@ For UDP multi-destination sends, a spy can observe any active destination it mat
 
 `PublicationConfig.FlowControl` can provide a sender flow-control strategy. If unset, Bunshin uses `UnicastFlowControl`, which follows Aeron's default unicast behavior of advancing the sender limit to the maximum receiver right edge.
 
-`MaxMulticastFlowControl` applies the same max-right-edge rule for multicast-style receiver sets. `MinMulticastFlowControl` tracks receiver right edges and uses the slowest active receiver until that receiver times out. QUIC publications currently have one remote endpoint. UDP publications can send to multiple unicast destinations or a multicast group, so these strategies can track multiple receiver right edges.
+`MaxMulticastFlowControl` applies the same max-right-edge rule for multicast-style receiver sets. `MinMulticastFlowControl` tracks receiver right edges and uses the slowest active receiver until that receiver times out. `PreferredMulticastFlowControl` gives a configured receiver ID set priority; if any preferred receiver is active, the sender limit is based on the slowest preferred receiver, otherwise it falls back to the slowest active receiver. QUIC publications currently have one remote endpoint. UDP publications can send to multiple unicast destinations or a multicast group, so these strategies can track multiple receiver right edges.
 
 ## UDP Destinations
 
-`PublicationConfig.RemoteAddr` supplies the initial UDP destination. `PublicationConfig.UDPDestinations` can add more destinations at dial time. Channel URIs can also carry repeated `destination=` parameters, and `ChannelURI.PublicationConfig` maps them into the UDP destination list. `Publication.AddDestination`, `Publication.RemoveDestination`, and `Publication.Destinations` manage the active destination set after dial.
+`PublicationConfig.RemoteAddr` supplies the initial UDP destination. `PublicationConfig.UDPDestinations` can add more destinations at dial time. Channel URIs can also carry repeated `destination=` parameters, and `ChannelURI.PublicationConfig` maps them into the UDP destination list. This covers manual MDC configuration. `Publication.AddDestination`, `Publication.RemoveDestination`, and `Publication.Destinations` provide dynamic MDC control after dial.
 
-Each UDP `Send` writes the DATA datagrams to every active destination and waits for each destination to ACK the sequence. STATUS frames are applied independently per receiver ID, so multicast-oriented flow-control strategies can track multiple receiver right edges.
+Each UDP `Send` first ensures that each destination has a fresh setup handshake. A publication sends a `HELLO` datagram before the first DATA for a destination and refreshes that setup after the destination has been silent longer than `PublicationConfig.UDPReceiverTimeout`. Setup frames do not consume DATA sequence numbers. After setup, the send writes the DATA datagrams to every active destination and waits for each destination to ACK the sequence. STATUS frames are applied independently per receiver ID, so multicast-oriented flow-control strategies can track multiple receiver right edges.
 
 UDP publications preserve the configured destination endpoint strings separately from the current resolved UDP addresses. `Publication.ReResolveDestinations` refreshes all destination addresses on demand. `PublicationConfig.UDPNameResolutionInterval` refreshes them before sends when the interval has elapsed, and channel URIs can set the same behavior with `name-resolution-interval=10s`. `Publication.DestinationEndpoints` returns the configured endpoint strings; `Publication.Destinations` returns the current resolved addresses.
+
+`Publication.DestinationStatuses` returns a liveness snapshot for each active UDP destination: configured endpoint, resolved remote address, active flag, last setup time, last STATUS time, last ACK time, last feedback time, last sequence, last RTT, and retransmitted frame count. `PublicationConfig.UDPReceiverTimeout` controls how long a destination remains active after feedback; it defaults to the same timeout used by multicast flow-control receiver tracking.
 
 UDP channel endpoints may use wildcard ports such as `endpoint=127.0.0.1:0`. After a subscription binds, `Subscription.ChannelURI` reports the concrete bound endpoint with the actual port. `Publication.ChannelURI` reports the configured publication endpoint, dynamic destinations, and name-resolution interval.
 
@@ -227,7 +229,7 @@ Duplicate or late sequences that have already been delivered are ACKed without i
 
 ## Negotiation
 
-QUIC publications send a `HELLO` frame before the first `DATA` frame. UDP subscriptions can answer `HELLO` datagrams, but the UDP publication fast path currently sends DATA directly. The HELLO payload is two bytes:
+QUIC publications send a `HELLO` frame before the first `DATA` frame. UDP publications send a `HELLO` datagram before the first `DATA` datagram for each destination and refresh it when the destination has been silent past the configured receiver timeout. The HELLO payload is two bytes:
 
 | Offset | Size | Type | Field | Description |
 | --- | ---: | --- | --- | --- |
