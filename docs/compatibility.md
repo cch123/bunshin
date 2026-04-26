@@ -46,9 +46,11 @@ Known gaps versus a mature Aeron-style stack:
 - Bunshin does not implement Aeron wire protocol, Aeron CnC files, Aeron Archive protocol, or Aeron Cluster protocol.
 - Bunshin does not expose Aeron client APIs or guarantee behavior parity with Aeron tools.
 - External driver subscriptions are polled by out-of-process clients through per-subscription mmap shared images. The legacy data-ring status fields remain as compatibility aliases for the same mapped image state.
+- External driver publications still send payloads through IPC commands. Promoting that path to client-writable mmap log buffers remains a future Aeron-semantic parity task.
+- Bunshin's mmap term buffers and subscription shared images do not yet provide the full Aeron `LogBuffers`/`Image` lifecycle, fragment/block/raw polling, unblock, and position-counter semantics.
 - QUIC is the default reliable transport. The UDP backend has Bunshin-native setup, status, NAK repair with optional retry, RTT feedback, sender endpoint diagnostics, receiver peer diagnostics, receiver-image rebuild tracking, and optional AIMD congestion-window policy, but it is not a full Aeron congestion-control implementation.
 - Bunshin Archive records delivered Bunshin messages and metadata. It does not yet record raw Aeron-style image fragments or expose SBE control and recording-event streams.
-- Bunshin Cluster uses Bunshin-native remote member transport and quorum gating. It does not yet provide Aeron Cluster protocol compatibility or automatic backup promotion.
+- Bunshin Cluster uses Bunshin-native remote member transport and quorum gating. It does not yet provide Aeron Cluster protocol compatibility, automated backup promotion, or complete external client redirect/failover behavior.
 - Tooling reads Bunshin JSON reports and native catalogs, not Aeron CnC, catalog, SBE, AeronStat, LossStat, ArchiveTool, or ClusterTool formats. Adapter projects must explicitly map Bunshin JSON files into Aeron-shaped output if that is desired.
 - Performance tuning, runtime pinning, socket tuning, and capacity planning still require environment-specific benchmark runs.
 

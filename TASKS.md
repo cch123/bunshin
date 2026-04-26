@@ -171,6 +171,17 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 These tasks are beyond the current Bunshin-native roadmap. They are required only if Bunshin should move closer to Aeron runtime semantics. They do not imply Aeron wire, API, file, or tool compatibility unless a task explicitly calls for an adapter.
 
 - [ ] Keep `docs/aeron-parity.md` current as the source of truth for Aeron semantic parity gaps.
+- [ ] Promote external-driver publication sends from IPC payload commands onto client-writable mmap log buffers with driver-owned position and back-pressure metadata.
+- [ ] Turn driver-managed publication term buffers into the actual cross-process publication data path, including claim/commit visibility, producer positions, and cleanup semantics.
+- [ ] Deepen subscription shared images into Aeron-style image/log-buffer lifecycle with fragment, block, and raw polling, position counters, image availability/unavailability, and unblock diagnostics.
+- [ ] Run production-like UDP validation for loss, fanout, receiver lag, and congestion-window behavior, then tune defaults from measured results.
+- [ ] Decide whether to add a fuller Aeron-style UDP congestion-control implementation or keep AIMD as the Bunshin-native policy boundary.
+- [ ] Move archive recording ownership closer to driver-managed subscription images and record richer source-image metadata in recording descriptors.
+- [ ] Add richer archive source/destination session management for replication and replay merge, including live-image cutover diagnostics.
+- [ ] Add automated cluster backup promotion plus leader redirect and failover behavior for external cluster clients.
+- [ ] Tie membership runtime hooks into a full automated cluster control plane with remote catch-up validation and operator commands.
+- [ ] Add Bunshin-native operational views equivalent to the missing AeronStat, LossStat, ArchiveTool, and ClusterTool workflows, or define explicit adapters.
+- [ ] Run production-like parity benchmarks and document capacity envelopes for QUIC, UDP, IPC rings, and mmap shared images.
 - [x] Add IPC-backed external-driver subscription polling so out-of-process clients can consume driver-owned subscriptions without embeddable callbacks.
 - [x] Add IPC-backed external-driver controlled polling with break and abort semantics.
 - [x] Expose external-driver subscription images, lag reports, and loss reports from driver snapshots.
