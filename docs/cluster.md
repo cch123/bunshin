@@ -37,6 +37,14 @@ egress, err := client.Send(ctx, []byte("increment"))
 fmt.Println(egress.LogPosition, egress.CorrelationID, string(egress.Payload))
 ```
 
+`NewClient` keeps the direct one-request path. To let concurrent `Send` calls coalesce into quorum batches, open the client with `NewClientWithConfig`:
+
+```go
+client, err := node.NewClientWithConfig(ctx, bunshin.DefaultClusterClientConfig())
+```
+
+The default batch config uses `MaxBatchSize: 128` and `MaxBatchDelay: 50 * time.Microsecond`. The batcher first drains requests already queued by concurrent callers, flushes immediately when `MaxBatchSize` is reached, and otherwise waits at most `MaxBatchDelay` before submitting a partial batch. Set `MaxBatchSize` to `1` or use a zero-value `ClusterClientConfig` to keep batching disabled.
+
 Applications can also submit an explicit `ClusterIngress` when they own session and correlation allocation.
 
 ## Authentication And Authorization
@@ -112,7 +120,7 @@ Existing matching entries in a member log count as acknowledgements. This makes 
 
 ## Remote Member Transport
 
-`ListenClusterMemberTransport` exposes a running node over a Bunshin-native JSON/TCP request-response protocol. `DialClusterMember` returns a `ClusterMemberClient` that implements `ClusterLog` and `ClusterSnapshotStore`, and also supports remote ingress/egress through `Submit`.
+`ListenClusterMemberTransport` exposes a running node over a Bunshin-native Protobuf request-response protocol. The schema is documented in `docs/cluster-member.proto`. The default member transport is QUIC through `quic-go`; set `Network: "tcp"` explicitly to use the compatibility TCP path. `DialClusterMember` returns a `ClusterMemberClient` that implements `ClusterLog` and `ClusterSnapshotStore`, and also supports remote ingress/egress through `Submit`.
 
 ```go
 server, err := bunshin.ListenClusterMemberTransport(ctx, leader, bunshin.ClusterMemberTransportConfig{

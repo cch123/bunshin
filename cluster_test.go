@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestSingleNodeClusterSequencesIngressIntoLog(t *testing.T) {
@@ -44,6 +46,148 @@ func TestSingleNodeClusterSequencesIngressIntoLog(t *testing.T) {
 	}
 	if snapshot.Role != ClusterRoleLeader || snapshot.LastPosition != 1 {
 		t.Fatalf("unexpected node snapshot: %#v", snapshot)
+	}
+}
+
+func TestClusterClientSendBatchSequencesIngressIntoLog(t *testing.T) {
+	var delivered []ClusterMessage
+	node, err := StartClusterNode(context.Background(), ClusterConfig{
+		DisableTimerLoop: true,
+		Service: ClusterHandler(func(_ context.Context, msg ClusterMessage) ([]byte, error) {
+			delivered = append(delivered, msg)
+			return append([]byte("ack:"), msg.Payload...), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close(context.Background())
+
+	client, err := node.NewClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	egresses, err := client.SendBatch(context.Background(), [][]byte{
+		[]byte("one"),
+		[]byte("two"),
+		[]byte("three"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(egresses) != 3 || egresses[0].LogPosition != 1 || egresses[1].LogPosition != 2 ||
+		egresses[2].LogPosition != 3 || string(egresses[0].Payload) != "ack:one" ||
+		string(egresses[1].Payload) != "ack:two" || string(egresses[2].Payload) != "ack:three" {
+		t.Fatalf("unexpected batch egresses: %#v", egresses)
+	}
+	if len(delivered) != 3 || delivered[0].LogPosition != 1 || delivered[1].LogPosition != 2 ||
+		delivered[2].LogPosition != 3 || delivered[0].CorrelationID != 1 ||
+		delivered[1].CorrelationID != 2 || delivered[2].CorrelationID != 3 {
+		t.Fatalf("unexpected delivered batch: %#v", delivered)
+	}
+}
+
+func TestClusterClientAutoBatchQuorumIngress(t *testing.T) {
+	memberLog := &recordingClusterQuorumLog{ClusterLog: NewInMemoryClusterLog()}
+	node, err := StartClusterNode(context.Background(), ClusterConfig{
+		NodeID:            1,
+		Mode:              ClusterModeAppointedLeader,
+		AppointedLeaderID: 1,
+		DisableTimerLoop:  true,
+		Service: ClusterHandler(func(context.Context, ClusterMessage) ([]byte, error) {
+			return nil, nil
+		}),
+		Quorum: &ClusterQuorumConfig{
+			MemberLogs:  []ClusterLog{memberLog},
+			RequiredAck: 2,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close(context.Background())
+
+	client, err := node.NewClientWithConfig(context.Background(), ClusterClientConfig{
+		MaxBatchSize:  3,
+		MaxBatchDelay: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func(i int) {
+			<-start
+			egress, err := client.Send(context.Background(), []byte{byte('a' + i)})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if egress.LogPosition < 1 || egress.LogPosition > 3 {
+				errs <- errors.New("unexpected auto-batch log position")
+				return
+			}
+			errs <- nil
+		}(i)
+	}
+	close(start)
+	for i := 0; i < 3; i++ {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for auto-batched sends")
+		}
+	}
+
+	memberLog.mu.Lock()
+	batchSizes := append([]int(nil), memberLog.batchSizes...)
+	memberLog.mu.Unlock()
+	if len(batchSizes) != 1 || batchSizes[0] != 3 {
+		t.Fatalf("unexpected auto-batch quorum sizes: %#v", batchSizes)
+	}
+}
+
+func TestClusterClientAutoBatchMaxDelayFlushesPartialBatch(t *testing.T) {
+	memberLog := &recordingClusterQuorumLog{ClusterLog: NewInMemoryClusterLog()}
+	node, err := StartClusterNode(context.Background(), ClusterConfig{
+		NodeID:            1,
+		Mode:              ClusterModeAppointedLeader,
+		AppointedLeaderID: 1,
+		DisableTimerLoop:  true,
+		Service: ClusterHandler(func(context.Context, ClusterMessage) ([]byte, error) {
+			return nil, nil
+		}),
+		Quorum: &ClusterQuorumConfig{
+			MemberLogs:  []ClusterLog{memberLog},
+			RequiredAck: 2,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close(context.Background())
+
+	client, err := node.NewClientWithConfig(context.Background(), ClusterClientConfig{
+		MaxBatchSize:  3,
+		MaxBatchDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Send(context.Background(), []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+
+	memberLog.mu.Lock()
+	batchSizes := append([]int(nil), memberLog.batchSizes...)
+	memberLog.mu.Unlock()
+	if len(batchSizes) != 1 || batchSizes[0] != 1 {
+		t.Fatalf("unexpected max-delay batch sizes: %#v", batchSizes)
 	}
 }
 
@@ -285,10 +429,29 @@ type recordingClusterService struct {
 }
 
 type snapshotCounterService struct {
+	mu                     sync.Mutex
 	value                  uint64
 	replayed               int
 	loadedSnapshotPosition int64
 	startContext           ClusterServiceContext
+}
+
+type recordingClusterQuorumLog struct {
+	ClusterLog
+	mu         sync.Mutex
+	batchSizes []int
+}
+
+func (l *recordingClusterQuorumLog) AppendQuorumBatch(ctx context.Context, entries []ClusterLogEntry) error {
+	l.mu.Lock()
+	l.batchSizes = append(l.batchSizes, len(entries))
+	l.mu.Unlock()
+	for _, entry := range entries {
+		if _, err := l.ClusterLog.Append(ctx, entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *snapshotCounterService) OnClusterStart(_ context.Context, ctx ClusterServiceContext) error {
@@ -301,6 +464,8 @@ func (s *snapshotCounterService) OnClusterStop(context.Context, ClusterServiceCo
 }
 
 func (s *snapshotCounterService) OnClusterMessage(_ context.Context, msg ClusterMessage) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if msg.Replay {
 		s.replayed++
 	}
@@ -313,15 +478,25 @@ func (s *snapshotCounterService) OnClusterMessage(_ context.Context, msg Cluster
 }
 
 func (s *snapshotCounterService) SnapshotClusterState(context.Context, ClusterServiceContext) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	payload := make([]byte, 8)
 	binary.BigEndian.PutUint64(payload, s.value)
 	return payload, nil
 }
 
 func (s *snapshotCounterService) LoadClusterSnapshot(_ context.Context, snapshot ClusterStateSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.loadedSnapshotPosition = snapshot.Position
 	s.value = binary.BigEndian.Uint64(snapshot.Payload)
 	return nil
+}
+
+func (s *snapshotCounterService) currentValue() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.value
 }
 
 func (s *recordingClusterService) OnClusterStart(_ context.Context, ctx ClusterServiceContext) error {

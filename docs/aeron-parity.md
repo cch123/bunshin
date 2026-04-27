@@ -20,8 +20,8 @@ The remaining gaps are mostly semantic depth, not just missing names. Aeron beha
 | Archive recording | Aeron Archive records selected subscription images as-is, preserving Aeron data stream format in segment files. | Bunshin can record delivered messages or raw Bunshin DATA frames after ordered delivery, using a Bunshin archive record header. | Add richer descriptor metadata for source image state and continue moving recording ownership toward driver-managed image state. |
 | Archive control | Aeron Archive uses SBE control request, response, recording event, and recording signal streams with correlation IDs and control sessions. | Bunshin has an in-process typed control server plus a Bunshin-native JSON control protocol with correlation IDs, control sessions, replay events, and recording event streams. | Decide whether an Aeron SBE adapter is a goal; otherwise keep the JSON protocol as the explicit Bunshin-native boundary. |
 | Archive replay and replication | Aeron replay supports recording ID, position, bounded length, open-ended replay, live replay merge, and replication that can follow a live source. | Bunshin replays from position, supports replay merge, replicates stopped recordings, and can follow an active recording through recording-event-driven live replication. | Deepen source/destination archive session management and tie replay merge more directly to live image state. |
-| Cluster consensus | Aeron Cluster uses a strong leader, majority durable recording before service consumption, leader elections, catch-up, and archive-backed log/snapshot recovery. | Bunshin has local leader modes, heartbeat/election state, remote `ClusterLog` transport for replication and quorum append, quorum commit gating before service delivery, archive-backed log/snapshot storage, learners, backup, and standby. | Add automated leader failover, member catch-up orchestration, and backup promotion over remote transport. |
-| Cluster ingress and egress | Aeron Cluster defines client ingress, egress, sessions, redirects, authentication, and SBE cluster protocol messages. | Bunshin has in-process ingress/egress clients, authentication, authorization hooks, and a Bunshin-native JSON/TCP member protocol for remote ingress/egress. | Add redirect/failover semantics for external cluster clients and decide whether an external cluster-client protocol should remain Bunshin-native or get an adapter. |
+| Cluster consensus | Aeron Cluster uses a strong leader, leadership terms, election ballots, majority durable recording before service consumption, catch-up, and archive-backed log/snapshot recovery. | Bunshin has local leader modes, heartbeat/election state, remote `ClusterLog` transport for replication and quorum append, quorum commit gating before service delivery, archive-backed log/snapshot storage, learners, backup, and standby. | Replace the heartbeat-only election path with Aeron-style canvass/nomination/ballot semantics, persist leadership-term/vote state, gate candidates by log position and catch-up status, and add automated leader failover, catch-up orchestration, and backup promotion over remote transport. |
+| Cluster ingress and egress | Aeron Cluster defines client ingress, egress, sessions, redirects, authentication, and SBE cluster protocol messages. | Bunshin has in-process ingress/egress clients, authentication, authorization hooks, and a Bunshin-native Protobuf-over-QUIC member protocol for remote ingress/egress. | Add redirect/failover semantics for external cluster clients and decide whether an external cluster-client protocol should remain Bunshin-native or get an adapter. |
 | Membership and upgrade | Aeron manages live cluster membership, elections, log catch-up, and operational cluster control. | Bunshin has membership-change and rolling-upgrade planners plus runtime application hooks for catch-up, leader transfer, upgrade, and validation. | Tie runtime hooks into a full automated cluster control plane with redirect/failover behavior. |
 | Tooling | Aeron ships AeronStat, LossStat, ArchiveTool, ClusterTool, event logging, and SBE-aware diagnostics. | Bunshin ships native CLI tools over JSON driver/archive/cluster state. | Add Bunshin equivalents for the missing operational views, and separately decide whether Aeron tool compatibility is a goal. |
 | Performance | Aeron is designed for low and predictable latency using tuned agents, direct buffers, SBE/Agrona, and extensive benchmark coverage. | Bunshin has Go benchmarks, QUIC/UDP/IPC parity baseline workloads, idle strategies, and profiling docs. | Run parity benchmarks regularly, add adapter rows if an Aeron-backed adapter is introduced, and use results to guide runtime pinning, allocation, GC, and socket-tuning work. |
@@ -32,9 +32,10 @@ The remaining gaps are mostly semantic depth, not just missing names. Aeron beha
 2. Promote external publication sends from IPC payload commands to client-writable mmap log buffers.
 3. Deepen driver images/log buffers into fuller fragment, block, raw polling, lifecycle, and position-counter semantics.
 4. Benchmark and tune the completed UDP transport semantics under realistic loss, fanout, receiver-lag, and congestion-window workloads.
-5. Add automated cluster failover, catch-up, redirect, and backup-promotion behavior over remote member transport.
-6. Move archive recording ownership closer to driver-managed image state and deepen replay/replication session management.
-7. Run the parity benchmark suite before choosing more low-level work or introducing any Aeron-backed adapter.
+5. Add Aeron-style cluster election first: canvass, nomination, ballot, leadership-term persistence, log-position-based candidate selection, follower term validation, and active-leader transition.
+6. Add automated cluster failover, catch-up, redirect, and backup-promotion behavior over remote member transport.
+7. Move archive recording ownership closer to driver-managed image state and deepen replay/replication session management.
+8. Run the parity benchmark suite before choosing more low-level work or introducing any Aeron-backed adapter.
 
 ## Execution Checklist
 
@@ -79,6 +80,16 @@ Use this list for incremental Aeron-semantic alignment work. Checked items can s
 - [x] Apply live cluster membership transitions instead of only producing plans.
 - [x] Add Aeron baseline benchmarks for QUIC, Bunshin UDP, IPC, and future adapters.
 - [x] Decide and document final non-goals for Aeron wire, API, file, and tool compatibility.
+- [ ] Replace the heartbeat-only local election path with Aeron-style canvass, nomination, ballot, leader transition, and termination states.
+- [ ] Persist leadership term, candidate/ballot vote state, and accepted leader state before responding to election or leadership messages.
+- [ ] Gate leadership candidacy on voting membership, durable log/recording position, snapshot recovery state, and catch-up status.
+- [ ] Carry election messages over the Protobuf-over-QUIC cluster member transport and reject stale-term or stale-position leaders.
+- [ ] Add new-leader recovery: catch up missing entries, replay deterministic service state to the committed position, and only then enter active leadership.
+- [ ] Add leadership-term fencing across ingress, timers, service messages, quorum append, replication, and control operations.
+- [ ] Add external client redirect, retry, and reconnect semantics for active-leader failover.
+- [ ] Automate standby/backup promotion as part of failover, including snapshot/log recovery and role transition validation.
+- [ ] Add split-brain, stale-term, stale-log, slow-catch-up, and simultaneous-candidate test coverage.
+- [ ] Add failover benchmarks for election duration, catch-up time, redirect latency, and post-failover throughput.
 - [ ] Promote external-driver publication sends from IPC payload commands onto client-writable mmap log buffers with driver-owned position and back-pressure metadata.
 - [ ] Turn driver-managed publication term buffers into the actual cross-process publication data path, including claim/commit visibility, producer positions, and cleanup semantics.
 - [ ] Deepen subscription shared images into Aeron-style image/log-buffer lifecycle with fragment, block, and raw polling, position counters, image availability/unavailability, and unblock diagnostics.

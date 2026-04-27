@@ -74,6 +74,20 @@ go test -run '^$' -bench 'Benchmark(PublicationSubscriptionMemoryProfile|Archive
 
 These report `gc-cycles`, `heap-delta-bytes`, and `total-alloc-bytes` in addition to Go's standard allocation metrics.
 
+Run cluster-mode ingress, replication catch-up, and latency benchmarks:
+
+```sh
+go test -run '^$' -bench '^BenchmarkCluster' -benchmem ./...
+```
+
+For more stable local comparisons, run multiple samples with a fixed benchmark duration:
+
+```sh
+go test -run '^$' -bench '^BenchmarkCluster' -benchmem -benchtime=1s -count=3 .
+```
+
+The cluster benchmarks report `msg/s`; the latency benchmark also reports `p50-ns`, `p95-ns`, `p99-ns`, `p999-ns`, and `max-ns`.
+
 ## Current Coverage
 
 - `BenchmarkPublicationSubscriptionSend` measures end-to-end publication/subscription throughput and allocations for 256-byte payloads over the default `quic-go` transport.
@@ -91,6 +105,11 @@ These report `gc-cycles`, `heap-delta-bytes`, and `total-alloc-bytes` in additio
 - `BenchmarkUDPMultiDestinationChurn` measures add/send/remove behavior for dynamic UDP destinations.
 - `BenchmarkArchiveReplay` and `BenchmarkArchiveReplayMerge` measure archive history replay and replay-merge delivery overhead.
 - `BenchmarkPublicationSubscriptionMemoryProfile`, `BenchmarkArchiveMemoryProfile`, and `BenchmarkMediaDriverMemoryProfile` report allocation and GC counters for the main messaging, archive, and embeddable driver loops.
+- `BenchmarkClusterIngress` measures single-node ingress, in-memory quorum ingress, QUIC remote ingress, and QUIC quorum append paths with 256-byte payloads.
+- `BenchmarkClusterBatchIngress` measures explicit QUIC quorum ingress batches at sizes 8, 32, 128, and 256.
+- `BenchmarkClusterAutoBatchIngress` measures concurrent `ClusterClient.Send` calls with `DefaultClusterClientConfig` (`MaxBatchSize=128`, `MaxBatchDelay=50us`).
+- `BenchmarkClusterReplicationCatchUp` measures follower catch-up from an in-memory source log and over the QUIC member transport.
+- `BenchmarkClusterIngressLatency` reports local single-node and QUIC remote ingress latency percentiles under benchmark load.
 
 ## Gaps
 

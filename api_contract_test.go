@@ -46,6 +46,7 @@ func TestPublicAPIContract(t *testing.T) {
 		ArchiveControlConfig{},
 		ArchiveControlProtocolConfig{},
 		ClusterConfig{},
+		ClusterClientConfig{},
 		ClusterLearnerConfig{},
 		ClusterReplicationConfig{},
 		ClusterElectionConfig{},

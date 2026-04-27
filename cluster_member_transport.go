@@ -1,19 +1,23 @@
 package bunshin
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 const (
 	ClusterMemberProtocolVersion         = 1
-	defaultClusterMemberTransportNetwork = "tcp"
+	clusterMemberTransportQUIC           = "quic"
+	defaultClusterMemberTransportNetwork = clusterMemberTransportQUIC
 	defaultClusterMemberTransportAddr    = "127.0.0.1:0"
 )
 
@@ -27,47 +31,67 @@ const (
 type ClusterMemberProtocolAction string
 
 const (
-	ClusterMemberActionAppendLog     ClusterMemberProtocolAction = "append_log"
-	ClusterMemberActionSnapshotLog   ClusterMemberProtocolAction = "snapshot_log"
-	ClusterMemberActionLastPosition  ClusterMemberProtocolAction = "last_position"
-	ClusterMemberActionSaveSnapshot  ClusterMemberProtocolAction = "save_snapshot"
-	ClusterMemberActionLoadSnapshot  ClusterMemberProtocolAction = "load_snapshot"
-	ClusterMemberActionTakeSnapshot  ClusterMemberProtocolAction = "take_snapshot"
-	ClusterMemberActionSubmitIngress ClusterMemberProtocolAction = "submit_ingress"
-	ClusterMemberActionDescribe      ClusterMemberProtocolAction = "describe"
+	ClusterMemberActionAppendLog          ClusterMemberProtocolAction = "append_log"
+	ClusterMemberActionAppendLogAck       ClusterMemberProtocolAction = "append_log_ack"
+	ClusterMemberActionAppendLogBatchAck  ClusterMemberProtocolAction = "append_log_batch_ack"
+	ClusterMemberActionSnapshotLog        ClusterMemberProtocolAction = "snapshot_log"
+	ClusterMemberActionLastPosition       ClusterMemberProtocolAction = "last_position"
+	ClusterMemberActionSaveSnapshot       ClusterMemberProtocolAction = "save_snapshot"
+	ClusterMemberActionLoadSnapshot       ClusterMemberProtocolAction = "load_snapshot"
+	ClusterMemberActionTakeSnapshot       ClusterMemberProtocolAction = "take_snapshot"
+	ClusterMemberActionSubmitIngress      ClusterMemberProtocolAction = "submit_ingress"
+	ClusterMemberActionSubmitIngressBatch ClusterMemberProtocolAction = "submit_ingress_batch"
+	ClusterMemberActionDescribe           ClusterMemberProtocolAction = "describe"
 )
 
 type ClusterMemberTransportConfig struct {
-	Network  string
-	Addr     string
-	Listener net.Listener
+	Network    string
+	Addr       string
+	Listener   net.Listener
+	TLSConfig  *tls.Config
+	QUICConfig *quic.Config
+	PacketConn net.PacketConn
 }
 
 type ClusterMemberClientConfig struct {
-	Network string
-	Addr    string
-	Conn    net.Conn
+	Network    string
+	Addr       string
+	Conn       net.Conn
+	TLSConfig  *tls.Config
+	QUICConfig *quic.Config
+	PacketConn net.PacketConn
 }
 
 type ClusterMemberTransportServer struct {
-	node     *ClusterNode
-	listener net.Listener
+	node         *ClusterNode
+	listener     net.Listener
+	quicListener *quic.Listener
+	transport    *quic.Transport
 
-	done  chan struct{}
-	once  sync.Once
-	wg    sync.WaitGroup
-	conns map[net.Conn]struct{}
-	mu    sync.Mutex
+	done      chan struct{}
+	once      sync.Once
+	wg        sync.WaitGroup
+	conns     map[net.Conn]struct{}
+	quicConns map[*quic.Conn]struct{}
+	mu        sync.Mutex
 }
 
 type ClusterMemberClient struct {
-	conn    net.Conn
-	encoder *json.Encoder
-	decoder *json.Decoder
+	stream    clusterMemberProtocolStream
+	conn      *quic.Conn
+	transport *quic.Transport
+	reader    *bufio.Reader
 
 	mu                sync.Mutex
 	nextCorrelationID uint64
 	closed            bool
+}
+
+type clusterMemberProtocolStream interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	SetDeadline(time.Time) error
 }
 
 type ClusterMemberProtocolMessage struct {
@@ -84,7 +108,9 @@ type ClusterMemberProtocolMessage struct {
 	Snapshot    ClusterStateSnapshot `json:"snapshot,omitempty"`
 	HasSnapshot bool                 `json:"has_snapshot,omitempty"`
 	Ingress     ClusterIngress       `json:"ingress,omitempty"`
+	Ingresses   []ClusterIngress     `json:"ingresses,omitempty"`
 	Egress      ClusterEgress        `json:"egress,omitempty"`
+	Egresses    []ClusterEgress      `json:"egresses,omitempty"`
 	Description ClusterDescription   `json:"description,omitempty"`
 }
 
@@ -96,31 +122,54 @@ func ListenClusterMemberTransport(ctx context.Context, node *ClusterNode, cfg Cl
 		ctx = context.Background()
 	}
 
-	listener := cfg.Listener
-	if listener == nil {
-		network := cfg.Network
-		if network == "" {
+	network := cfg.Network
+	if network == "" {
+		if cfg.Listener != nil {
+			network = "tcp"
+		} else {
 			network = defaultClusterMemberTransportNetwork
 		}
-		addr := cfg.Addr
-		if addr == "" {
-			addr = defaultClusterMemberTransportAddr
-		}
-		var err error
-		listener, err = net.Listen(network, addr)
-		if err != nil {
-			return nil, fmt.Errorf("listen cluster member transport: %w", err)
-		}
+	}
+	addr := cfg.Addr
+	if addr == "" {
+		addr = defaultClusterMemberTransportAddr
 	}
 
 	server := &ClusterMemberTransportServer{
-		node:     node,
-		listener: listener,
-		done:     make(chan struct{}),
-		conns:    make(map[net.Conn]struct{}),
+		node:      node,
+		done:      make(chan struct{}),
+		conns:     make(map[net.Conn]struct{}),
+		quicConns: make(map[*quic.Conn]struct{}),
 	}
-	server.wg.Add(1)
-	go server.acceptLoop(ctx)
+	if network == clusterMemberTransportQUIC {
+		if cfg.Listener != nil {
+			return nil, invalidConfigf("cluster member TCP listener cannot be used with QUIC transport")
+		}
+		tlsConf, err := clusterMemberServerTLSConfig(cfg.TLSConfig)
+		if err != nil {
+			return nil, err
+		}
+		listener, transport, err := listenQUIC(addr, tlsConf, cfg.QUICConfig, cfg.PacketConn)
+		if err != nil {
+			return nil, fmt.Errorf("listen cluster member quic transport: %w", err)
+		}
+		server.quicListener = listener
+		server.transport = transport
+		server.wg.Add(1)
+		go server.acceptQUICLoop(ctx)
+	} else {
+		listener := cfg.Listener
+		if listener == nil {
+			var err error
+			listener, err = net.Listen(network, addr)
+			if err != nil {
+				return nil, fmt.Errorf("listen cluster member transport: %w", err)
+			}
+		}
+		server.listener = listener
+		server.wg.Add(1)
+		go server.acceptLoop(ctx)
+	}
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -132,10 +181,16 @@ func ListenClusterMemberTransport(ctx context.Context, node *ClusterNode, cfg Cl
 }
 
 func (s *ClusterMemberTransportServer) Addr() net.Addr {
-	if s == nil || s.listener == nil {
+	if s == nil {
 		return nil
 	}
-	return s.listener.Addr()
+	if s.quicListener != nil {
+		return s.quicListener.Addr()
+	}
+	if s.listener != nil {
+		return s.listener.Addr()
+	}
+	return nil
 }
 
 func (s *ClusterMemberTransportServer) Close() error {
@@ -148,12 +203,21 @@ func (s *ClusterMemberTransportServer) Close() error {
 		if s.listener != nil {
 			err = errors.Join(err, s.listener.Close())
 		}
+		if s.quicListener != nil {
+			err = errors.Join(err, s.quicListener.Close())
+		}
 		s.mu.Lock()
 		for conn := range s.conns {
 			err = errors.Join(err, conn.Close())
 		}
+		for conn := range s.quicConns {
+			err = errors.Join(err, conn.CloseWithError(0, "closed"))
+		}
 		s.mu.Unlock()
 		s.wg.Wait()
+		if s.transport != nil {
+			err = errors.Join(err, s.transport.Close())
+		}
 	})
 	return err
 }
@@ -189,19 +253,64 @@ func (s *ClusterMemberTransportServer) serveConn(ctx context.Context, conn net.C
 		_ = conn.Close()
 	}()
 
-	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
+	s.serveProtocolStream(ctx, conn)
+}
+
+func (s *ClusterMemberTransportServer) acceptQUICLoop(ctx context.Context) {
+	defer s.wg.Done()
 	for {
-		var request ClusterMemberProtocolMessage
-		if err := decoder.Decode(&request); err != nil {
+		conn, err := s.quicListener.Accept(ctx)
+		if err != nil {
+			select {
+			case <-s.done:
+				return
+			case <-ctx.Done():
+				return
+			default:
+				return
+			}
+		}
+		s.mu.Lock()
+		s.quicConns[conn] = struct{}{}
+		s.mu.Unlock()
+		s.wg.Add(1)
+		go s.serveQUICConn(ctx, conn)
+	}
+}
+
+func (s *ClusterMemberTransportServer) serveQUICConn(ctx context.Context, conn *quic.Conn) {
+	defer s.wg.Done()
+	defer func() {
+		s.mu.Lock()
+		delete(s.quicConns, conn)
+		s.mu.Unlock()
+		_ = conn.CloseWithError(0, "closed")
+	}()
+
+	for {
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		s.serveProtocolStream(ctx, stream)
+	}
+}
+
+func (s *ClusterMemberTransportServer) serveProtocolStream(ctx context.Context, stream io.ReadWriteCloser) {
+	defer stream.Close()
+
+	reader := bufio.NewReader(stream)
+	for {
+		request, err := readClusterMemberProtocolMessage(reader)
+		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(ctx.Err(), context.Canceled) {
 				return
 			}
-			_ = encoder.Encode(clusterMemberProtocolError(0, err))
+			_ = writeClusterMemberProtocolMessage(stream, clusterMemberProtocolError(0, err))
 			return
 		}
 		response := s.handleRequest(ctx, request)
-		if err := encoder.Encode(response); err != nil {
+		if err := writeClusterMemberProtocolMessage(stream, response); err != nil {
 			return
 		}
 	}
@@ -226,6 +335,18 @@ func (s *ClusterMemberTransportServer) handleRequest(ctx context.Context, reques
 			return clusterMemberProtocolError(request.CorrelationID, err)
 		}
 		response.Entry = entry
+	case ClusterMemberActionAppendLogAck:
+		if err := appendClusterQuorumMember(ctx, s.node.log, request.Entry); err != nil {
+			return clusterMemberProtocolError(request.CorrelationID, err)
+		}
+		response.Position = request.Entry.Position
+	case ClusterMemberActionAppendLogBatchAck:
+		if err := appendClusterQuorumMemberBatch(ctx, s.node.log, request.Entries); err != nil {
+			return clusterMemberProtocolError(request.CorrelationID, err)
+		}
+		if len(request.Entries) > 0 {
+			response.Position = request.Entries[len(request.Entries)-1].Position
+		}
 	case ClusterMemberActionSnapshotLog:
 		entries, err := s.node.log.Snapshot(ctx)
 		if err != nil {
@@ -268,6 +389,12 @@ func (s *ClusterMemberTransportServer) handleRequest(ctx context.Context, reques
 			return clusterMemberProtocolError(request.CorrelationID, err)
 		}
 		response.Egress = egress
+	case ClusterMemberActionSubmitIngressBatch:
+		egresses, err := s.node.SubmitBatch(ctx, request.Ingresses)
+		if err != nil {
+			return clusterMemberProtocolError(request.CorrelationID, err)
+		}
+		response.Egresses = egresses
 	case ClusterMemberActionDescribe:
 		description, err := s.node.Describe(ctx)
 		if err != nil {
@@ -284,27 +411,48 @@ func DialClusterMember(ctx context.Context, cfg ClusterMemberClientConfig) (*Clu
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	conn := cfg.Conn
-	if conn == nil {
-		network := cfg.Network
-		if network == "" {
-			network = defaultClusterMemberTransportNetwork
-		}
-		if cfg.Addr == "" {
-			return nil, invalidConfigf("cluster member address is required")
-		}
-		var d net.Dialer
-		var err error
-		conn, err = d.DialContext(ctx, network, cfg.Addr)
-		if err != nil {
-			return nil, fmt.Errorf("dial cluster member transport: %w", err)
-		}
+	if cfg.Conn != nil {
+		return newClusterMemberClient(cfg.Conn, nil, nil), nil
 	}
+	network := cfg.Network
+	if network == "" {
+		network = defaultClusterMemberTransportNetwork
+	}
+	if cfg.Addr == "" {
+		return nil, invalidConfigf("cluster member address is required")
+	}
+	if network == clusterMemberTransportQUIC {
+		tlsConf := clusterMemberClientTLSConfig(cfg.TLSConfig)
+		conn, transport, err := dialQUIC(ctx, cfg.Addr, tlsConf, cfg.QUICConfig, cfg.PacketConn)
+		if err != nil {
+			return nil, fmt.Errorf("dial cluster member quic transport: %w", err)
+		}
+		stream, err := conn.OpenStreamSync(ctx)
+		if err != nil {
+			_ = conn.CloseWithError(0, "open stream failed")
+			if transport != nil {
+				_ = transport.Close()
+			}
+			return nil, fmt.Errorf("open cluster member quic stream: %w", err)
+		}
+		return newClusterMemberClient(stream, conn, transport), nil
+	}
+
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, network, cfg.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial cluster member transport: %w", err)
+	}
+	return newClusterMemberClient(conn, nil, nil), nil
+}
+
+func newClusterMemberClient(stream clusterMemberProtocolStream, conn *quic.Conn, transport *quic.Transport) *ClusterMemberClient {
 	return &ClusterMemberClient{
-		conn:    conn,
-		encoder: json.NewEncoder(conn),
-		decoder: json.NewDecoder(conn),
-	}, nil
+		stream:    stream,
+		conn:      conn,
+		transport: transport,
+		reader:    bufio.NewReader(stream),
+	}
 }
 
 func (c *ClusterMemberClient) Append(ctx context.Context, entry ClusterLogEntry) (ClusterLogEntry, error) {
@@ -315,6 +463,36 @@ func (c *ClusterMemberClient) Append(ctx context.Context, entry ClusterLogEntry)
 		return ClusterLogEntry{}, err
 	}
 	return cloneClusterLogEntry(response.Entry), nil
+}
+
+func (c *ClusterMemberClient) AppendQuorumMember(ctx context.Context, entry ClusterLogEntry) error {
+	response, err := c.request(ctx, ClusterMemberActionAppendLogAck, func(request *ClusterMemberProtocolMessage) {
+		request.Entry = cloneClusterLogEntry(entry)
+	})
+	if err != nil {
+		return err
+	}
+	if response.Position != entry.Position {
+		return fmt.Errorf("%w: quorum member appended mismatched entry at position %d", ErrClusterLogPosition, response.Position)
+	}
+	return nil
+}
+
+func (c *ClusterMemberClient) AppendQuorumBatch(ctx context.Context, entries []ClusterLogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	response, err := c.request(ctx, ClusterMemberActionAppendLogBatchAck, func(request *ClusterMemberProtocolMessage) {
+		request.Entries = cloneClusterLogEntries(entries)
+	})
+	if err != nil {
+		return err
+	}
+	lastPosition := entries[len(entries)-1].Position
+	if response.Position != lastPosition {
+		return fmt.Errorf("%w: quorum member appended mismatched batch position %d", ErrClusterLogPosition, response.Position)
+	}
+	return nil
 }
 
 func (c *ClusterMemberClient) Snapshot(ctx context.Context) ([]ClusterLogEntry, error) {
@@ -375,6 +553,22 @@ func (c *ClusterMemberClient) Submit(ctx context.Context, ingress ClusterIngress
 	return response.Egress, nil
 }
 
+func (c *ClusterMemberClient) SubmitBatch(ctx context.Context, ingresses []ClusterIngress) ([]ClusterEgress, error) {
+	if len(ingresses) == 0 {
+		return nil, nil
+	}
+	response, err := c.request(ctx, ClusterMemberActionSubmitIngressBatch, func(request *ClusterMemberProtocolMessage) {
+		request.Ingresses = cloneClusterIngresses(ingresses)
+	})
+	if err != nil {
+		return nil, err
+	}
+	for i := range response.Egresses {
+		response.Egresses[i].Payload = cloneBytes(response.Egresses[i].Payload)
+	}
+	return response.Egresses, nil
+}
+
 func (c *ClusterMemberClient) Describe(ctx context.Context) (ClusterDescription, error) {
 	response, err := c.request(ctx, ClusterMemberActionDescribe, nil)
 	if err != nil {
@@ -393,10 +587,17 @@ func (c *ClusterMemberClient) Close() error {
 		return nil
 	}
 	c.closed = true
-	if c.conn != nil {
-		return c.conn.Close()
+	var err error
+	if c.stream != nil {
+		err = errors.Join(err, c.stream.Close())
 	}
-	return nil
+	if c.conn != nil {
+		err = errors.Join(err, c.conn.CloseWithError(0, "closed"))
+	}
+	if c.transport != nil {
+		err = errors.Join(err, c.transport.Close())
+	}
+	return err
 }
 
 func (c *ClusterMemberClient) request(ctx context.Context, action ClusterMemberProtocolAction, fill func(*ClusterMemberProtocolMessage)) (ClusterMemberProtocolMessage, error) {
@@ -418,10 +619,10 @@ func (c *ClusterMemberClient) request(ctx context.Context, action ClusterMemberP
 		return ClusterMemberProtocolMessage{}, ErrClusterClosed
 	}
 	if deadline, ok := ctx.Deadline(); ok {
-		if err := c.conn.SetDeadline(deadline); err != nil {
+		if err := c.stream.SetDeadline(deadline); err != nil {
 			return ClusterMemberProtocolMessage{}, err
 		}
-		defer c.conn.SetDeadline(time.Time{})
+		defer c.stream.SetDeadline(time.Time{})
 	}
 
 	c.nextCorrelationID++
@@ -434,12 +635,12 @@ func (c *ClusterMemberClient) request(ctx context.Context, action ClusterMemberP
 	if fill != nil {
 		fill(&request)
 	}
-	if err := c.encoder.Encode(request); err != nil {
+	if err := writeClusterMemberProtocolMessage(c.stream, request); err != nil {
 		return ClusterMemberProtocolMessage{}, err
 	}
 
-	var response ClusterMemberProtocolMessage
-	if err := c.decoder.Decode(&response); err != nil {
+	response, err := readClusterMemberProtocolMessage(c.reader)
+	if err != nil {
 		return ClusterMemberProtocolMessage{}, err
 	}
 	if response.Version != ClusterMemberProtocolVersion {
@@ -455,6 +656,28 @@ func (c *ClusterMemberClient) request(ctx context.Context, action ClusterMemberP
 		return ClusterMemberProtocolMessage{}, clusterMemberRemoteError(response.ErrorCode, response.Error)
 	}
 	return response, nil
+}
+
+func clusterMemberServerTLSConfig(cfg *tls.Config) (*tls.Config, error) {
+	if cfg == nil {
+		return defaultServerTLSConfig()
+	}
+	clone := cfg.Clone()
+	if len(clone.NextProtos) == 0 {
+		clone.NextProtos = []string{quicALPN}
+	}
+	return clone, nil
+}
+
+func clusterMemberClientTLSConfig(cfg *tls.Config) *tls.Config {
+	if cfg == nil {
+		return defaultClientTLSConfig()
+	}
+	clone := cfg.Clone()
+	if len(clone.NextProtos) == 0 {
+		clone.NextProtos = []string{quicALPN}
+	}
+	return clone
 }
 
 func clusterMemberProtocolResponse(correlationID uint64) ClusterMemberProtocolMessage {

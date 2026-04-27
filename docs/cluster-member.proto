@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package bunshin.cluster.v1;
+
+message ClusterMemberProtocolMessage {
+  uint32 version = 1;
+  string type = 2;
+  uint64 correlation_id = 3;
+  string action = 4;
+  string error = 5;
+  string error_code = 6;
+
+  ClusterLogEntry entry = 7;
+  repeated ClusterLogEntry entries = 8;
+  int64 position = 9;
+  ClusterStateSnapshot snapshot = 10;
+  bool has_snapshot = 11;
+  ClusterIngress ingress = 12;
+  ClusterEgress egress = 13;
+  ClusterDescription description = 14;
+  repeated ClusterIngress ingresses = 15;
+  repeated ClusterEgress egresses = 16;
+}
+
+message ClusterLogEntry {
+  int64 position = 1;
+  string type = 2;
+  uint64 session_id = 3;
+  uint64 correlation_id = 4;
+  uint64 timer_id = 5;
+  int64 deadline_unix_nanos = 6;
+  string source_service = 7;
+  string target_service = 8;
+  bytes payload = 9;
+}
+
+message ClusterStateSnapshot {
+  uint64 node_id = 1;
+  string role = 2;
+  int64 position = 3;
+  int64 taken_at_unix_nanos = 4;
+  bytes payload = 5;
+  repeated ClusterTimer timers = 6;
+}
+
+message ClusterTimer {
+  uint64 timer_id = 1;
+  int64 deadline_unix_nanos = 2;
+  bytes payload = 3;
+}
+
+message ClusterIngress {
+  uint64 session_id = 1;
+  uint64 correlation_id = 2;
+  bytes payload = 3;
+}
+
+message ClusterEgress {
+  uint64 session_id = 1;
+  uint64 correlation_id = 2;
+  int64 log_position = 3;
+  string type = 4;
+  uint64 timer_id = 5;
+  int64 deadline_unix_nanos = 6;
+  string source_service = 7;
+  string target_service = 8;
+  bytes payload = 9;
+}
+
+message ClusterDescription {
+  uint64 node_id = 1;
+  string mode = 2;
+  string role = 3;
+  int64 last_position = 4;
+  int64 snapshot_position = 5;
+  bool closed = 6;
+  bool suspended = 7;
+  ClusterLearnerStatus learner = 8;
+  ClusterReplicationStatus replication = 9;
+  ClusterElectionStatus election = 10;
+  ClusterQuorumStatus quorum = 11;
+}
+
+message ClusterLearnerStatus {
+  bool enabled = 1;
+  int64 master_position = 2;
+  int64 synced_position = 3;
+  uint64 snapshots = 4;
+  uint64 applied_since_snapshot = 5;
+  int64 last_sync_unix_nanos = 6;
+  string last_error = 7;
+}
+
+message ClusterReplicationStatus {
+  bool enabled = 1;
+  int64 source_position = 2;
+  int64 synced_position = 3;
+  uint64 applied = 4;
+  int64 last_sync_unix_nanos = 5;
+  string last_error = 6;
+}
+
+message ClusterElectionStatus {
+  bool enabled = 1;
+  uint64 leader_id = 2;
+  uint64 term = 3;
+  string role = 4;
+  repeated ClusterElectionMemberStatus members = 5;
+  int64 last_election_unix_nanos = 6;
+  string last_error = 7;
+}
+
+message ClusterElectionMemberStatus {
+  uint64 node_id = 1;
+  int64 last_heartbeat_unix_nanos = 2;
+  bool alive = 3;
+}
+
+message ClusterQuorumStatus {
+  bool enabled = 1;
+  uint64 members = 2;
+  uint64 required_ack = 3;
+  int64 last_commit = 4;
+  uint64 last_acks = 5;
+  string last_error = 6;
+  int64 last_at_unix_nanos = 7;
+}

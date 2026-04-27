@@ -147,3 +147,14 @@ func cloneClusterLogEntry(entry ClusterLogEntry) ClusterLogEntry {
 	entry.Payload = cloneBytes(entry.Payload)
 	return entry
 }
+
+func cloneClusterLogEntries(entries []ClusterLogEntry) []ClusterLogEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	cloned := make([]ClusterLogEntry, len(entries))
+	for i, entry := range entries {
+		cloned[i] = cloneClusterLogEntry(entry)
+	}
+	return cloned
+}

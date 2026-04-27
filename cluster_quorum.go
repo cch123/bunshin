@@ -34,6 +34,14 @@ type clusterQuorumState struct {
 	lastAt      time.Time
 }
 
+type clusterQuorumMemberAppender interface {
+	AppendQuorumMember(context.Context, ClusterLogEntry) error
+}
+
+type clusterQuorumMemberBatchAppender interface {
+	AppendQuorumBatch(context.Context, []ClusterLogEntry) error
+}
+
 func normalizeClusterQuorumConfig(cfg *ClusterQuorumConfig) (ClusterQuorumConfig, error) {
 	if cfg == nil {
 		return ClusterQuorumConfig{}, invalidConfigf("quorum config is required")
@@ -78,6 +86,27 @@ func (n *ClusterNode) appendClusterEntry(ctx context.Context, entry ClusterLogEn
 	return n.appendClusterEntryWithQuorum(ctx, quorum, entry)
 }
 
+func (n *ClusterNode) appendClusterEntries(ctx context.Context, entries []ClusterLogEntry) ([]ClusterLogEntry, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	n.mu.Lock()
+	quorum := n.quorum
+	n.mu.Unlock()
+	if quorum == nil {
+		appended := make([]ClusterLogEntry, 0, len(entries))
+		for _, entry := range entries {
+			got, err := n.log.Append(ctx, entry)
+			if err != nil {
+				return nil, err
+			}
+			appended = append(appended, got)
+		}
+		return appended, nil
+	}
+	return n.appendClusterEntriesWithQuorum(ctx, quorum, entries)
+}
+
 func (n *ClusterNode) appendClusterEntryWithQuorum(ctx context.Context, quorum *clusterQuorumState, entry ClusterLogEntry) (ClusterLogEntry, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -117,7 +146,58 @@ func (n *ClusterNode) appendClusterEntryWithQuorum(ctx context.Context, quorum *
 	return appended, nil
 }
 
+func (n *ClusterNode) appendClusterEntriesWithQuorum(ctx context.Context, quorum *clusterQuorumState, entries []ClusterLogEntry) ([]ClusterLogEntry, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	position, err := n.log.LastPosition(ctx)
+	if err != nil {
+		n.recordQuorumCommit(0, 0, err)
+		return nil, err
+	}
+	batch := make([]ClusterLogEntry, len(entries))
+	for i, entry := range entries {
+		entry = cloneClusterLogEntry(entry)
+		entry.Position = position + int64(i) + 1
+		batch[i] = entry
+	}
+
+	acks := 1
+	var commitErr error
+	for _, memberLog := range quorum.memberLogs {
+		if err := appendClusterQuorumMemberBatch(ctx, memberLog, batch); err != nil {
+			commitErr = errors.Join(commitErr, err)
+			continue
+		}
+		acks++
+	}
+	lastPosition := batch[len(batch)-1].Position
+	if acks < quorum.requiredAck {
+		err := fmt.Errorf("%w: position=%d acks=%d required=%d", ErrClusterQuorumUnavailable, lastPosition, acks, quorum.requiredAck)
+		if commitErr != nil {
+			err = fmt.Errorf("%w: %w", err, commitErr)
+		}
+		n.recordQuorumCommit(lastPosition, acks, err)
+		return nil, err
+	}
+
+	appended := make([]ClusterLogEntry, 0, len(batch))
+	for _, entry := range batch {
+		got, err := n.log.Append(ctx, entry)
+		if err != nil {
+			n.recordQuorumCommit(entry.Position, acks, err)
+			return nil, err
+		}
+		appended = append(appended, got)
+	}
+	n.recordQuorumCommit(lastPosition, acks, nil)
+	return appended, nil
+}
+
 func appendClusterQuorumMember(ctx context.Context, log ClusterLog, entry ClusterLogEntry) error {
+	if appender, ok := log.(clusterQuorumMemberAppender); ok {
+		return appender.AppendQuorumMember(ctx, cloneClusterLogEntry(entry))
+	}
 	appended, err := log.Append(ctx, cloneClusterLogEntry(entry))
 	if err == nil {
 		if appended.Position != entry.Position || !sameClusterLogEntry(appended, entry) {
@@ -135,6 +215,25 @@ func appendClusterQuorumMember(ctx context.Context, log ClusterLog, entry Cluste
 		}
 	}
 	return err
+}
+
+func appendClusterQuorumMemberBatch(ctx context.Context, log ClusterLog, entries []ClusterLogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if appender, ok := log.(clusterQuorumMemberBatchAppender); ok {
+		cloned := make([]ClusterLogEntry, len(entries))
+		for i, entry := range entries {
+			cloned[i] = cloneClusterLogEntry(entry)
+		}
+		return appender.AppendQuorumBatch(ctx, cloned)
+	}
+	for _, entry := range entries {
+		if err := appendClusterQuorumMember(ctx, log, entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func clusterLogContainsEntry(ctx context.Context, log ClusterLog, entry ClusterLogEntry) (bool, error) {

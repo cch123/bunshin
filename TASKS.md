@@ -122,6 +122,17 @@ This checklist tracks the work needed to evolve Bunshin from the current transpo
 - [x] Add cluster control tool for describe, snapshot, suspend, resume, shutdown, and validation.
 - [x] Add cluster authentication and authorization hooks.
 - [x] Add quorum commit semantics so services consume entries only after a majority has durably recorded the log.
+- [ ] Replace the current heartbeat-only local election with an Aeron-style cluster election state machine: canvass, nomination, ballot, leader transition, and termination states.
+- [ ] Persist leadership term, candidate/ballot vote state, and accepted leader state before responding to election or leadership messages.
+- [ ] Gate leadership candidacy on voting membership, durable log/recording position, snapshot recovery state, and member catch-up status.
+- [ ] Carry Aeron-style election messages over the cluster member QUIC transport using the existing Protobuf framing.
+- [ ] Make followers validate leader term, log position, and recovery status before switching to follower under a newly elected leader.
+- [ ] Add the new-leader recovery path: catch up missing log entries, replay service state to the committed position, then enter active leadership.
+- [ ] Add leadership-term fencing to ingress, timers, service messages, quorum append, replication, and control operations.
+- [ ] Add external cluster client redirect, retry, and reconnect behavior when a node is not the active leader.
+- [ ] Automate standby/backup promotion during failover, including snapshot/log recovery and role transition checks.
+- [ ] Add split-brain, stale-term, stale-log, slow-catch-up, and simultaneous-candidate tests for Aeron-style cluster election.
+- [ ] Add failover benchmarks that measure leader loss, election duration, catch-up time, client redirect latency, and post-failover throughput.
 
 ## Performance
 
@@ -178,7 +189,10 @@ These tasks are beyond the current Bunshin-native roadmap. They are required onl
 - [ ] Decide whether to add a fuller Aeron-style UDP congestion-control implementation or keep AIMD as the Bunshin-native policy boundary.
 - [ ] Move archive recording ownership closer to driver-managed subscription images and record richer source-image metadata in recording descriptors.
 - [ ] Add richer archive source/destination session management for replication and replay merge, including live-image cutover diagnostics.
+- [ ] Add full Aeron-style cluster election, including canvass, nomination, ballot, leadership-term persistence, log-position-based candidate selection, and active-leader transition.
 - [ ] Add automated cluster backup promotion plus leader redirect and failover behavior for external cluster clients.
+- [ ] Add leadership-term fencing and stale-leader rejection across ingress, timers, service messages, quorum append, replication, and control operations.
+- [ ] Add Aeron-style new-leader recovery and catch-up orchestration before a newly elected node starts sequencing ingress.
 - [ ] Tie membership runtime hooks into a full automated cluster control plane with remote catch-up validation and operator commands.
 - [ ] Add Bunshin-native operational views equivalent to the missing AeronStat, LossStat, ArchiveTool, and ClusterTool workflows, or define explicit adapters.
 - [ ] Run production-like parity benchmarks and document capacity envelopes for QUIC, UDP, IPC rings, and mmap shared images.

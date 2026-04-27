@@ -3,12 +3,16 @@ package bunshin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
 
 const (
 	defaultClusterNodeID ClusterNodeID = 1
+
+	DefaultClusterClientMaxBatchSize  = 128
+	DefaultClusterClientMaxBatchDelay = 50 * time.Microsecond
 )
 
 var (
@@ -160,12 +164,54 @@ type ClusterSnapshot struct {
 	Quorum           ClusterQuorumStatus
 }
 
+type ClusterClientConfig struct {
+	MaxBatchSize  int
+	MaxBatchDelay time.Duration
+}
+
 type ClusterClient struct {
 	mu                sync.Mutex
 	node              *ClusterNode
 	sessionID         ClusterSessionID
 	nextCorrelationID ClusterCorrelationID
 	principal         ClusterPrincipal
+	maxBatchSize      int
+	maxBatchDelay     time.Duration
+	batchQueue        []*clusterClientBatchRequest
+	batchFlushActive  bool
+	batchNotify       chan struct{}
+}
+
+type clusterClientBatchRequest struct {
+	ctx     context.Context
+	ingress ClusterIngress
+	result  chan clusterClientBatchResult
+}
+
+type clusterClientBatchResult struct {
+	egress ClusterEgress
+	err    error
+}
+
+func DefaultClusterClientConfig() ClusterClientConfig {
+	return ClusterClientConfig{
+		MaxBatchSize:  DefaultClusterClientMaxBatchSize,
+		MaxBatchDelay: DefaultClusterClientMaxBatchDelay,
+	}
+}
+
+func normalizeClusterClientConfig(cfg ClusterClientConfig) (ClusterClientConfig, error) {
+	if cfg.MaxBatchSize < 0 {
+		return ClusterClientConfig{}, invalidConfigf("invalid cluster client max batch size: %d", cfg.MaxBatchSize)
+	}
+	if cfg.MaxBatchDelay < 0 {
+		return ClusterClientConfig{}, invalidConfigf("invalid cluster client max batch delay: %s", cfg.MaxBatchDelay)
+	}
+	if cfg.MaxBatchSize <= 1 {
+		cfg.MaxBatchSize = 1
+		cfg.MaxBatchDelay = 0
+	}
+	return cfg, nil
 }
 
 func StartClusterNode(ctx context.Context, cfg ClusterConfig) (*ClusterNode, error) {
@@ -259,11 +305,19 @@ func (n *ClusterNode) Snapshot(ctx context.Context) (ClusterSnapshot, error) {
 }
 
 func (n *ClusterNode) NewClient(ctx context.Context) (*ClusterClient, error) {
+	return n.NewClientWithConfig(ctx, ClusterClientConfig{})
+}
+
+func (n *ClusterNode) NewClientWithConfig(ctx context.Context, cfg ClusterClientConfig) (*ClusterClient, error) {
 	if n == nil {
 		return nil, ErrClusterClosed
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	cfg, err := normalizeClusterClientConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
 	n.mu.Lock()
 	if n.closed {
@@ -306,11 +360,18 @@ func (n *ClusterNode) NewClient(ctx context.Context) (*ClusterClient, error) {
 		sessionID:         sessionID,
 		nextCorrelationID: 1,
 		principal:         cloneClusterPrincipal(principal),
+		maxBatchSize:      cfg.MaxBatchSize,
+		maxBatchDelay:     cfg.MaxBatchDelay,
+		batchNotify:       make(chan struct{}, 1),
 	}, nil
 }
 
 func (n *ClusterNode) Submit(ctx context.Context, ingress ClusterIngress) (ClusterEgress, error) {
 	return n.submit(ctx, ingress, clusterPrincipalFromContext(ctx))
+}
+
+func (n *ClusterNode) SubmitBatch(ctx context.Context, ingresses []ClusterIngress) ([]ClusterEgress, error) {
+	return n.submitBatch(ctx, ingresses, clusterPrincipalFromContext(ctx))
 }
 
 func (n *ClusterNode) submit(ctx context.Context, ingress ClusterIngress, principal ClusterPrincipal) (ClusterEgress, error) {
@@ -371,6 +432,86 @@ func (n *ClusterNode) submit(ctx context.Context, ingress ClusterIngress, princi
 		return ClusterEgress{}, err
 	}
 	return n.applyEntry(ctx, nodeID, role, entry, false)
+}
+
+func (n *ClusterNode) submitBatch(ctx context.Context, ingresses []ClusterIngress, principal ClusterPrincipal) ([]ClusterEgress, error) {
+	if n == nil {
+		return nil, ErrClusterClosed
+	}
+	if len(ingresses) == 0 {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	normalized := make([]ClusterIngress, len(ingresses))
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		return nil, ErrClusterClosed
+	}
+	if n.suspended {
+		n.mu.Unlock()
+		return nil, ErrClusterSuspended
+	}
+	if n.role != ClusterRoleLeader {
+		n.mu.Unlock()
+		return nil, ErrClusterNotLeader
+	}
+	for i, ingress := range ingresses {
+		if ingress.SessionID == 0 {
+			ingress.SessionID = n.nextSessionID
+			n.nextSessionID++
+		}
+		if ingress.CorrelationID == 0 {
+			ingress.CorrelationID = n.nextCorrelationID
+			n.nextCorrelationID++
+		}
+		ingress.Payload = cloneBytes(ingress.Payload)
+		normalized[i] = ingress
+	}
+	nodeID := n.nodeID
+	role := n.role
+	n.mu.Unlock()
+
+	entries := make([]ClusterLogEntry, len(normalized))
+	for i, ingress := range normalized {
+		if err := n.authorizeClusterAction(ctx, ClusterAuthorizationRequest{
+			NodeID:        nodeID,
+			Role:          role,
+			Principal:     principal,
+			Action:        ClusterAuthorizationActionIngress,
+			SessionID:     ingress.SessionID,
+			CorrelationID: ingress.CorrelationID,
+			Payload:       ingress.Payload,
+		}); err != nil {
+			return nil, err
+		}
+		entries[i] = ClusterLogEntry{
+			Type:          ClusterLogEntryIngress,
+			SessionID:     ingress.SessionID,
+			CorrelationID: ingress.CorrelationID,
+			Payload:       cloneBytes(ingress.Payload),
+		}
+	}
+
+	appended, err := n.appendClusterEntries(ctx, entries)
+	if err != nil {
+		return nil, err
+	}
+	egresses := make([]ClusterEgress, len(appended))
+	for i, entry := range appended {
+		egress, err := n.applyEntry(ctx, nodeID, role, entry, false)
+		if err != nil {
+			return nil, err
+		}
+		egresses[i] = egress
+	}
+	return egresses, nil
 }
 
 func (n *ClusterNode) Suspend(ctx context.Context) error {
@@ -546,7 +687,37 @@ func (c *ClusterClient) Send(ctx context.Context, payload []byte) (ClusterEgress
 	if c == nil || c.node == nil {
 		return ClusterEgress{}, ErrClusterClosed
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
+	if c.maxBatchSize > 1 {
+		correlationID := c.nextCorrelationID
+		c.nextCorrelationID++
+		request := &clusterClientBatchRequest{
+			ctx: ctx,
+			ingress: ClusterIngress{
+				SessionID:     c.sessionID,
+				CorrelationID: correlationID,
+				Payload:       cloneBytes(payload),
+			},
+			result: make(chan clusterClientBatchResult, 1),
+		}
+		c.batchQueue = append(c.batchQueue, request)
+		if !c.batchFlushActive {
+			c.batchFlushActive = true
+			go c.flushSendBatches()
+		}
+		c.notifyClusterClientBatchLocked()
+		c.mu.Unlock()
+
+		select {
+		case result := <-request.result:
+			return result.egress, result.err
+		case <-ctx.Done():
+			return ClusterEgress{}, ctx.Err()
+		}
+	}
 	correlationID := c.nextCorrelationID
 	c.nextCorrelationID++
 	principal := cloneClusterPrincipal(c.principal)
@@ -556,6 +727,145 @@ func (c *ClusterClient) Send(ctx context.Context, payload []byte) (ClusterEgress
 		CorrelationID: correlationID,
 		Payload:       payload,
 	}, principal)
+}
+
+func (c *ClusterClient) flushSendBatches() {
+	for {
+		if !c.waitClusterClientBatch() {
+			return
+		}
+		requests, principal := c.takeClusterClientBatch()
+		if len(requests) == 0 {
+			continue
+		}
+		c.submitClusterClientBatch(requests, principal)
+	}
+}
+
+func (c *ClusterClient) waitClusterClientBatch() bool {
+	c.mu.Lock()
+	if len(c.batchQueue) == 0 {
+		c.batchFlushActive = false
+		c.mu.Unlock()
+		return false
+	}
+	maxBatchSize := c.maxBatchSize
+	maxBatchDelay := c.maxBatchDelay
+	if len(c.batchQueue) >= maxBatchSize || maxBatchDelay <= 0 {
+		c.mu.Unlock()
+		return true
+	}
+	notify := c.batchNotify
+	c.mu.Unlock()
+
+	timer := time.NewTimer(maxBatchDelay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return true
+		case <-notify:
+			c.mu.Lock()
+			ready := len(c.batchQueue) >= maxBatchSize
+			c.mu.Unlock()
+			if ready {
+				return true
+			}
+		}
+	}
+}
+
+func (c *ClusterClient) takeClusterClientBatch() ([]*clusterClientBatchRequest, ClusterPrincipal) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.batchQueue) == 0 {
+		return nil, ClusterPrincipal{}
+	}
+	batchSize := c.maxBatchSize
+	if len(c.batchQueue) < batchSize {
+		batchSize = len(c.batchQueue)
+	}
+	requests := make([]*clusterClientBatchRequest, batchSize)
+	copy(requests, c.batchQueue[:batchSize])
+	remaining := copy(c.batchQueue, c.batchQueue[batchSize:])
+	for i := remaining; i < len(c.batchQueue); i++ {
+		c.batchQueue[i] = nil
+	}
+	c.batchQueue = c.batchQueue[:remaining]
+	return requests, cloneClusterPrincipal(c.principal)
+}
+
+func (c *ClusterClient) submitClusterClientBatch(requests []*clusterClientBatchRequest, principal ClusterPrincipal) {
+	ingresses := make([]ClusterIngress, 0, len(requests))
+	active := make([]*clusterClientBatchRequest, 0, len(requests))
+	for _, request := range requests {
+		if err := request.ctx.Err(); err != nil {
+			request.result <- clusterClientBatchResult{err: err}
+			continue
+		}
+		active = append(active, request)
+		ingresses = append(ingresses, request.ingress)
+	}
+	if len(active) == 0 {
+		return
+	}
+
+	egresses, err := c.node.submitBatch(clusterClientBatchContext(active), ingresses, principal)
+	if err != nil {
+		for _, request := range active {
+			request.result <- clusterClientBatchResult{err: err}
+		}
+		return
+	}
+	if len(egresses) != len(active) {
+		err := fmt.Errorf("%w: cluster client batch returned %d egresses for %d ingresses", ErrInvalidConfig, len(egresses), len(active))
+		for _, request := range active {
+			request.result <- clusterClientBatchResult{err: err}
+		}
+		return
+	}
+	for i, request := range active {
+		request.result <- clusterClientBatchResult{egress: egresses[i]}
+	}
+}
+
+func (c *ClusterClient) notifyClusterClientBatchLocked() {
+	select {
+	case c.batchNotify <- struct{}{}:
+	default:
+	}
+}
+
+func clusterClientBatchContext(requests []*clusterClientBatchRequest) context.Context {
+	for _, request := range requests {
+		if request.ctx != nil {
+			return context.WithoutCancel(request.ctx)
+		}
+	}
+	return context.Background()
+}
+
+func (c *ClusterClient) SendBatch(ctx context.Context, payloads [][]byte) ([]ClusterEgress, error) {
+	if c == nil || c.node == nil {
+		return nil, ErrClusterClosed
+	}
+	if len(payloads) == 0 {
+		return nil, nil
+	}
+	c.mu.Lock()
+	principal := cloneClusterPrincipal(c.principal)
+	ingresses := make([]ClusterIngress, len(payloads))
+	for i, payload := range payloads {
+		correlationID := c.nextCorrelationID
+		c.nextCorrelationID++
+		ingresses[i] = ClusterIngress{
+			SessionID:     c.sessionID,
+			CorrelationID: correlationID,
+			Payload:       payload,
+		}
+	}
+	c.mu.Unlock()
+	return c.node.submitBatch(ctx, ingresses, principal)
 }
 
 func (n *ClusterNode) start(ctx context.Context) error {
@@ -820,6 +1130,18 @@ func clusterEgressFromEntry(entry ClusterLogEntry, payload []byte) ClusterEgress
 		TargetService: entry.TargetService,
 		Payload:       cloneBytes(payload),
 	}
+}
+
+func cloneClusterIngresses(ingresses []ClusterIngress) []ClusterIngress {
+	if len(ingresses) == 0 {
+		return nil
+	}
+	cloned := make([]ClusterIngress, len(ingresses))
+	for i, ingress := range ingresses {
+		ingress.Payload = cloneBytes(ingress.Payload)
+		cloned[i] = ingress
+	}
+	return cloned
 }
 
 func (n *ClusterNode) snapshotPosition(ctx context.Context) int64 {
